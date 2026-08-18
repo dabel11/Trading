@@ -1,0 +1,27 @@
+# AI 트레이딩 앱 의존성
+# 설치: pip install -r requirements.txt
+
+# ── UI ──
+streamlit>=1.58.0
+streamlit-autorefresh>=1.0.1
+plotly>=6.7.0
+pywebview>=6.2.1          # 네이티브 .app 창
+
+# ── 데이터 처리 ──
+pandas>=2.0
+numpy>=1.24
+lxml>=5.0                 # pd.read_html (위키 종목 로드)
+
+# ── 시세 / 브로커 ──
+yfinance>=0.2.40          # 시세·차트 (무료, API 키 불필요)
+finnhub-python>=2.4.0     # 실시간 시세 (선택, API 키 필요)
+websocket-client>=1.7.0   # Finnhub WebSocket 체결 스트림 (없으면 REST 폴링으로 폴백)
+alpaca-py>=0.30           # 미국 주식 주문
+
+# ── 기술적 지표 ──
+ta>=0.11.0                # RSI·MACD·볼린저밴드
+
+# ── 유틸 ──
+requests>=2.31
+pytz>=2024.1              # 미국 장 시간 판별
+openpyxl>=3.1            # 거래내역 Excel 내보내기 (선택)
