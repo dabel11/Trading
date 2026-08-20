@@ -156,6 +156,16 @@ Python · Streamlit · Alpaca · Finnhub WebSocket · yfinance
 
 ---
 
+## 설치 (macOS)
+
+[**최신 릴리스에서 DMG 다운로드**](https://github.com/dabel11/Trading/releases/latest) → 열어서 `AI 트레이딩.app` 을 응용 프로그램 폴더로 드래그.
+
+API 키 없이 바로 실행됩니다 — yfinance 시세와 모의(페이퍼) 계좌로 동작합니다.
+서명되지 않은 앱이라 첫 실행 시 macOS 가 차단하면, 시스템 설정 → 개인정보 보호 및 보안에서
+"확인 없이 열기"를 눌러주세요.
+
+소스에서 직접 실행하려면 아래로 진행하세요.
+
 ## 시작하기
 
 ```bash
