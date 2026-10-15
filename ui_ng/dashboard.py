@@ -432,9 +432,10 @@ body{ background:var(--bg0)!important; }
 .frail{ position:fixed; right:14px; top:50%; transform:translateY(-50%); z-index:55;
   display:flex; flex-direction:column; gap:6px; background:var(--bg2); border:1px solid var(--line);
   border-radius:16px; padding:7px 6px; box-shadow:0 8px 28px rgba(0,0,0,.4); }
-.frail-item{ width:52px; padding:9px 0; border-radius:12px; text-align:center; cursor:pointer;
-  color:var(--t3); font-size:.6rem; font-weight:700; user-select:none; transition:all .1s; }
-.frail-item .fi{ font-size:1.05rem; display:block; margin-bottom:2px; filter:grayscale(1) opacity(.6); }
+.frail-item{ width:50px; padding:7px 0; border-radius:11px; text-align:center; cursor:pointer;
+  color:var(--t3); font-size:.58rem; font-weight:700; user-select:none; transition:all .1s; }
+.frail-item .fi{ font-size:1rem; display:block; margin-bottom:1px; filter:grayscale(1) opacity(.6); }
+.frail-div{ height:1px; background:var(--line); margin:4px 7px; }
 .frail-item:hover{ background:var(--bg3); color:var(--t2); }
 .frail-item.on{ background:var(--bg3); color:var(--t1); }
 .frail-item.on .fi{ filter:none; }
@@ -848,7 +849,7 @@ def render_toss_table(d, state, select_cb):
                 '<div class="tnum">현재가</div><div class="tnum">등락률</div>'
                 '<div>AI 스코어 비율</div><div>섹터</div><div class="tnum">보유</div></div>')
         if not d["rows"]:
-            ui.html('<div class="empty">보유 종목이 없습니다 · 우하단 + 로 주문하세요.</div>')
+            ui.html('<div class="empty">보유 종목이 없습니다 · 우측 레일 💵 주문으로 매수하세요.</div>')
             return
         for i, r in enumerate(d["rows"], 1):
             dd = rtf.get_price(r["tk"]) or {}
@@ -1322,22 +1323,6 @@ def main_page():
             ui.button("닫기", on_click=pg.close).classes("tbtn").style("margin-top:10px")
         pg.open()
 
-    def open_menu():
-        items = [("직접 주문", "모의 매수/매도", page_order),
-                 ("자동 트레이딩", "데몬 · 사이클", page_auto),
-                 ("전략 선택", "25개 카탈로그", page_strategy),
-                 ("주식 열람", "지수 · 종목", page_stocks),
-                 ("포트폴리오", "보유 · 거래내역", page_portfolio),
-                 ("설정", "매매 파라미터", page_settings)]
-        with ui.dialog() as dlg, ui.card().classes("drawer-card"):
-            ui.html('<div style="font-size:.95rem;font-weight:800;margin-bottom:8px">빠른 메뉴</div>')
-            with ui.element("div").classes("fmenu"):
-                for title, desc, fn in items:
-                    it = ui.html(f'<div class="fmenu-item"><div class="mt">{title}</div>'
-                                 f'<div class="md">{desc}</div></div>')
-                    it.on("click", lambda e, f=fn: (dlg.close(), open_page(f)))
-        dlg.open()
-
     # 본문
     with ui.element("div").classes("wrap"):
         @ui.refreshable
@@ -1371,7 +1356,7 @@ def main_page():
         render_bottom_bar()
     bottom()
 
-    # 플로팅 우측 레일
+    # 플로팅 우측 레일 — 뷰 모드 + 거래 메뉴
     @ui.refreshable
     def rail():
         with ui.element("div").classes("frail"):
@@ -1379,11 +1364,13 @@ def main_page():
                 it = ui.html(f'<div class="frail-item{" on" if state["rmode"]==key else ""}">'
                              f'<span class="fi">{icon}</span>{key}</div>')
                 it.on("click", lambda e, k=key: set_rmode(k))
+            ui.html('<div class="frail-div"></div>')
+            for label, icon, fn in [("주문", "💵", page_order), ("자동", "🤖", page_auto),
+                                    ("전략", "🎯", page_strategy), ("열람", "🔍", page_stocks),
+                                    ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
+                it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
+                it.on("click", lambda e, f=fn: open_page(f))
     rail()
-
-    # 플로팅 액션 버튼
-    fab = ui.html('<div class="fab">＋</div>')
-    fab.on("click", lambda e: open_menu())
 
     _screen["refresh"] = lambda: (tbl.refresh(), right.refresh())
 
