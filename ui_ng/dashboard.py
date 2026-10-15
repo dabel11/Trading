@@ -614,9 +614,28 @@ def read_orders(limit=40):
         return []
 
 
+def _is_paper() -> bool:
+    """매매 모드 — config(autotrader_config.json)의 paper 플래그가 단일 소스."""
+    try:
+        return bool(load_config().get("paper", True))
+    except Exception:
+        return True
+
+
+def _broker_cash() -> float:
+    """실거래 모드 현금(브로커 계좌). 실패 시 0."""
+    try:
+        from broker import Broker
+        acct = Broker(paper=False).get_account()
+        return float(acct.get("cash", acct.get("buying_power", 0)) or 0)
+    except Exception:
+        return 0.0
+
+
 def collect():
-    cash = pa.cash()
-    pm = PortfolioManager(paper=PAPER)
+    paper = _is_paper()
+    cash = pa.cash() if paper else _broker_cash()
+    pm = PortfolioManager(paper=paper)
     raw, is_demo = [], False
     if pm.positions:
         for tk, p in pm.positions.items():
@@ -638,7 +657,7 @@ def collect():
                          pnl_pct=(pnl / cb * 100) if cb else 0, held=held,
                          score=sc, sector=_sector_of(tk)))
     return dict(cash=cash, invested=invested, cost=cost, total_pnl=invested - cost,
-                equity=cash + invested, rows=rows, is_demo=is_demo)
+                equity=cash + invested, rows=rows, is_demo=is_demo, paper=paper)
 
 
 def confirm(title: str, body: str, on_ok, ok_label: str = "실행", danger: bool = False):
@@ -739,6 +758,61 @@ _screen = {"refresh": lambda: None}
 # 메인 화면 콜백 훅(main_page에서 실제 함수로 교체)
 _hooks = {"select": (lambda tk: None), "set_mv": (lambda k: None),
           "auto": (lambda: None), "open_page": (lambda fn: None)}
+
+# ── 텔레그램 봇 구동 + 상태 기록 ──────────────────────────────────────────────
+_TG_STARTED = {"on": False}
+
+
+def _write_bot_status():
+    try:
+        import telegram_bot as tb
+        cfg = load_config()
+        paper = bool(cfg.get("paper", True))
+        d = collect()
+        try:
+            import market_hours as mh
+            mopen = mh.is_market_open()
+        except Exception:
+            mopen = False
+        pos = [dict(ticker=r["tk"], shares=r["sh"], entry=r["ep"], cur=r["cur"],
+                    pnl_pct=r["pnl_pct"] / 100.0) for r in d["rows"]]
+        tb.write_status({
+            "auto_on": DAEMON.running(), "paper": paper,
+            "mode": "모의(페이퍼)" if paper else "실거래",
+            "strategy": cfg.get("strategy_name", cfg.get("strategy", "—")),
+            "horizon": cfg.get("horizon", "—"),
+            "alloc": "유동형" if cfg.get("dynamic", True) else "고정형",
+            "market_open": mopen,
+            "equity": round(d["equity"]), "cash": round(d["cash"]),
+            "invested": round(d["invested"]), "upnl": round(d["total_pnl"]),
+            "upnl_pct": (d["total_pnl"] / d["cost"]) if d["cost"] else 0,
+            "n_positions": len(d["rows"]), "positions": pos,
+            "last_run": time.strftime("%H:%M:%S", time.localtime(DAEMON.last_run)) if DAEMON.last_run else "—",
+            "buy_th": cfg.get("min_score", 60),
+        })
+    except Exception:
+        pass
+
+
+def ensure_telegram_running():
+    """텔레그램 봇 기동(설정 시) + 상태 기록 루프. notifier 설정에서 토큰/채팅을 읽는다.
+    start()는 멱등 — 설정을 켜면 다음 루프에서 기동된다."""
+    if _TG_STARTED["on"]:
+        return
+    _TG_STARTED["on"] = True
+
+    def _run():
+        while True:
+            try:
+                import telegram_bot as tb, notifier
+                tg = (notifier.load_config() or {}).get("telegram", {})
+                if tg.get("enabled") and tg.get("bot_token"):
+                    tb.start(tg["bot_token"], tg.get("chat_id", ""))
+            except Exception:
+                pass
+            _write_bot_status()
+            time.sleep(12)
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ── 공통 렌더 조각 ────────────────────────────────────────────────────────────
@@ -1328,7 +1402,7 @@ def page_order():
 
         def _exec_order(tk, q, side, px):
             from core.execution import execute_manual
-            res = execute_manual(tk, q, side, True, px)
+            res = execute_manual(tk, q, side, _is_paper(), px)
             ui.notify(f'{tk} {"매수" if side=="buy" else "매도"} 체결: '
                       f'{res.get("shares")}주 @ ${_fmt(res.get("price"))}',
                       type="positive", position="top")
@@ -1469,6 +1543,55 @@ def page_stocks():
 def page_settings():
     cfg = load_config()
     ui.html('<div class="sec-h">설정</div>')
+
+    # ── 매매 모드 (앱·텔레그램 공통) ──
+    paper = _is_paper()
+
+    def _switch_mode(to_paper):
+        c = load_config()
+        c["paper"] = bool(to_paper)
+        _ctl_mod.save_config(c)
+        ui.notify(f'{"🟢 모의투자" if to_paper else "🔴 실거래"} 모드로 전환했습니다.',
+                  position="top", type=("positive" if to_paper else "warning"))
+        _screen["refresh"]()
+
+    with ui.element("div").classes("card").style("margin-bottom:12px"):
+        ui.html('<div class="sh2">매매 모드 <small>· 앱·텔레그램·자동매매 공통</small></div>'
+                f'<div style="font-size:.9rem;font-weight:800;margin:6px 0 10px;'
+                f'color:{"var(--green)" if paper else "var(--up)"}">'
+                f'현재: {"🟢 모의투자(페이퍼)" if paper else "🔴 실거래 — 실제 자금"}</div>')
+        with ui.row().classes("gap-2"):
+            if paper:
+                ui.button("🔴 실거래로 전환", on_click=lambda: confirm(
+                    "실거래 전환", "이후 매매가 <b>실제 계좌·실제 자금</b>으로 체결됩니다. (Alpaca API 키 필요)",
+                    lambda: _switch_mode(False), ok_label="실거래 전환", danger=True)
+                ).classes("tbtn tbtn-danger")
+            else:
+                ui.button("🟢 모의투자로 전환", on_click=lambda: _switch_mode(True)).classes("tbtn tbtn-primary")
+
+    # ── 텔레그램 봇 ──
+    import notifier as _ntf
+    tg = (_ntf.load_config().get("telegram", {}) or {})
+    with ui.element("div").classes("card").style("margin-bottom:12px"):
+        ui.html('<div class="sh2">텔레그램 봇 <small>· 원격 매매·모드전환·현황 알림</small></div>')
+        tg_en = ui.switch("봇 활성화", value=bool(tg.get("enabled"))).props("dense")
+        tg_tok = ui.input("봇 토큰 (BotFather)", value=tg.get("bot_token", "")).props("outlined dense dark").classes("w-full")
+        tg_chat = ui.input("Chat ID (허용 채팅)", value=str(tg.get("chat_id", ""))).props("outlined dense dark").classes("w-full")
+
+        def _save_tg():
+            nc = _ntf.load_config()
+            nc.setdefault("telegram", {})
+            nc["telegram"]["enabled"] = bool(tg_en.value)
+            nc["telegram"]["bot_token"] = (tg_tok.value or "").strip()
+            nc["telegram"]["chat_id"] = (tg_chat.value or "").strip()
+            _ntf.save_config(nc)
+            ui.notify("텔레그램 설정 저장됨 — 봇이 최대 12초 내 연결됩니다.", position="top", type="positive")
+        ui.button("텔레그램 저장", on_click=_save_tg).classes("tbtn tbtn-primary").style("margin-top:8px")
+        ui.html('<div style="font-size:.68rem;color:var(--t3);margin-top:9px;line-height:1.7">'
+                '· @BotFather 로 봇 생성 → 토큰 입력, 봇과 대화 시작 후 Chat ID 입력<br>'
+                '· 명령: <b>/help /mode /모의 /실거래 /buy AAPL 500 /sell AAPL /confirm</b></div>')
+
+    ui.html('<div class="sec-h" style="margin-top:4px">자동매매 파라미터</div>')
     # (key, label, value, kind)  kind: pct | int | text
     specs = [
         ("strategy_name", "전략", cfg.get("strategy_name", ""), "text"),
@@ -1539,6 +1662,7 @@ def main_page():
         _subscribe([s for s, _ in INDEX_CARDS])
     ensure_hist_running(lambda: [r["tk"] for r in collect()["rows"]])
     ensure_market_running()
+    ensure_telegram_running()
 
     # 헤더
     with ui.element("div").classes("topbar"):
@@ -1549,9 +1673,12 @@ def main_page():
         @ui.refreshable
         def meta_box():
             alive = DAEMON.running()
+            paper = _is_paper()
             dcol = "var(--green)" if alive else "var(--t3)"
             now = datetime.now().strftime("%H:%M:%S")
-            ui.html(f'<div class="hmeta"><span class="badge">모의투자</span>'
+            badge = ('<span class="badge">모의투자</span>' if paper else
+                     '<span class="badge" style="background:rgba(240,69,79,.16);color:#FF8A91">🔴 실거래</span>')
+            ui.html(f'<div class="hmeta">{badge}'
                     f'<span><span class="dot" style="background:{dcol}"></span>자동매매 {"실행 중" if alive else "정지"}</span>'
                     f'<span class="mono">{now}</span></div>')
         meta_box()

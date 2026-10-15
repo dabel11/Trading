@@ -132,6 +132,10 @@ def cmd_help(_s: dict) -> str:
             "/balance — 잔액·손익\n"
             "/portfolio — 보유 종목\n"
             "/scores — 상위 점수 후보\n"
+            "─ 모드 ─\n"
+            "/mode — 현재 모드 조회\n"
+            "/모의 (=/mode paper) — 모의투자 전환\n"
+            "/실거래 (=/mode live) — 실거래 전환\n"
             "─ 매매 ─\n"
             "/buy AAPL 500 — $500어치 매수\n"
             "/buy AAPL 3주 — 3주 매수\n"
@@ -163,6 +167,58 @@ def _quote(tk: str):
         return None
 
 
+def _cfg_paper() -> bool:
+    """현재 매매 모드 — config(autotrader_config.json)의 paper 플래그가 단일 소스."""
+    try:
+        from core.control import load_config
+        return bool(load_config().get("paper", True))
+    except Exception:
+        return bool(_status().get("paper", True))
+
+
+def _set_paper(paper: bool):
+    """모드 전환 — config 저장 + 상태 파일 즉시 반영."""
+    try:
+        from core.control import load_config, save_config
+        cfg = load_config()
+        cfg["paper"] = bool(paper)
+        save_config(cfg)
+    except Exception:
+        pass
+    try:
+        s = _status()
+        s["paper"] = bool(paper)
+        s["mode"] = "모의(페이퍼)" if paper else "실거래"
+        write_status(s)
+    except Exception:
+        pass
+
+
+def cmd_mode(args: list) -> str:
+    """/mode (조회) · /mode paper (모의) · /mode live (실거래)."""
+    cur = _cfg_paper()
+    if not args:
+        return (f"현재 모드: {'🟢 모의투자(페이퍼)' if cur else '🔴 실거래'}\n"
+                "전환: /mode paper (모의) · /mode live (실거래)\n"
+                "단축: /모의 · /실거래")
+    a = args[0].lower().strip()
+    if a in ("paper", "모의", "sim", "demo"):
+        _set_paper(True)
+        return "🟢 모의투자(페이퍼) 모드로 전환했습니다.\n이후 모든 매매는 가상 현금으로 체결됩니다."
+    if a in ("live", "실거래", "real"):
+        _set_paper(False)
+        warn = ""
+        try:
+            import config as _c
+            if "your_" in _c.ALPACA_API_KEY:
+                warn = "\n⚠️ Alpaca API 키가 없어 실제 주문은 실패합니다 (.env 설정 필요)."
+        except Exception:
+            pass
+        return ("🔴 실거래 모드로 전환했습니다.\n이후 매매는 **실제 계좌·실제 자금**으로 체결됩니다 — 신중히!"
+                + warn)
+    return "사용법: /mode paper (모의) · /mode live (실거래)"
+
+
 def cmd_buy(args: list, chat_id: str) -> str:
     """/buy TICKER 500  ($500어치) · /buy TICKER 3주 (3주)."""
     if len(args) < 2:
@@ -184,7 +240,7 @@ def cmd_buy(args: list, chat_id: str) -> str:
             return "금액을 해석할 수 없습니다 (예: 500)"
     if qty < 1:
         return f"금액이 1주 가격(${price:,.2f})보다 작습니다"
-    paper = _status().get("paper", True)
+    paper = _cfg_paper()
     _pending[chat_id] = {"side": "buy", "ticker": tk, "shares": qty,
                          "est_price": price, "paper": paper, "ts": time.time()}
     return (f"📥 매수 주문 미리보기 ({'모의' if paper else '⚠️ 실거래'})\n"
@@ -197,7 +253,7 @@ def cmd_sell(args: list, chat_id: str) -> str:
     if not args:
         return "사용법: /sell AAPL  (전량)\n또는 /sell AAPL 2  (2주)"
     tk = args[0].upper().strip()
-    paper = _status().get("paper", True)
+    paper = _cfg_paper()
     try:
         from portfolio import PortfolioManager
         pos = PortfolioManager(paper=paper).positions.get(tk)
@@ -259,6 +315,7 @@ _HANDLERS = {
 }
 
 _TRADE_CMDS = {"buy", "sell", "confirm", "cancel"}
+_MODE_CMDS = {"mode", "paper", "live", "모의", "실거래"}
 _allowed_chat = ""   # start()에서 설정 — 매매 명령은 이 채팅에서만
 
 
@@ -266,6 +323,14 @@ def handle(text: str, chat_id: str = "") -> str:
     parts = text.strip().split()
     cmd = parts[0].lower().lstrip("/").split("@")[0]
     args = parts[1:]
+    if cmd in _MODE_CMDS:
+        if not _allowed_chat or chat_id != _allowed_chat:
+            return "⛔ 모드 전환은 설정된 Chat ID에서만 가능합니다 (설정 → 알림)."
+        if cmd in ("paper", "모의"):
+            return cmd_mode(["paper"])
+        if cmd in ("live", "실거래"):
+            return cmd_mode(["live"])
+        return cmd_mode(args)
     if cmd in _TRADE_CMDS:
         # 매매는 Chat ID가 명시 설정된 경우에만 (오픈 채팅 매매 차단)
         if not _allowed_chat or chat_id != _allowed_chat:
