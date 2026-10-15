@@ -190,6 +190,47 @@ def sparkline(vals, up=True, w=120, h=34):
             f'<polyline points="{line}" fill="none" stroke="{col}" stroke-width="1.6" '
             f'stroke-linejoin="round" stroke-linecap="round"/></svg>')
 
+
+# ── 시장 데이터(공포탐욕·섹터·급등락·장상태) 백그라운드 캐시 ─────────────────
+_MKT = {"fg": None, "sectors": [], "gainers": [], "losers": [], "status": ("", False), "ts": 0.0}
+_MKT_STARTED = {"on": False}
+
+
+def prefetch_market():
+    import market_data as md
+    import market_hours as mh
+    try:
+        _MKT["fg"] = md.fear_greed_index()
+    except Exception:
+        pass
+    try:
+        _MKT["sectors"] = md.sector_performance("5d")
+    except Exception:
+        pass
+    try:
+        mv = md.top_movers(8)
+        _MKT["gainers"] = mv.get("gainers", [])
+        _MKT["losers"] = mv.get("losers", [])
+    except Exception:
+        pass
+    try:
+        _MKT["status"] = mh.market_status_label()
+    except Exception:
+        pass
+    _MKT["ts"] = time.time()
+
+
+def ensure_market_running():
+    if _MKT_STARTED["on"]:
+        return
+    _MKT_STARTED["on"] = True
+
+    def _loop():
+        while True:
+            prefetch_market()
+            time.sleep(45)
+    threading.Thread(target=_loop, daemon=True).start()
+
 # ── 테마 ─────────────────────────────────────────────────────────────────────
 STYLE = """
 <style>
@@ -465,6 +506,80 @@ body{ background:var(--bg0)!important; }
 """
 ui.add_head_html(TOSS_STYLE, shared=True)
 
+# ── 시장 중심 레이아웃 테마 ──────────────────────────────────────────────────
+TOSS2_STYLE = """
+<style>
+.wrap{ padding:12px 84px 56px 16px; }   /* 우측 플로팅 레일 공간 확보 */
+.page2col{ display:grid; grid-template-columns:minmax(0,1fr) 352px; gap:12px; align-items:start; }
+@media (max-width:1180px){ .page2col{ grid-template-columns:1fr; } }
+.col-mkt{ display:flex; flex-direction:column; gap:12px; min-width:0; }
+.col-acct{ display:flex; flex-direction:column; gap:10px; }
+.sh2{ font-size:.72rem; font-weight:800; color:var(--t1); margin:0 2px 2px;
+  display:flex; align-items:center; justify-content:space-between; }
+.sh2 small{ font-size:.64rem; font-weight:600; color:var(--t3); }
+
+/* 시장 현황(pulse) */
+.pulse{ display:grid; grid-template-columns:auto auto 1fr; gap:18px; align-items:center;
+  background:var(--bg2); border:1px solid var(--line); border-radius:12px; padding:12px 18px; }
+.mkt-stat{ display:flex; flex-direction:column; gap:2px; white-space:nowrap; }
+.mkt-stat .l{ font-size:.6rem; color:var(--t3); font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+.mkt-stat .v{ font-size:1.1rem; font-weight:800; }
+.mkt-open{ display:inline-flex; align-items:center; gap:7px; font-size:.9rem; font-weight:800; }
+.fg{ min-width:0; }
+.fg-top{ display:flex; justify-content:space-between; font-size:.62rem; color:var(--t3); font-weight:700; margin-bottom:5px; }
+.fg-bar{ height:8px; border-radius:5px; position:relative;
+  background:linear-gradient(90deg,#4E7BF5,#8A929E 50%,#F0454F); }
+.fg-mark{ position:absolute; top:-3px; width:3px; height:14px; background:#fff; border-radius:2px; box-shadow:0 0 0 2px var(--bg2); }
+
+/* 급등락 + 섹터 2단 */
+.mkt-row{ display:grid; grid-template-columns:1.2fr 1fr; gap:12px; align-items:start; }
+@media (max-width:900px){ .mkt-row{ grid-template-columns:1fr; } }
+.card2{ background:var(--bg2); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+.mv-tabs{ display:flex; gap:4px; margin-bottom:6px; }
+.mv-tab{ font-size:.72rem; font-weight:700; color:var(--t3); padding:4px 11px; border-radius:7px; cursor:pointer; user-select:none; }
+.mv-tab.on{ background:var(--bg3); color:var(--t1); }
+.mv-row{ display:grid; grid-template-columns:20px 24px 1fr auto; gap:9px; align-items:center;
+  padding:7px 2px; border-bottom:1px solid var(--line); font-size:.82rem; cursor:pointer; }
+.mv-row:last-child{ border-bottom:none; }
+.mv-row:hover{ background:var(--bg3); }
+.mv-rank{ color:var(--t3); font-weight:700; font-size:.72rem; text-align:center; }
+
+/* 섹터 히트맵 */
+.heat{ display:grid; grid-template-columns:repeat(2,1fr); gap:6px; }
+.heat-tile{ border-radius:10px; padding:10px 11px; min-height:54px; display:flex;
+  flex-direction:column; justify-content:space-between; }
+.heat-tile .hn{ font-size:.74rem; font-weight:800; color:#fff; }
+.heat-tile .hr{ font-size:.84rem; font-weight:800; color:#fff; }
+
+/* 자동매매 패널 */
+.auto{ background:linear-gradient(180deg, rgba(49,130,246,.07), var(--bg2));
+  border:1px solid var(--line2); border-radius:13px; padding:15px 16px; }
+.auto-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+.auto-title{ font-size:.96rem; font-weight:800; display:flex; align-items:center; gap:8px; }
+.auto-dot{ width:9px; height:9px; border-radius:50%; display:inline-block; }
+.auto-grid{ display:grid; grid-template-columns:repeat(4,1fr); gap:9px; margin-bottom:11px; }
+.auto-kpi{ background:var(--bg1); border:1px solid var(--line); border-radius:9px; padding:9px 11px; }
+.auto-kpi .l{ font-size:.58rem; color:var(--t3); font-weight:700; text-transform:uppercase; letter-spacing:.03em; }
+.auto-kpi .v{ font-size:1.02rem; font-weight:800; margin-top:3px; }
+.auto-log{ font-size:.71rem; color:var(--t2); font-variant-numeric:tabular-nums; padding:1px 0; }
+
+/* 우측 내 계좌 */
+.acct{ background:linear-gradient(160deg,#17202E,var(--bg2)); border:1px solid var(--line2); border-radius:13px; padding:16px; }
+.acct .eql{ font-size:.64rem; color:var(--t3); font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+.acct .eq{ font-size:1.72rem; font-weight:800; letter-spacing:-.02em; margin-top:3px; }
+.acct .pnl{ font-size:.86rem; font-weight:800; margin-top:3px; }
+.acct-sub{ display:flex; justify-content:space-between; margin-top:13px; padding-top:11px; border-top:1px solid var(--line); font-size:.78rem; }
+.acct-sub .k{ color:var(--t3); } .acct-sub .v{ color:var(--t1); font-weight:700; font-variant-numeric:tabular-nums; }
+.hl-row{ display:grid; grid-template-columns:26px 1fr auto; gap:9px; align-items:center;
+  padding:9px 4px; border-bottom:1px solid var(--line); font-size:.82rem; cursor:pointer; }
+.hl-row:last-child{ border-bottom:none; }
+.hl-row:hover{ background:var(--bg3); }
+.hl-row.sel{ background:rgba(49,130,246,.09); box-shadow:inset 2px 0 0 var(--blue); }
+.hl-nm b{ font-weight:700; } .hl-nm small{ display:block; font-size:.64rem; color:var(--t3); }
+</style>
+"""
+ui.add_head_html(TOSS2_STYLE, shared=True)
+
 
 # ── 유틸 ─────────────────────────────────────────────────────────────────────
 def _col(v: float) -> str:
@@ -621,6 +736,9 @@ DAEMON = _PoCDaemon()
 
 # 쓰기 후 현재 페이지를 다시 그리기 위한 훅(main_page에서 content.refresh 로 설정)
 _screen = {"refresh": lambda: None}
+# 메인 화면 콜백 훅(main_page에서 실제 함수로 교체)
+_hooks = {"select": (lambda tk: None), "set_mv": (lambda k: None),
+          "auto": (lambda: None), "open_page": (lambda fn: None)}
 
 
 # ── 공통 렌더 조각 ────────────────────────────────────────────────────────────
@@ -902,6 +1020,138 @@ def render_bottom_bar():
                 f'<span class="c" style="color:{c}">{"+" if chg>=0 else ""}{chg:+.2f} '
                 f'({"+" if pct>=0 else ""}{pct:.2f}%)</span></div>')
         ui.html("".join(html) or '<span style="color:var(--t3);font-size:.76rem;padding:0 14px">시세 불러오는 중…</span>')
+
+
+def render_market_pulse():
+    fg = _MKT.get("fg") or {}
+    status, is_open = _MKT.get("status", ("", False))
+    vix = rtf.get_price("^VIX") or {}
+    vix_px = vix.get("price", fg.get("vix", 0))
+    vix_pct = vix.get("change_pct", 0) * 100
+    score = max(0, min(100, int(fg.get("score", 50))))
+    oc = "var(--green)" if is_open else "var(--t3)"
+    with ui.element("div").classes("pulse"):
+        ui.html(f'<div class="mkt-stat"><span class="l">미국장</span>'
+                f'<span class="mkt-open"><span class="auto-dot" style="background:{oc}"></span>{status or "—"}</span></div>')
+        ui.html(f'<div class="mkt-stat"><span class="l">VIX 변동성</span>'
+                f'<span class="v mono" style="color:{_col(vix_pct)}">{_fmt(vix_px)} '
+                f'<span style="font-size:.7rem">{"+" if vix_pct>=0 else ""}{vix_pct:.1f}%</span></span></div>')
+        ui.html(f'<div class="fg"><div class="fg-top"><span>공포 &amp; 탐욕 지수</span>'
+                f'<span style="color:var(--t1);font-weight:800">{score} · {fg.get("label","—")}</span></div>'
+                f'<div class="fg-bar"><div class="fg-mark" style="left:calc({score}% - 1px)"></div></div>'
+                f'<div style="display:flex;justify-content:space-between;font-size:.56rem;color:var(--t4);margin-top:3px">'
+                f'<span>극도의 공포</span><span>극도의 탐욕</span></div></div>')
+
+
+def render_movers(state):
+    tab = state.get("mv", "gainers")
+    data = _MKT.get(tab, [])
+    with ui.element("div").classes("card2"):
+        with ui.element("div").classes("mv-tabs"):
+            for k, lbl in [("gainers", "🔺 상승 TOP"), ("losers", "🔻 하락 TOP")]:
+                t = ui.html(f'<div class="mv-tab{" on" if tab==k else ""}">{lbl}</div>')
+                t.on("click", lambda e, kk=k: _hooks["set_mv"](kk))
+        if not data:
+            ui.html('<div class="side-empty" style="padding:12px 0">시장 데이터 불러오는 중…</div>')
+            return
+        for i, it in enumerate(data[:8], 1):
+            tk = it.get("ticker", "")
+            chg = it.get("chg", 0)
+            c = _col(chg)
+            ini, lc = _logo(tk)
+            el = ui.html(
+                f'<div class="mv-row"><span class="mv-rank">{i}</span>'
+                f'<span class="tlogo" style="background:{lc};width:22px;height:22px;flex:0 0 22px;font-size:.54rem">{ini}</span>'
+                f'<b style="font-weight:700">{tk}</b>'
+                f'<span class="tnum mono" style="color:{c};font-size:.82rem">{"+" if chg>=0 else ""}{chg:.2f}%</span></div>')
+            el.on("click", lambda e, t=tk: _hooks["select"](t))
+
+
+def render_heatmap():
+    sectors = _MKT.get("sectors", [])
+    with ui.element("div").classes("card2"):
+        ui.html('<div class="sh2">섹터 <small>· 5일 수익률</small></div>')
+        if not sectors:
+            ui.html('<div class="side-empty" style="padding:12px 0">불러오는 중…</div>')
+            return
+        tiles = []
+        for s in sectors:
+            ret = s.get("ret", 0)
+            nm = s.get("name", "")
+            inten = min(1.0, abs(ret) / 4.0)
+            base = (240, 69, 79) if ret >= 0 else (78, 123, 245)
+            bg = f"rgba({base[0]},{base[1]},{base[2]},{0.16 + inten*0.55:.2f})"
+            tiles.append(f'<div class="heat-tile" style="background:{bg}"><div class="hn">{nm}</div>'
+                         f'<div class="hr">{"+" if ret>=0 else ""}{ret:.2f}%</div></div>')
+        ui.html('<div class="heat">' + "".join(tiles) + '</div>')
+
+
+def render_auto_panel(d):
+    cfg = load_config()
+    running = DAEMON.running()
+    dot = "var(--green)" if running else "var(--t3)"
+    last = time.strftime("%H:%M:%S", time.localtime(DAEMON.last_run)) if DAEMON.last_run else "—"
+    strat = cfg.get("strategy_name", cfg.get("strategy", "—"))
+    with ui.element("div").classes("auto"):
+        ui.html(f'<div class="auto-head"><div class="auto-title">🤖 자동매매'
+                f'<span class="auto-dot" style="background:{dot}"></span>'
+                f'<span style="font-size:.76rem;font-weight:700;color:{"var(--green)" if running else "var(--t3)"}">'
+                f'{"실행 중" if running else "정지"}</span></div>'
+                f'<span class="ind-tag">{strat} · {"모의" if cfg.get("paper",True) else "실거래"}</span></div>')
+        ui.html('<div class="auto-grid">'
+                f'<div class="auto-kpi"><div class="l">사이클 실행</div><div class="v mono">{DAEMON.runs}</div></div>'
+                f'<div class="auto-kpi"><div class="l">마지막 실행</div><div class="v mono" style="font-size:.84rem">{last}</div></div>'
+                f'<div class="auto-kpi"><div class="l">실행 주기</div><div class="v mono">{cfg.get("interval",0)}초</div></div>'
+                f'<div class="auto-kpi"><div class="l">손절/익절</div><div class="v mono" style="font-size:.84rem">'
+                f'{cfg.get("stop_loss",0)*100:.0f}/{cfg.get("take_profit",0)*100:.0f}%</div></div></div>')
+        with ui.row().classes("gap-2"):
+            if running:
+                ui.button("■ 정지", on_click=lambda: (DAEMON.stop(),
+                          ui.notify("자동매매 정지", position="top"), _hooks["auto"]())
+                          ).classes("tbtn tbtn-danger")
+            else:
+                ui.button("▶ 자동매매 시작", on_click=lambda: confirm(
+                    "자동매매 시작",
+                    f'{cfg.get("interval",300)}초 주기로 run_cycle(발굴·채점·주문)을 실행합니다. 모의 체결.',
+                    lambda: (DAEMON.start() and None, ui.notify("자동매매 시작 — 첫 사이클 실행 중…", position="top"), _hooks["auto"]()),
+                    ok_label="시작")).classes("tbtn tbtn-primary")
+            ui.button("↻ 지금 1회 실행", on_click=lambda: confirm(
+                "지금 1회 실행", "run_cycle 사이클을 1회 실행합니다.",
+                lambda: (DAEMON.run_once(), ui.notify("사이클 1회 실행 중…", position="top")),
+                ok_label="실행")).classes("tbtn")
+        if DAEMON.last_log:
+            ui.html('<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">'
+                    + "".join(f'<div class="auto-log">· {str(m)[:120]}</div>' for m in DAEMON.last_log[-4:])
+                    + '</div>')
+
+
+def render_my_account(d, state):
+    pnl_pct = (d["total_pnl"] / d["cost"] * 100) if d["cost"] else 0.0
+    c = _col(d["total_pnl"])
+    with ui.element("div").classes("acct"):
+        ui.html(f'<div class="eql">총 평가자산</div><div class="eq mono">${_fmt(d["equity"])}</div>'
+                f'<div class="pnl mono" style="color:{c}">{"+" if d["total_pnl"]>=0 else ""}'
+                f'${_fmt(d["total_pnl"])} ({pnl_pct:+.2f}%)</div>'
+                f'<div class="acct-sub"><span class="k">투자원금</span><span class="v">${_fmt(d["cost"])}</span></div>'
+                f'<div class="acct-sub" style="border-top:none;padding-top:5px;margin-top:5px">'
+                f'<span class="k">가용 현금</span><span class="v">${_fmt(d["cash"])}</span></div>')
+    with ui.element("div").classes("card2"):
+        ui.html(f'<div class="sh2">보유 종목 <small>{len(d["rows"])}종목 · 클릭 상세</small></div>')
+        if not d["rows"]:
+            ui.html('<div class="side-empty" style="padding:14px 0;text-align:center;line-height:1.7">보유 종목 없음<br>'
+                    '<span style="font-size:.68rem">자동매매를 켜거나 레일 💵 주문으로 매수</span></div>')
+        else:
+            for r in d["rows"]:
+                c2 = _col(r["pnl"])
+                ini, lc = _logo(r["tk"])
+                sel = " sel" if state.get("sel") == r["tk"] else ""
+                el = ui.html(
+                    f'<div class="hl-row{sel}">'
+                    f'<span class="tlogo" style="background:{lc};width:24px;height:24px;flex:0 0 24px;font-size:.56rem">{ini}</span>'
+                    f'<div class="hl-nm"><b>{r["tk"]}</b><small>{r["sh"]:g}주 · {SECTOR_KO.get(r["sector"],"")}</small></div>'
+                    f'<div class="tnum mono" style="color:{c2};font-size:.78rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div>')
+                el.on("click", lambda e, tk=r["tk"]: _hooks["select"](tk))
+    render_detail(d, state)
 
 
 def page_dashboard():
@@ -1282,17 +1532,18 @@ PAGE_FUNCS = {
 # ── 앱 셸 ─────────────────────────────────────────────────────────────────────
 @ui.page("/")
 def main_page():
-    state = {"sel": None, "rmode": "상세"}
+    state = {"sel": None, "mv": "gainers"}
     try:
         _subscribe([s for s, _ in INDEX_CARDS] + [r["tk"] for r in collect()["rows"]])
     except Exception:
         _subscribe([s for s, _ in INDEX_CARDS])
     ensure_hist_running(lambda: [r["tk"] for r in collect()["rows"]])
+    ensure_market_running()
 
-    # 미니 헤더 (탭 최소화)
+    # 헤더
     with ui.element("div").classes("topbar"):
         ui.html('<span class="brand">📈 AI 트레이딩</span>'
-                '<nav class="tnav"><a class="on">홈</a></nav>')
+                '<nav class="tnav"><a class="on">시장</a></nav>')
         ui.html('<div class="search">/ 종목·지수 검색</div>')
 
         @ui.refreshable
@@ -1305,16 +1556,16 @@ def main_page():
                     f'<span class="mono">{now}</span></div>')
         meta_box()
 
-    # 콜백 (본문보다 먼저 정의 — 첫 렌더에서 참조됨)
+    # 콜백
     def select(tk):
         state["sel"] = tk
-        tbl.refresh()
-        right.refresh()
+        _subscribe([tk], interval=3.0)
+        threading.Thread(target=lambda: prefetch_history([tk]), daemon=True).start()
+        acct_box.refresh()
 
-    def set_rmode(k):
-        state["rmode"] = k
-        rail.refresh()
-        right.refresh()
+    def set_mv(k):
+        state["mv"] = k
+        movers_box.refresh()
 
     def open_page(fn):
         with ui.dialog() as pg, ui.card().classes("drawer-card").style(
@@ -1323,32 +1574,56 @@ def main_page():
             ui.button("닫기", on_click=pg.close).classes("tbtn").style("margin-top:10px")
         pg.open()
 
-    # 본문
+    _hooks["select"] = select
+    _hooks["set_mv"] = set_mv
+    _hooks["open_page"] = open_page
+    _hooks["auto"] = lambda: auto_box.refresh()
+
+    # 본문: 지수 → (시장 정보 | 내 계좌)
     with ui.element("div").classes("wrap"):
         @ui.refreshable
         def idx_grid():
             render_index_grid()
         idx_grid()
 
-        with ui.element("div").classes("tmain"):
-            with ui.element("div").classes("col-main"):
-                ui.html('<div class="th">보유 종목 <small>· 실시간 · 행 클릭 시 상세</small></div>')
+        with ui.element("div").classes("page2col"):
+            # 좌: 시장 정보 (메인)
+            with ui.element("div").classes("col-mkt"):
+                @ui.refreshable
+                def pulse_box():
+                    render_market_pulse()
+                pulse_box()
+
+                with ui.element("div").classes("mkt-row"):
+                    with ui.element("div"):
+                        ui.html('<div class="sh2">급등락 <small>· S&amp;P 500 · 클릭 상세</small></div>')
+
+                        @ui.refreshable
+                        def movers_box():
+                            render_movers(state)
+                        movers_box()
+                    with ui.element("div"):
+                        @ui.refreshable
+                        def heat_box():
+                            render_heatmap()
+                        heat_box()
 
                 @ui.refreshable
-                def tbl():
-                    d = collect()
-                    if state["sel"] is None:
-                        state["sel"] = d["rows"][0]["tk"] if d["rows"] else INDEX_CARDS[0][0]
-                    render_toss_table(d, state, select)
-                tbl()
-            with ui.element("div"):
+                def auto_box():
+                    render_auto_panel(collect())
+                auto_box()
+
+            # 우: 내 계좌 (분리)
+            with ui.element("div").classes("col-acct"):
+                ui.html('<div class="sh2">내 계좌 <small>· 자동매매 대상</small></div>')
+
                 @ui.refreshable
-                def right():
+                def acct_box():
                     d = collect()
                     if state["sel"] is None:
                         state["sel"] = d["rows"][0]["tk"] if d["rows"] else INDEX_CARDS[0][0]
-                    render_right(d, state)
-                right()
+                    render_my_account(d, state)
+                acct_box()
 
     # 하단 고정 티커바
     @ui.refreshable
@@ -1356,31 +1631,34 @@ def main_page():
         render_bottom_bar()
     bottom()
 
-    # 플로팅 우측 레일 — 뷰 모드 + 거래 메뉴
-    @ui.refreshable
-    def rail():
-        with ui.element("div").classes("frail"):
-            for key, icon in [("상세", "📈"), ("내투자", "💼"), ("실시간", "🔥"), ("관심", "⭐")]:
-                it = ui.html(f'<div class="frail-item{" on" if state["rmode"]==key else ""}">'
-                             f'<span class="fi">{icon}</span>{key}</div>')
-                it.on("click", lambda e, k=key: set_rmode(k))
-            ui.html('<div class="frail-div"></div>')
-            for label, icon, fn in [("주문", "💵", page_order), ("자동", "🤖", page_auto),
-                                    ("전략", "🎯", page_strategy), ("열람", "🔍", page_stocks),
-                                    ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
-                it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
-                it.on("click", lambda e, f=fn: open_page(f))
-    rail()
+    # 플로팅 우측 레일 — 거래 메뉴
+    with ui.element("div").classes("frail"):
+        for label, icon, fn in [("주문", "💵", page_order), ("자동", "🤖", page_auto),
+                                ("전략", "🎯", page_strategy), ("열람", "🔍", page_stocks),
+                                ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
+            it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
+            it.on("click", lambda e, f=fn: open_page(f))
 
-    _screen["refresh"] = lambda: (tbl.refresh(), right.refresh())
+    _screen["refresh"] = lambda: (acct_box.refresh(), auto_box.refresh())
 
-    def tick():
+    def tick_fast():
         meta_box.refresh()
         idx_grid.refresh()
         bottom.refresh()
 
-    ui.timer(2.0, tick)
-    ui.timer(6.0, lambda: (tbl.refresh(), right.refresh()))
+    def tick_med():
+        auto_box.refresh()
+        acct_box.refresh()
+
+    def tick_slow():
+        pulse_box.refresh()
+        movers_box.refresh()
+        heat_box.refresh()
+
+    ui.timer(2.0, tick_fast)
+    ui.timer(5.0, tick_med)
+    ui.timer(12.0, tick_slow)
+    ui.timer(4.0, tick_slow, once=True)   # 시장 데이터 초기 조기 표시
 
 
 if __name__ in {"__main__", "__mp_main__"}:
