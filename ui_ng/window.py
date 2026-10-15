@@ -77,6 +77,16 @@ def main():
         except Exception:
             pass
 
+    def _activate():
+        # .app 래퍼 스크립트로 띄우면 자식 python 창이 전면 활성화가 안 돼
+        # WKWebView가 페인트를 멈춰 '빈 창'처럼 보인다 → 명시적으로 전면 활성화.
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+    win.events.shown += _activate
     win.events.closed += _on_closed
     webview.start()                     # 메인 스레드 점유 = 창 생명주기
 
