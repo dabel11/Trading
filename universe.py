@@ -57,6 +57,26 @@ INDEXES = {
 }
 
 
+# 나스닥100 하드코딩 폴백 — 위키 Nasdaq-100 페이지가 navbox 템플릿(스크랩 불가)으로
+# 바뀌어 _fetch_wiki_table 이 0종목을 반환한다(2026 확인). 구성종목은 연 1회 수준으로만
+# 바뀌므로 하드코딩이 깨진 스크랩보다 안정적이다.
+NASDAQ100 = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AXON", "AZN", "BIIB", "BKNG",
+    "BKR", "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD",
+    "CSCO", "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DXCM", "EA", "EXC",
+    "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
+    "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU", "MAR",
+    "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MSTR", "MU",
+    "NFLX", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD",
+    "PEP", "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SNPS", "TEAM",
+    "TMUS", "TSLA", "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS",
+]
+
+# 스크랩이 깨졌을 때 쓸 하드코딩 폴백
+_FALLBACKS = {"나스닥 100": NASDAQ100}
+
+
 def get_index(name: str) -> list[str]:
     """지수 구성종목 티커 목록 반환 (캐시)."""
     cache = _load_cache()
@@ -69,6 +89,8 @@ def get_index(name: str) -> list[str]:
         syms = _fetch_wiki_table(url, col)
     except Exception:
         syms = []
+    if not syms and name in _FALLBACKS:     # 스크랩 실패 → 하드코딩 폴백
+        syms = list(_FALLBACKS[name])
     if syms:
         cache[name] = syms
         _save_cache(cache)

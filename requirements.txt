@@ -6,6 +6,7 @@ streamlit>=1.58.0
 streamlit-autorefresh>=1.0.1
 plotly>=6.7.0
 pywebview>=6.2.1          # 네이티브 .app 창
+nicegui>=3.18             # 신규 UI(ui_ng/) — 탈-Streamlit 이전본
 
 # ── 데이터 처리 ──
 pandas>=2.0
