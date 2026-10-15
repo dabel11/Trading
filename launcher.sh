@@ -1,15 +1,17 @@
 #!/bin/bash
 # AI 트레이딩 — macOS 런처
-# NiceGUI 앱(ui_ng)을 pywebview 네이티브 창으로 실행 (구 Streamlit app.py 대체)
+# NiceGUI 앱(ui_ng)을 전용 venv에서 pywebview 네이티브 창으로 실행 (구 Streamlit app.py 대체)
+# 전용 venv(--system-site-packages)로 pandas/yfinance 등은 재사용하고 nicegui만 추가해
+# 시스템 Python 의존성을 오염시키지 않는다.
 
-# 앱이 위치한 디렉터리 (.app/Contents/Resources/trade)
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR" || exit 1
 
-PORT=8501
 LOG="$HOME/Library/Logs/AITrading.log"
 mkdir -p "$(dirname "$LOG")"
+echo "=== $(date) 시작 ===" >> "$LOG"
 
+# ── 베이스 Python 선택 (백엔드 의존성 pandas 등 보유한 것 우선) ──
 CANDIDATES=(
   /Library/Frameworks/Python.framework/Versions/3.14/bin/python3
   /Library/Frameworks/Python.framework/Versions/Current/bin/python3
@@ -17,42 +19,37 @@ CANDIDATES=(
   /opt/homebrew/bin/python3
   "$(command -v python3)"
 )
-
-echo "=== $(date) 시작 ===" >> "$LOG"
-
-# 1순위: nicegui가 이미 설치된 Python 선택
-PY=""
+BASE_PY=""
 for cand in "${CANDIDATES[@]}"; do
-  if [ -x "$cand" ] && "$cand" -c "import nicegui" 2>/dev/null; then
-    PY="$cand"; echo "nicegui 보유 Python: $PY" >> "$LOG"; break
+  if [ -x "$cand" ] && "$cand" -c "import pandas" 2>/dev/null; then
+    BASE_PY="$cand"; break
   fi
 done
-
-# 없으면: 사용 가능한 첫 Python에 설치
-if [ -z "$PY" ]; then
-  for cand in "${CANDIDATES[@]}"; do
-    if [ -x "$cand" ]; then PY="$cand"; break; fi
-  done
-  if [ -z "$PY" ]; then
-    osascript -e 'display alert "Python 필요" message "Python 3가 설치되어 있지 않습니다. python.org 에서 설치 후 다시 실행하세요."'
-    exit 1
-  fi
-  echo "패키지 설치 대상 Python: $PY" >> "$LOG"
-  osascript -e 'display notification "필수 패키지를 설치합니다 (1~2분 소요)" with title "AI 트레이딩"'
-  PKGS="nicegui plotly pandas numpy yfinance finnhub-python alpaca-py ta requests pywebview lxml"
-  # PEP 668(외부관리 환경) 우회 + --user 폴백
-  "$PY" -m pip install --user -q $PKGS >> "$LOG" 2>&1 \
-    || "$PY" -m pip install --user --break-system-packages -q $PKGS >> "$LOG" 2>&1
+if [ -z "$BASE_PY" ]; then
+  for cand in "${CANDIDATES[@]}"; do [ -x "$cand" ] && BASE_PY="$cand" && break; done
 fi
+if [ -z "$BASE_PY" ]; then
+  osascript -e 'display alert "Python 필요" message "Python 3가 설치되어 있지 않습니다. python.org 에서 설치 후 다시 실행하세요."'
+  exit 1
+fi
+echo "베이스 Python: $BASE_PY" >> "$LOG"
 
-# pywebview 보장 (네이티브 창)
+# ── 전용 venv (최초 1회 생성, 시스템 패키지 재사용) ──
+VENV="$HOME/Library/Application Support/AITrading/venv"
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "venv 생성: $VENV" >> "$LOG"
+  osascript -e 'display notification "최초 실행 준비 중입니다 (1~2분 소요)" with title "AI 트레이딩"'
+  "$BASE_PY" -m venv --system-site-packages "$VENV" >> "$LOG" 2>&1
+fi
+PY="$VENV/bin/python"
+
+# ── nicegui / pywebview 보장 ──
+"$PY" -c "import nicegui" 2>/dev/null \
+  || "$PY" -m pip install -q nicegui >> "$LOG" 2>&1
 "$PY" -c "import webview" 2>/dev/null \
-  || "$PY" -m pip install --user -q pywebview >> "$LOG" 2>&1 \
-  || "$PY" -m pip install --user --break-system-packages -q pywebview >> "$LOG" 2>&1
+  || "$PY" -m pip install -q pywebview >> "$LOG" 2>&1
 
 echo "NiceGUI 네이티브 앱 실행 (ui_ng.window)" >> "$LOG"
-
-# ui_ng/window.py 가 NiceGUI 서버 기동 + pywebview 네이티브 창 표시를 모두 담당.
 # -m 실행이므로 반드시 프로젝트 루트($APP_DIR)에서 돌려야 ui_ng/백엔드 import 가 된다.
 # arm64 강제: 유니버설 Python이 Rosetta 모드로 실행되면 arm64-only .so 로드 실패.
 if arch -arm64 true 2>/dev/null; then
