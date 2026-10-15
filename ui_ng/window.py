@@ -46,7 +46,7 @@ def _start_server():
     return subprocess.Popen(
         [sys.executable, "-m", "ui_ng.dashboard"],
         cwd=str(ROOT),
-        env={**os.environ, "POC_DEMO": "1"},
+        env=dict(os.environ),   # 실제 장부 모드(기본). 개발 격리는 POC_ISOLATE=1 로 외부 지정.
         stdout=log, stderr=subprocess.STDOUT,
     )
 
@@ -62,7 +62,7 @@ def main():
 
     import webview
     win = webview.create_window(
-        "AI 트레이딩 · NiceGUI",        # 기존 'AI 트레이딩' 창과 구분되는 제목
+        "AI 트레이딩",
         URL,
         width=1440, height=900,
         min_size=(1100, 700),

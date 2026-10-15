@@ -39,35 +39,40 @@ except Exception:
 
 ROOT = Path(__file__).resolve().parent.parent
 PAPER = True
-DEMO = os.environ.get("POC_DEMO", "1") == "1"
 
-# ── 상태 격리: 실가동 앱과 완전히 분리된 PoC 전용 state 디렉터리 ──────────────
-# 모든 상태 파일(config·pid·현금·장부·주문·lock)을 ui_ng/_poc_state/ 로 리다이렉트.
-# 백엔드 함수들은 내부에서 import 한 '같은' 모듈 전역을 쓰므로(모듈 싱글톤),
-# 여기서 모듈 상수만 바꾸면 인프로세스 쓰기 전부가 이 디렉터리로 격리된다.
+# ── 상태 모드 ────────────────────────────────────────────────────────────────
+# 기본 = 실제 장부(app.py 완전 대체 — config·현금·보유·주문을 그대로 공유).
+# POC_ISOLATE=1 → ui_ng/_poc_state/ 로 격리(개발·데모용, 실가동과 분리).
 import portfolio as _pf_mod
 import core.control as _ctl_mod
 import core.execution as _ex_mod
 import safe_store as _ss_mod
 
-POC_STATE = ROOT / "ui_ng" / "_poc_state"
-POC_STATE.mkdir(parents=True, exist_ok=True)
-_ctl_mod.CONFIG_FILE = POC_STATE / "autotrader_config.json"
-_ctl_mod.PID_FILE = POC_STATE / "autotrader.pid"
-pa.PAPER_FILE = POC_STATE / "paper_account.json"
-_pf_mod.STATE_FILE = POC_STATE / "state.json"
-_pf_mod.PAPER_STATE_FILE = POC_STATE / "state_paper.json"
-_ex_mod.ORDERS_FILE = POC_STATE / "orders_log.json"
-_ss_mod._TRADE_LOCK_FILE = POC_STATE / ".trade.lock"
+POC_ISOLATE = os.environ.get("POC_ISOLATE", "0") == "1"
+DEMO = POC_ISOLATE and os.environ.get("POC_DEMO", "1") == "1"  # 샘플 포지션은 격리 모드만
 
-# 최초 시드 — config(모의·복합·자동매매 off) + 모의현금 $10,000
-if not _ctl_mod.CONFIG_FILE.exists():
-    _seed = dict(_ctl_mod.DEFAULT_CONFIG)
-    _seed["enabled"] = False
-    _seed["paper"] = True
-    _ctl_mod.CONFIG_FILE.write_text(json.dumps(_seed, ensure_ascii=False))
-if not pa.PAPER_FILE.exists():
-    pa.PAPER_FILE.write_text(json.dumps({"cash": 10000.0, "seed": 10000.0}))
+if POC_ISOLATE:
+    # 모든 상태 파일을 전용 디렉터리로 리다이렉트(모듈 싱글톤 전역 몽키패치).
+    POC_STATE = ROOT / "ui_ng" / "_poc_state"
+    POC_STATE.mkdir(parents=True, exist_ok=True)
+    _ctl_mod.CONFIG_FILE = POC_STATE / "autotrader_config.json"
+    _ctl_mod.PID_FILE = POC_STATE / "autotrader.pid"
+    pa.PAPER_FILE = POC_STATE / "paper_account.json"
+    _pf_mod.STATE_FILE = POC_STATE / "state.json"
+    _pf_mod.PAPER_STATE_FILE = POC_STATE / "state_paper.json"
+    _ex_mod.ORDERS_FILE = POC_STATE / "orders_log.json"
+    _ss_mod._TRADE_LOCK_FILE = POC_STATE / ".trade.lock"
+    if not _ctl_mod.CONFIG_FILE.exists():
+        _seed = dict(_ctl_mod.DEFAULT_CONFIG)
+        _seed["enabled"] = False
+        _seed["paper"] = True
+        _ctl_mod.CONFIG_FILE.write_text(json.dumps(_seed, ensure_ascii=False))
+    if not pa.PAPER_FILE.exists():
+        pa.PAPER_FILE.write_text(json.dumps({"cash": 10000.0, "seed": 10000.0}))
+    STATE_LABEL = "격리된 PoC 전용 장부(ui_ng/_poc_state)에만 반영됩니다. 실가동 앱과 무관."
+else:
+    # 실제 장부 — 백엔드 기본 경로(프로젝트 루트) 그대로 사용.
+    STATE_LABEL = "실제 장부(config·현금·보유·주문)에 반영됩니다."
 
 PAGES = ["대시보드", "전략 선택", "자동 트레이딩", "포트폴리오",
          "주식 열람", "직접 주문", "설정"]
@@ -264,7 +269,7 @@ def _subscribe(tickers, interval=5.0):
 
 def read_orders(limit=40):
     try:
-        with open(POC_STATE / "orders_log.json") as f:
+        with open(_ex_mod.ORDERS_FILE) as f:
             d = json.load(f)
         return list(reversed(d.get("orders", [])))[:limit]
     except Exception:
@@ -305,8 +310,7 @@ def confirm(title: str, body: str, on_ok, ok_label: str = "실행", danger: bool
             "max-width:460px;color:var(--t1);gap:6px"):
         ui.html(f'<div style="font-size:.95rem;font-weight:800;margin-bottom:2px">{title}</div>'
                 f'<div style="font-size:.8rem;color:var(--t2);line-height:1.6">{body}</div>'
-                '<div style="font-size:.7rem;color:var(--t3);margin-top:8px">'
-                '· 격리된 PoC 전용 장부(ui_ng/_poc_state)에만 반영됩니다. 실가동 앱과 무관.</div>')
+                f'<div style="font-size:.7rem;color:var(--t3);margin-top:8px">· {STATE_LABEL}</div>')
         with ui.row().classes("w-full justify-end").style("gap:8px;margin-top:8px"):
             ui.button("취소", on_click=d.close).classes("tbtn")
 
@@ -339,6 +343,12 @@ class _PoCDaemon:
     def start(self) -> bool:
         if self.running():
             return False
+        # 단일 실행 권한: 외부 데몬(autotrader.py)이 살아있으면 거부 → 중복 매매 방지.
+        try:
+            if not _ctl_mod.register_pid():
+                return False
+        except Exception:
+            pass
         self._stop.clear()
         try:
             _ctl_mod.set_enabled(True)
@@ -352,6 +362,7 @@ class _PoCDaemon:
         self._stop.set()
         try:
             _ctl_mod.set_enabled(False)
+            _ctl_mod.cleanup_pid()
         except Exception:
             pass
 
@@ -569,9 +580,12 @@ def page_auto():
         ui.html("".join(f'<div class="kv"><span class="k">{k}</span><span class="v">{v}</span></div>' for k, v in rows))
     ui.html('<div class="sec-h" style="margin-top:14px">제어</div>')
     def _start():
-        DAEMON.start()
-        ui.notify("자동매매를 시작했습니다. 첫 사이클 실행 중…", position="top")
-        ui.timer(7.0, _screen["refresh"], once=True)
+        if DAEMON.start():
+            ui.notify("자동매매를 시작했습니다. 첫 사이클 실행 중…", position="top")
+            ui.timer(7.0, _screen["refresh"], once=True)
+        else:
+            ui.notify("시작 실패 — 이미 실행 중이거나 외부 데몬이 가동 중입니다.",
+                      type="warning", position="top")
         _screen["refresh"]()
 
     def _stop():
@@ -923,5 +937,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         _ngcore.sio.eio.max_http_buffer_size = 32 * 1024 * 1024
     except Exception:
         pass
-    ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩 · NiceGUI",
+    ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
            show=False, reload=False, dark=True, favicon="📈")
