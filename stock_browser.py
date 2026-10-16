@@ -521,6 +521,71 @@ def search(query: str, sector: str = "전체") -> list[dict]:
     return results[:80]  # 최대 80개
 
 
+_SYMSEARCH_CACHE: dict = {}
+
+
+def symbol_search(query: str, limit: int = 25) -> list[dict]:
+    """미국장 '전 종목' 검색 — Finnhub 심볼검색(회사명·티커) + 로컬 DB 병합.
+
+    로컬 DB(~700종목) 밖의 모든 미국 상장 종목까지 회사명으로 찾는다.
+    반환: [{"ticker","name","sector"}] (US 상장 우선, 중복 제거).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    q_up = q.upper()
+
+    # 1) 로컬 DB (한글 섹터·빠른 매칭) 먼저
+    merged: dict[str, dict] = {}
+    for r in search(q):
+        merged.setdefault(r["ticker"].upper(), r)
+
+    # 2) Finnhub 심볼검색 (전 종목) — 캐시 60초
+    import time as _t
+    hit = _SYMSEARCH_CACHE.get(q_up)
+    if hit and _t.time() - hit[0] < 60:
+        fh = hit[1]
+    else:
+        fh = []
+        try:
+            import json as _j, urllib.request, urllib.parse
+            from config import FINNHUB_API_KEY as _fk
+            if _fk and "your_" not in _fk:
+                url = ("https://finnhub.io/api/v1/search?q="
+                       + urllib.parse.quote(q) + "&token=" + _fk)
+                with urllib.request.urlopen(url, timeout=8) as rr:
+                    data = _j.loads(rr.read().decode())
+                for it in (data.get("result") or []):
+                    sym = (it.get("symbol") or "").upper()
+                    desc = it.get("description") or sym
+                    # 미국 상장만: 해외 거래소 접미사(.XX) 제외
+                    if not sym or "." in sym or ":" in sym:
+                        continue
+                    fh.append({"ticker": sym, "name": desc.title(),
+                               "sector": "", "etf": ""})
+        except Exception:
+            fh = []
+        _SYMSEARCH_CACHE[q_up] = (_t.time(), fh)
+
+    for r in fh:
+        merged.setdefault(r["ticker"], r)
+
+    out = list(merged.values())
+    ql = q.lower()
+
+    def _rank(r):
+        tk = r["ticker"]; nm = (r.get("name") or "").lower()
+        if tk == q_up:
+            return (0, len(tk))                     # 티커 정확 일치
+        if nm.startswith(ql):
+            return (1, len(nm))                     # 회사명 앞부분 일치
+        if tk.startswith(q_up):
+            return (2, len(tk))                     # 티커 앞부분 일치
+        return (3, len(tk))
+    out.sort(key=_rank)
+    return out[:limit]
+
+
 def search_kr(query: str) -> list[dict]:
     """국내 종목만 검색."""
     q = query.strip().lower()

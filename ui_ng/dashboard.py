@@ -501,7 +501,8 @@ body{ background:var(--bg0)!important; }
 .tnav a:hover{ color:var(--t2); background:var(--bg3); }
 .tnav a.on{ color:var(--t1); }
 .search{ flex:1; max-width:360px; margin:0 16px; background:var(--bg2); border:1px solid var(--line);
-  border-radius:9px; padding:7px 12px; font-size:.78rem; color:var(--t3); }
+  border-radius:9px; padding:7px 12px; font-size:.78rem; color:var(--t3); cursor:pointer; }
+.search:hover{ border-color:var(--line2); color:var(--t2); }
 </style>
 """
 ui.add_head_html(TOSS_STYLE, shared=True)
@@ -623,6 +624,17 @@ AI_STYLE = """
 .dai-top{ display:flex; align-items:center; justify-content:space-between; }
 .dai-ttl{ font-size:.66rem; font-weight:800; color:#C9BBFF; letter-spacing:.03em; }
 .dai-rat{ font-size:.7rem; color:var(--t2); margin-top:6px; line-height:1.45; }
+/* 전 종목 검색 결과 행 */
+.srow{ display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding:9px 12px; border:1px solid var(--line); border-radius:9px; background:var(--bg1);
+  cursor:pointer; }
+.srow:hover{ background:var(--bg3); border-color:var(--line2); }
+/* 자동매매 타겟 스캔 */
+.tgt-sum{ display:grid; grid-template-columns:repeat(3,1fr); gap:9px; margin:10px 0; }
+.tgt-kpi{ background:var(--bg1); border:1px solid var(--line2); border-radius:10px; padding:10px 12px; text-align:center; }
+.tgt-kpi .l{ font-size:.6rem; color:var(--t3); font-weight:700; }
+.tgt-kpi .v{ font-size:1.25rem; font-weight:800; margin-top:3px; }
+.tgt-line{ font-size:.7rem; color:var(--t3); margin:2px 0 10px; }
 </style>
 """
 ui.add_head_html(AI_STYLE, shared=True)
@@ -638,6 +650,20 @@ def _fmt(n, dec=2) -> str:
         return f"{float(n):,.{dec}f}"
     except Exception:
         return "—"
+
+
+def _age(ts) -> str:
+    try:
+        d = max(0, int(time.time() - float(ts)))
+    except Exception:
+        return "—"
+    if not ts:
+        return "아직 없음"
+    if d < 60:
+        return f"{d}초 전"
+    if d < 3600:
+        return f"{d//60}분 전"
+    return f"{d//3600}시간 전"
 
 
 def _price(tk: str):
@@ -1422,12 +1448,12 @@ def page_auto():
                 for m in DAEMON.last_log))
 
 
-def page_order():
+def page_order(preset_ticker=None):
     _subscribe([s for s, _ in INDEX_SYMS])
     ui.html('<div class="sec-h">직접 주문 (모의)</div>')
     state = {"side": "buy"}
     with ui.element("div").classes("card").style("max-width:560px"):
-        tk_in = ui.input("종목 티커", value="AAPL").props("outlined dense dark").classes("w-full")
+        tk_in = ui.input("종목 티커", value=(preset_ticker or "AAPL")).props("outlined dense dark").classes("w-full")
         with ui.element("div").classes("seg").style("margin:10px 0"):
             buy_b = ui.label("매수").classes("segbtn on-buy")
             sell_b = ui.label("매도").classes("segbtn")
@@ -1578,23 +1604,51 @@ def page_ai():
 
     render_ai_sources()
 
-    ui.html('<div class="sh2" style="margin-top:14px">최신 AI 판단 <small>· 점수 내림차순</small></div>')
+    buy_th = int(cfg.get("min_score", 60))
+    sell_th = int(cfg.get("sell_score", 35))
+
+    def _tickers():
+        """자동매매가 실제로 스캔하는 유니버스(watchlist) + 보유종목."""
+        try:
+            import watchlist as wl
+            uni_list = list(wl.load() or [])
+        except Exception:
+            uni_list = []
+        try:
+            held = [r["tk"] for r in collect()["rows"]]
+        except Exception:
+            held = []
+        out = list(dict.fromkeys(uni_list + held))
+        return out or ["AAPL", "MSFT", "NVDA"]
+
+    uni_n = len(_tickers())
+    ui.html(f'<div class="sh2" style="margin-top:14px">🎯 자동매매 타겟 스캔 '
+            f'<small>· 유니버스 {uni_n}종목 · 매수문턱 {buy_th}</small></div>')
 
     busy = {"on": False}
 
     @ui.refreshable
     def vbox():
-        if busy["on"] and not _eng.LAST.get("verdicts"):
-            ui.html('<div class="empty">🧠 공신력 소스를 모아 AI가 판단 중… (수초)</div>')
+        snap = _eng.snapshot(top=60)
+        verds = snap.get("verdicts") or []
+        # 타겟팅 요약
+        if verds:
+            n_buy = sum(1 for v in verds if v["score"] >= buy_th)
+            n_sell = sum(1 for v in verds if v["score"] <= sell_th)
+            n_hold = len(verds) - n_buy - n_sell
+            ui.html(
+                '<div class="tgt-sum">'
+                f'<div class="tgt-kpi"><div class="l">🔴 매수 타겟</div><div class="v" style="color:var(--up)">{n_buy}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">⚪ 관망</div><div class="v">{n_hold}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">🔵 매도/회피</div><div class="v" style="color:var(--dn)">{n_sell}</div></div>'
+                '</div>'
+                f'<div class="tgt-line">자동매매는 매 사이클 이 {len(verds)}종목을 AI로 채점해 '
+                f'확신점수 {buy_th} 이상을 매수, {sell_th} 이하를 매도합니다. (분석 {_age(snap.get("ts",0))})</div>')
+        if busy["on"] and not verds:
+            ui.html('<div class="empty">🧠 유니버스를 공신력 소스로 채점 중… (수~수십초)</div>')
             return
-        render_ai_verdicts(_eng.snapshot(top=16))
+        render_ai_verdicts({"verdicts": verds[:24]})
     vbox()
-
-    def _tickers():
-        try:
-            return [r["tk"] for r in collect()["rows"]][:12] or ["AAPL", "MSFT", "NVDA"]
-        except Exception:
-            return ["AAPL", "MSFT", "NVDA"]
 
     def _run(force=True):
         tickers = _tickers()
@@ -1603,28 +1657,28 @@ def page_ai():
 
         def work():
             try:
-                _eng.score_universe(tickers, ttl=0 if force else _eng._TTL)
+                _eng.score_universe(tickers, buy_th=buy_th, sell_th=sell_th,
+                                    ttl=0 if force else _eng._TTL)
             except Exception:
                 pass
             finally:
                 busy["on"] = False
         threading.Thread(target=work, daemon=True).start()
-        # 결과가 채워질 때까지 폴링(최대 ~30초), 나오면 자동 중지.
         tries = {"n": 0}
         holder = {}
 
         def poll():
             tries["n"] += 1
             vbox.refresh()
-            if _eng.LAST.get("verdicts") or tries["n"] >= 16:
+            if (_eng.LAST.get("verdicts") and not busy["on"]) or tries["n"] >= 24:
                 t = holder.get("t")
                 if t:
                     t.active = False
         holder["t"] = ui.timer(2.0, poll)
 
     with ui.row().style("margin-top:10px;gap:8px"):
-        ui.button("지금 재분석", on_click=lambda: (_run(True),
-                   ui.notify("보유 종목을 AI로 재분석 중…", position="top"))).classes("tbtn tbtn-primary")
+        ui.button("유니버스 전체 재스캔", on_click=lambda: (_run(True),
+                   ui.notify(f"유니버스 {uni_n}종목을 AI로 재스캔 중…", position="top"))).classes("tbtn tbtn-primary")
         ui.button("새로고침", on_click=vbox.refresh).classes("tbtn")
         ui.button("폴백 전략 선택", on_click=lambda: _hooks["open_page"](page_strategy)).classes("tbtn")
 
@@ -1670,8 +1724,162 @@ def page_strategy():
                     (lambda key=key, nm=nm: _set_strategy(key, nm)), ok_label="변경"))
 
 
+def page_lookup(ticker):
+    """미국장 임의 종목 상세 — 시세·차트·핵심지표 + AI 판단(공신력 소스)."""
+    import stock_browser as sb
+    ticker = (ticker or "").upper().strip()
+    data = {"quote": None, "hist": None, "verdict": None, "done": False}
+
+    ui.html(f'<div class="sec-h">{ticker} <small style="font-size:.7rem;color:var(--t3)">· 종목 상세</small></div>')
+
+    @ui.refreshable
+    def body():
+        q = data["quote"]
+        if q is None:
+            ui.html('<div class="empty">시세·차트·AI 판단 불러오는 중…</div>')
+            return
+        px = q.get("price", 0) or 0
+        pct = (q.get("change_pct", 0) or 0) * 100
+        chg = q.get("change", 0) or 0
+        c = _col(pct)
+        ui.html(f'<div class="card"><div style="font-weight:800;font-size:1.05rem">{q.get("name", ticker)} '
+                f'<span style="color:var(--t3);font-size:.8rem">{ticker}'
+                f'{" · " + q.get("sector") if q.get("sector") else ""}</span></div>'
+                f'<div class="dprice mono" style="font-size:1.5rem;margin-top:4px">${_fmt(px)}</div>'
+                f'<div class="dchg" style="color:{c};font-weight:700">{"+" if chg>=0 else ""}{_fmt(chg)} '
+                f'({"+" if pct>=0 else ""}{pct:.2f}%)</div></div>')
+        if data["hist"]:
+            ui.echart(_area_option(data["hist"], pct >= 0)).classes("dchart")
+        # 핵심 지표
+        def _m(v, fmt="{}"):
+            return fmt.format(v) if v not in (None, 0, "") else "—"
+        mc = q.get("market_cap") or 0
+        mc_s = (f"${mc/1e12:.2f}T" if mc >= 1e12 else f"${mc/1e9:.1f}B" if mc >= 1e9
+                else f"${mc/1e6:.0f}M" if mc else "—")
+        tgt = q.get("target_price")
+        stats = [("시총", mc_s), ("PER", _m(q.get("pe") and round(q["pe"], 1))),
+                 ("EPS", _m(q.get("eps") and round(q["eps"], 2))),
+                 ("목표가", _m(tgt and f"${tgt:.0f}")),
+                 ("52주高", _m(q.get("52w_high") and f"${q['52w_high']:.0f}")),
+                 ("52주低", _m(q.get("52w_low") and f"${q['52w_low']:.0f}"))]
+        ui.html('<div class="dstats">' + "".join(
+            f'<div class="dstat"><span class="k">{k}</span><span class="v">{v}</span></div>'
+            for k, v in stats) + '</div>')
+        # AI 판단
+        v = data["verdict"]
+        if v is None:
+            ui.html('<div class="dai"><div class="dai-ttl">🧠 AI 판단</div>'
+                    '<div class="dai-rat">공신력 소스 수집 중…</div></div>')
+        else:
+            ev = ""
+            for e in sorted(v.get("evidence", []), key=lambda x: -(x.get("credibility", 0)*x.get("confidence", 0))):
+                st = e.get("stance", 0)
+                cls = "up" if st > 0.1 else ("dn" if st < -0.1 else "fl")
+                ar = "▲" if st > 0.1 else ("▼" if st < -0.1 else "─")
+                ev += (f'<div class="vev-row"><span class="vev-ar {cls}">{ar}</span>'
+                       f'<span class="vev-src">{e.get("source_label","")}</span>'
+                       f'<span>{e.get("detail","")}</span></div>')
+            ui.html(f'<div class="vcard"><div class="vtop">'
+                    f'<div class="vtk">🧠 AI 판단<small>확신도 {int(v.get("conviction",0)*100)}%</small></div>'
+                    f'<div style="display:flex;align-items:center;gap:9px">'
+                    f'<span class="vscore">{v.get("score",50):.0f}/100</span>{_vpill(v.get("action","HOLD"))}</div></div>'
+                    f'<div class="vrat">{v.get("rationale","")}</div>'
+                    f'<div class="vev">{ev or "<span style=\'color:var(--t3);font-size:.7rem\'>근거 없음</span>"}</div></div>')
+        if q.get("description"):
+            ui.html(f'<div style="font-size:.72rem;color:var(--t2);line-height:1.5;margin-top:10px">{q["description"]}</div>')
+        # 관심목록 추가 / 주문
+        with ui.row().style("margin-top:12px;gap:8px"):
+            ui.button("＋ 자동매매 유니버스에 추가", on_click=lambda t=ticker: _add_to_universe(t)).classes("tbtn")
+            ui.button("💵 주문", on_click=lambda t=ticker: _hooks["open_page"](lambda: page_order(t))).classes("tbtn tbtn-primary")
+
+    body()
+
+    def work():
+        try:
+            data["quote"] = sb.get_quote(ticker)
+        except Exception:
+            data["quote"] = {"ticker": ticker, "name": ticker, "price": 0}
+        try:
+            df = sb.get_ohlcv(ticker, "6mo")
+            if df is not None and len(df) > 5:
+                data["hist"] = [float(x) for x in df["Close"].tail(120).tolist()]
+        except Exception:
+            pass
+        try:
+            from influence import engine as _eng
+            data["verdict"] = _eng.verdict_for(ticker).to_dict()
+        except Exception:
+            pass
+        data["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+    holder = {}
+
+    def poll():
+        body.refresh()
+        if data["done"]:
+            t = holder.get("t")
+            if t:
+                t.active = False
+    holder["t"] = ui.timer(1.0, poll)
+
+
+def _add_to_universe(ticker):
+    try:
+        import watchlist as wl
+        wl.add(ticker)
+        ui.notify(f"{ticker} 을(를) 자동매매 유니버스에 추가했습니다.", type="positive", position="top")
+    except Exception as e:
+        ui.notify(f"추가 실패: {e}", type="warning", position="top")
+
+
+def render_search_results(query, container):
+    import stock_browser as sb
+    q = (query or "").strip()
+    container.clear()
+    with container:
+        if len(q) < 1:
+            ui.html('<div class="empty">티커 또는 회사명을 입력하세요 (예: AAPL, 테슬라, palantir).</div>')
+            return
+        try:
+            res = sb.symbol_search(q, limit=30)
+        except Exception:
+            res = []
+        if not res:
+            ui.html('<div class="empty">검색 결과가 없습니다.</div>')
+            return
+        _subscribe([r["ticker"] for r in res[:30]], interval=6.0)
+        for r in res:
+            tk = r["ticker"]
+            dpx = rtf.get_price(tk) or {}
+            px = dpx.get("price", 0)
+            pct = (dpx.get("change_pct", 0) or 0) * 100
+            c = _col(pct) if px else "var(--t3)"
+            pxs = (f'${_fmt(px)} <span style="color:{c}">{"+" if pct>=0 else ""}{pct:.2f}%</span>'
+                   if px else '<span style="color:var(--t3)">로딩…</span>')
+            row = ui.html(
+                f'<div class="srow"><div><b>{tk}</b> '
+                f'<span style="color:var(--t3);font-size:.72rem">{r.get("name","")[:34]}</span></div>'
+                f'<div class="mono" style="font-size:.78rem">{pxs}</div></div>')
+            row.on("click", lambda e, t=tk: _hooks["open_page"](lambda: page_lookup(t)))
+
+
 def page_stocks():
-    ui.html('<div class="sec-h">주식 열람</div>')
+    ui.html('<div class="sec-h">주식 열람 <small style="font-size:.7rem;color:var(--t3)">· 미국장 전 종목</small></div>')
+
+    # ── 전 종목 검색 ──
+    def _do_search():
+        render_search_results(search_in.value, results)
+
+    with ui.row().classes("items-center gap-2").style("margin-bottom:8px"):
+        search_in = ui.input("전 종목 검색 (티커·회사명)").props("outlined dense dark clearable").style("min-width:280px")
+        search_in.on("keydown.enter", lambda e: _do_search())
+        ui.button("검색", on_click=_do_search).classes("tbtn tbtn-primary")
+    results = ui.column().style("gap:4px;margin-bottom:14px")
+    with results:
+        ui.html('<div class="empty">티커 또는 회사명으로 미국장 모든 종목을 조회하세요.</div>')
+
+    ui.html('<div class="sh2">인덱스 둘러보기</div>')
     try:
         idx_opts = ["주요 지수"] + list(uni.available_indexes())
     except Exception:
@@ -1697,13 +1905,14 @@ def page_stocks():
                     chg = dpx.get("change", 0)
                     pct = dpx.get("change_pct", 0) * 100
                     c = _col(pct)
-                    ui.html(f'<div class="tr r univ-g"><div class="tk">{tk}</div>'
+                    rowel = ui.html(f'<div class="tr r univ-g" style="cursor:pointer"><div class="tk">{tk}</div>'
                             f'<div class="num mono">{_fmt(dpx.get("price",0))}</div>'
                             f'<div class="num mono" style="color:{c}">{"+" if chg>=0 else ""}{_fmt(chg)}</div>'
                             f'<div class="num mono" style="color:{c}">{"+" if pct>=0 else ""}{pct:.2f}%</div></div>')
                 else:
-                    ui.html(f'<div class="tr r univ-g"><div class="tk">{tk}</div>'
+                    rowel = ui.html(f'<div class="tr r univ-g" style="cursor:pointer"><div class="tk">{tk}</div>'
                             '<div class="num" style="color:var(--t3)">로딩…</div><div></div><div></div></div>')
+                rowel.on("click", lambda e, t=tk: _hooks["open_page"](lambda: page_lookup(t)))
 
     async def load_index(name):
         if name == "주요 지수":
@@ -1869,7 +2078,8 @@ def main_page():
     with ui.element("div").classes("topbar"):
         ui.html('<span class="brand">📈 AI 트레이딩</span>'
                 '<nav class="tnav"><a class="on">시장</a></nav>')
-        ui.html('<div class="search">/ 종목·지수 검색</div>')
+        _hdr_search = ui.html('<div class="search">🔍 미국장 전 종목 검색 · 티커·회사명</div>')
+        _hdr_search.on("click", lambda e: _hooks["open_page"](page_stocks))
 
         @ui.refreshable
         def meta_box():
