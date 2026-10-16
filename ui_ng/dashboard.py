@@ -2012,10 +2012,22 @@ def page_settings():
                 f'<div style="font-size:.9rem;font-weight:800;margin:6px 0 10px;'
                 f'color:{"var(--green)" if paper else "var(--up)"}">'
                 f'현재: {"🟢 모의투자(페이퍼)" if paper else "🔴 실거래 — 실제 자금"}</div>')
+        try:
+            import config as _cfgmod
+            _alp = _cfgmod.alpaca_ready()
+        except Exception:
+            _alp = False
+        if not _alp:
+            ui.html('<div style="font-size:.68rem;color:#FF8A91;margin:2px 0 8px">'
+                    '⚠️ Alpaca API 키가 설정되지 않아 실거래 주문은 실패합니다 — '
+                    '.env 에 ALPACA_API_KEY/SECRET 입력 필요.</div>')
         with ui.row().classes("gap-2"):
             if paper:
+                _warn = ("" if _alp else
+                         "<br><b style='color:#FF8A91'>⚠️ 현재 Alpaca 키가 없어 실제 주문은 실패합니다.</b>")
                 ui.button("🔴 실거래로 전환", on_click=lambda: confirm(
-                    "실거래 전환", "이후 매매가 <b>실제 계좌·실제 자금</b>으로 체결됩니다. (Alpaca API 키 필요)",
+                    "실거래 전환",
+                    "이후 매매가 <b>실제 계좌·실제 자금</b>으로 체결됩니다. (Alpaca API 키 필요)" + _warn,
                     lambda: _switch_mode(False), ok_label="실거래 전환", danger=True)
                 ).classes("tbtn tbtn-danger")
             else:

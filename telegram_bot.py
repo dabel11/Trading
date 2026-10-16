@@ -258,7 +258,7 @@ def cmd_mode(args: list) -> str:
         warn = ""
         try:
             import config as _c
-            if "your_" in _c.ALPACA_API_KEY:
+            if not _c.alpaca_ready():
                 warn = "\n⚠️ Alpaca API 키가 없어 실제 주문은 실패합니다 (.env 설정 필요)."
         except Exception:
             pass

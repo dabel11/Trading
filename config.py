@@ -20,6 +20,21 @@ ALPACA_API_KEY  = os.environ.get("ALPACA_API_KEY",  "your_alpaca_api_key")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "your_alpaca_secret_key")
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL",  "https://paper-api.alpaca.markets")
 
+# 플레이스홀더 표식(다국어) — 미설정 키 감지용
+_PLACEHOLDER_MARKS = ("your_", "여기에", "xxx", "changeme", "replace")
+
+
+def _key_set(k: str) -> bool:
+    """키가 실제로 설정됐는지(플레이스홀더/빈값/너무 짧음 제외)."""
+    k = str(k or "").strip()
+    return bool(k) and len(k) >= 16 and not any(m in k.lower() for m in _PLACEHOLDER_MARKS) \
+        and "여기에" not in k
+
+
+def alpaca_ready() -> bool:
+    """실거래(Alpaca) 주문을 낼 수 있는 유효 키가 설정돼 있는지."""
+    return _key_set(ALPACA_API_KEY) and _key_set(ALPACA_SECRET_KEY)
+
 # --- Finnhub (free tier: 60 req/min) ---
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "your_finnhub_api_key")
 
