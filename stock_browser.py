@@ -671,41 +671,73 @@ def get_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
         return pd.DataFrame()
 
 
-_CHART_CACHE: dict = {}      # (ticker,rng,interval) -> (ts, closes)
-_CHART_TTL = 900             # 15분 — 한 번 받으면 재사용(레이트리밋 완화)
+_CHART_CACHE: dict = {}      # ticker -> (ts, closes)
+_CHART_TTL = 900             # 15분 — 한 번 받으면 재사용(호출 최소화)
+
+_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+       "Accept": "application/json"}
 
 
-def chart_closes(ticker: str, rng: str = "6mo", interval: str = "1d",
-                 n: int = 160) -> list[float]:
-    """차트용 종가 리스트 — Yahoo 차트 API 직접 호출(캐시+듀얼호스트 재시도).
+def _nasdaq_daily(ticker: str, months: int = 6) -> list[float]:
+    """Nasdaq 공개 차트 API — 6개월 일봉 종가. Yahoo 레이트리밋과 무관."""
+    import json as _j, urllib.request
+    from datetime import date, timedelta
+    to = date.today(); frm = to - timedelta(days=months * 31)
+    for acls in ("stocks", "etf", "index"):
+        try:
+            url = (f"https://api.nasdaq.com/api/quote/{ticker}/chart"
+                   f"?assetclass={acls}&fromdate={frm}&todate={to}")
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_UA),
+                                        timeout=8) as r:
+                d = _j.loads(r.read().decode())
+            ch = (d.get("data") or {}).get("chart")
+            if ch:
+                out = []
+                for p in ch:
+                    y = p.get("y")
+                    if y is None:
+                        y = (p.get("z") or {}).get("value")
+                    if y is not None:
+                        out.append(float(y))
+                if out:
+                    return out
+        except Exception:
+            continue
+    return []
 
-    yfinance download 경로는 서버에서 레이트리밋(429)으로 자주 빈 결과를 내므로
-    가벼운 chart 엔드포인트를 직접 호출한다. 15분 캐시로 재호출을 줄이고,
-    429 시 query1→query2 로 재시도. 모두 실패하면 만료 캐시라도 반환.
-    """
-    import json as _j, urllib.request, time as _t
-    key = (ticker.upper(), rng, interval)
-    hit = _CHART_CACHE.get(key)
-    if hit and hit[1] and _t.time() - hit[0] < _CHART_TTL:
-        return hit[1][-n:]
-    hdr = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+def _yahoo_daily(ticker: str, rng: str = "6mo", interval: str = "1d") -> list[float]:
+    import json as _j, urllib.request
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
         try:
             url = (f"https://{host}/v8/finance/chart/{ticker}"
                    f"?range={rng}&interval={interval}")
-            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr),
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_UA),
                                         timeout=8) as r:
                 d = _j.loads(r.read().decode())
             res = d["chart"]["result"][0]
             closes = [float(c) for c in res["indicators"]["quote"][0]["close"]
                       if c is not None]
             if closes:
-                _CHART_CACHE[key] = (_t.time(), closes)
-                return closes[-n:]
+                return closes
         except Exception:
             continue
-    # 모두 실패 → 만료된 캐시라도 있으면 사용
+    return []
+
+
+def chart_closes(ticker: str, rng: str = "6mo", interval: str = "1d",
+                 n: int = 160) -> list[float]:
+    """차트용 6개월 일봉 종가. Nasdaq(레이트리밋 無) 우선 → Yahoo 폴백 + 15분 캐시."""
+    import time as _t
+    tk = ticker.upper()
+    hit = _CHART_CACHE.get(tk)
+    if hit and hit[1] and _t.time() - hit[0] < _CHART_TTL:
+        return hit[1][-n:]
+    closes = _nasdaq_daily(ticker, 6) or _yahoo_daily(ticker, rng, interval)
+    if closes:
+        _CHART_CACHE[tk] = (_t.time(), closes)
+        return closes[-n:]
     return hit[1][-n:] if hit and hit[1] else []
 
 
