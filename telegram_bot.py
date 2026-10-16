@@ -127,6 +127,7 @@ def cmd_scores(s: dict) -> str:
 
 def cmd_help(_s: dict) -> str:
     return ("🤖 AI 트레이딩 봇 명령어\n"
+            "/id — 내 Chat ID 확인(최초 설정용)\n"
             "/ping — 정상 동작 확인\n"
             "/status — 전체 현황\n"
             "/balance — 잔액·손익\n"
@@ -323,6 +324,11 @@ def handle(text: str, chat_id: str = "") -> str:
     parts = text.strip().split()
     cmd = parts[0].lower().lstrip("/").split("@")[0]
     args = parts[1:]
+    if cmd in ("id", "chatid", "myid", "아이디"):
+        # 제한 없음 — Chat ID 확인용(설정에 입력)
+        return (f"🆔 이 채팅의 Chat ID\n{chat_id}\n\n"
+                "앱 ⚙️ 설정 → 텔레그램 봇 → Chat ID 칸에 위 숫자를 입력하고 저장하세요.\n"
+                "그러면 /buy /sell /mode 등 매매·모드 명령이 열립니다.")
     if cmd in _MODE_CMDS:
         if not _allowed_chat or chat_id != _allowed_chat:
             return "⛔ 모드 전환은 설정된 Chat ID에서만 가능합니다 (설정 → 알림)."
