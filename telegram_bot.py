@@ -380,17 +380,17 @@ def handle(text: str, chat_id: str = "") -> str:
         # 읽기 전용 — 제한 없음
         return cmd_ai(args, _status())
     if cmd in _MODE_CMDS:
-        if not _allowed_chat or chat_id != _allowed_chat:
-            return "⛔ 모드 전환은 설정된 Chat ID에서만 가능합니다 (설정 → 알림)."
+        if not _is_owner(chat_id):
+            return "⛔ 모드 전환은 등록된 Chat ID에서만 가능합니다 (/id 로 등록)."
         if cmd in ("paper", "모의"):
             return cmd_mode(["paper"])
         if cmd in ("live", "실거래"):
             return cmd_mode(["live"])
         return cmd_mode(args)
     if cmd in _TRADE_CMDS:
-        # 매매는 Chat ID가 명시 설정된 경우에만 (오픈 채팅 매매 차단)
-        if not _allowed_chat or chat_id != _allowed_chat:
-            return "⛔ 매매 명령은 설정된 Chat ID에서만 가능합니다 (설정 → 알림에서 Chat ID 확인)"
+        # 매매는 등록된 Chat ID에서만 (오픈 채팅 매매 차단)
+        if not _is_owner(chat_id):
+            return "⛔ 매매 명령은 등록된 Chat ID에서만 가능합니다 (/id 로 등록)"
         if cmd == "buy":
             return cmd_buy(args, chat_id)
         if cmd == "sell":
@@ -426,6 +426,68 @@ def _send(token: str, chat_id: str, text: str):
         pass
 
 
+# ─────────────────────────────────────────── 소유자 Chat ID (단일 소스: notifier 설정)
+
+def _is_numeric_chat(cid) -> bool:
+    """텔레그램 전송 가능한 숫자 Chat ID 인지 (사용자명 @handle 은 전송 불가)."""
+    cid = str(cid or "").strip()
+    return bool(cid) and cid.lstrip("-").isdigit()
+
+
+def _owner_chat() -> str:
+    """등록된 소유자 숫자 Chat ID. 미설정/사용자명이면 '' (= 미등록)."""
+    try:
+        import notifier
+        cid = str((notifier.load_config().get("telegram") or {}).get("chat_id", "")).strip()
+        return cid if _is_numeric_chat(cid) else ""
+    except Exception:
+        return ""
+
+
+def _adopt_chat(chat_id: str) -> bool:
+    """소유자 숫자 ID가 아직 없을 때, 들어온 숫자 chat_id 를 소유자로 저장(부트스트랩).
+    이미 숫자 소유자가 있으면 바꾸지 않는다(탈취 방지)."""
+    global _allowed_chat
+    if not _is_numeric_chat(chat_id) or _owner_chat():
+        return False
+    try:
+        import notifier
+        cfg = notifier.load_config()
+        tg = dict(cfg.get("telegram") or {})
+        tg["chat_id"] = str(chat_id)
+        tg["enabled"] = True
+        cfg["telegram"] = tg
+        notifier.save_config(cfg)
+        _allowed_chat = str(chat_id)
+        return True
+    except Exception:
+        return False
+
+
+def _is_owner(chat_id) -> bool:
+    owner = _owner_chat()
+    if owner:
+        return str(chat_id) == owner
+    return _is_numeric_chat(_allowed_chat) and str(chat_id) == _allowed_chat
+
+
+def push(text: str) -> bool:
+    """소유자에게 능동 알림 전송(매매 체결·모드 변경 등). 설정 OK면 True."""
+    try:
+        import notifier
+        tg = notifier.load_config().get("telegram") or {}
+        if not tg.get("enabled"):
+            return False
+        token = (tg.get("bot_token") or "").strip()
+        chat = _owner_chat()
+        if not token or not chat:
+            return False
+        _send(token, chat, text)
+        return True
+    except Exception:
+        return False
+
+
 def poll_loop(token: str, allowed_chat_id: str = ""):
     """롱폴링으로 명령 수신·응답. allowed_chat_id 가 있으면 그 채팅에만 응답(보안)."""
     token = (token or "").strip()
@@ -448,8 +510,30 @@ def poll_loop(token: str, allowed_chat_id: str = ""):
             chat_id = str((msg.get("chat") or {}).get("id", ""))
             if not text.startswith("/"):
                 continue
-            if allowed and chat_id != allowed:
-                continue   # 설정된 채팅이 아니면 무시(보안)
+            cmdname = text[1:].split()[0].split("@")[0].lower()
+            owner = _owner_chat()
+            # 부트스트랩: 소유자 미등록이면 /start·/id 로 들어온 숫자 chat_id 를 자동 등록
+            if not owner and cmdname in ("start", "id", "chatid", "myid", "아이디"):
+                if _adopt_chat(chat_id):
+                    owner = chat_id
+                    try:
+                        _send(token, chat_id,
+                              "✅ 이 채팅을 알림 받을 소유자로 등록했습니다.\n"
+                              f"Chat ID: {chat_id}\n이제 매매·모드 명령과 알림이 활성화됩니다. /help")
+                    except Exception:
+                        pass
+                    continue
+            # 소유자 등록 후에는 소유자에게만 응답(프라이버시)
+            if owner:
+                if chat_id != owner:
+                    continue
+            else:
+                # 아직 미등록 & 부트스트랩 명령 아님 → 안내만
+                try:
+                    _send(token, chat_id, "먼저 /id 또는 /start 를 보내 이 채팅을 등록하세요.")
+                except Exception:
+                    pass
+                continue
             try:
                 _send(token, chat_id, handle(text, chat_id))
             except Exception:

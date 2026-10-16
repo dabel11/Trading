@@ -156,6 +156,25 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     result["prices"] = {r["ticker"]: prices.get(r["ticker"])
                         for r in scores_raw[:10]}
 
+    # 체결 발생 시 텔레그램 능동 알림(소유자 등록돼 있으면)
+    try:
+        bought, sold = result.get("bought") or [], result.get("sold") or []
+        if bought or sold:
+            import telegram_bot as tgb
+            mode = "모의" if paper else "🔴 실거래"
+            eng = "🧠 AI 인플루언서" if sn == "ai_influencer" else cfg.get("strategy_name", sn)
+            lines = [f"🤖 자동매매 체결 · {mode}", f"{eng} · 국면 {regime}"]
+            for b in bought:
+                lines.append(f"🔴 매수 {b['ticker']} {b['shares']}주 @ ${b['price']:.2f}")
+            for s in sold:
+                lines.append(f"🔵 매도 {s['ticker']} {s['shares']}주 @ ${s['price']:.2f} "
+                             f"({s.get('pnl_pct', 0):+.1%})")
+            cash_now = _pa.cash() if paper else pm.available_capital()
+            lines.append(f"💰 현금 ${cash_now:,.0f}")
+            tgb.push("\n".join(lines))
+    except Exception as e:
+        L(f"알림 건너뜀: {e}")
+
     # 텔레그램 봇 상태 스냅샷
     try:
         import telegram_bot as tgb
