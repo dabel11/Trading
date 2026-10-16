@@ -1756,7 +1756,13 @@ def page_lookup(ticker):
                 f'<div class="dchg" style="color:{c};font-weight:700">{"+" if chg>=0 else ""}{_fmt(chg)} '
                 f'({"+" if pct>=0 else ""}{pct:.2f}%)</div></div>')
         if data["hist"]:
-            ui.echart(_area_option(data["hist"], pct >= 0)).classes("dchart")
+            ui.echart(_area_option(data["hist"], pct >= 0)).classes("dchart").style("height:200px")
+        elif data["done"]:
+            ui.html('<div class="dchart" style="display:flex;align-items:center;'
+                    'justify-content:center;color:var(--t3);font-size:.76rem">차트 데이터를 불러오지 못했습니다</div>')
+        else:
+            ui.html('<div class="dchart" style="display:flex;align-items:center;'
+                    'justify-content:center;color:var(--t3);font-size:.76rem">차트 불러오는 중…</div>')
         # 핵심 지표
         def _m(v, fmt="{}"):
             return fmt.format(v) if v not in (None, 0, "") else "—"
@@ -1806,12 +1812,23 @@ def page_lookup(ticker):
             data["quote"] = sb.get_quote(ticker)
         except Exception:
             data["quote"] = {"ticker": ticker, "name": ticker, "price": 0}
-        try:
-            df = sb.get_ohlcv(ticker, "6mo")
-            if df is not None and len(df) > 5:
-                data["hist"] = [float(x) for x in df["Close"].tail(120).tolist()]
-        except Exception:
-            pass
+        # 차트: 6개월 일봉 우선, 실패 시 당일 인트라데이(프리페치) 폴백
+        for _ in range(2):
+            try:
+                df = sb.get_ohlcv(ticker, "6mo")
+                if df is not None and len(df) > 5:
+                    data["hist"] = [float(x) for x in df["Close"].tail(130).tolist()]
+                    break
+            except Exception:
+                pass
+        if not data["hist"]:
+            try:
+                prefetch_history([ticker])
+                v = get_hist(ticker)
+                if v and len(v) > 2:
+                    data["hist"] = v
+            except Exception:
+                pass
         try:
             from influence import engine as _eng
             data["verdict"] = _eng.verdict_for(ticker).to_dict()
