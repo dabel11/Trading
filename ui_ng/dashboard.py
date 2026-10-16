@@ -1812,13 +1812,17 @@ def page_lookup(ticker):
             data["quote"] = sb.get_quote(ticker)
         except Exception:
             data["quote"] = {"ticker": ticker, "name": ticker, "price": 0}
-        # 차트: 6개월 일봉 우선, 실패 시 당일 인트라데이(프리페치) 폴백
-        for _ in range(2):
+        # 차트: Yahoo 차트 API 직접 호출(가벼움·덜 막힘) 우선
+        try:
+            data["hist"] = sb.chart_closes(ticker, "6mo", "1d", 160)
+        except Exception:
+            data["hist"] = []
+        # 폴백: yfinance 다운로드 → 당일 인트라데이 프리페치
+        if not data["hist"]:
             try:
                 df = sb.get_ohlcv(ticker, "6mo")
                 if df is not None and len(df) > 5:
                     data["hist"] = [float(x) for x in df["Close"].tail(130).tolist()]
-                    break
             except Exception:
                 pass
         if not data["hist"]:

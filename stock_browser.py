@@ -671,6 +671,32 @@ def get_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def chart_closes(ticker: str, rng: str = "6mo", interval: str = "1d",
+                 n: int = 160) -> list[float]:
+    """차트용 종가 리스트 — Yahoo 차트 API 직접 호출.
+
+    yfinance 의 download 경로는 서버에서 레이트리밋으로 자주 빈 결과를 내므로,
+    더 가볍고 덜 막히는 chart 엔드포인트를 직접 호출한다(브라우저 UA).
+    실패 시 빈 리스트.
+    """
+    import json as _j, urllib.request
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+               f"?range={rng}&interval={interval}")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = _j.loads(r.read().decode())
+        res = d["chart"]["result"][0]
+        closes = res["indicators"]["quote"][0]["close"]
+        closes = [float(c) for c in closes if c is not None]
+        return closes[-n:]
+    except Exception:
+        return []
+
+
 def get_bulk_quotes(tickers: list[str]) -> list[dict]:
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
