@@ -630,6 +630,32 @@ def search_kr(query: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 # 시세 / 차트 API
 # ─────────────────────────────────────────────────────────────────────────────
+def _nasdaq_quote(ticker: str) -> dict:
+    """Nasdaq 공개 시세(이름·현재가·등락) — Yahoo 레이트리밋 폴백."""
+    import json as _j, urllib.request
+    for acls in ("stocks", "etf", "index"):
+        try:
+            url = f"https://api.nasdaq.com/api/quote/{ticker}/info?assetclass={acls}"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = _j.loads(r.read().decode())
+            pd = (d.get("data") or {})
+            pr = (pd.get("primaryData") or {})
+            raw = (pr.get("lastSalePrice") or "").replace("$", "").replace(",", "")
+            price = float(raw) if raw else 0.0
+            if price <= 0:
+                continue
+            pct = (pr.get("percentageChange") or "0").replace("%", "").replace("+", "")
+            net = (pr.get("netChange") or "0").replace("+", "").replace(",", "")
+            return {"ticker": ticker, "name": pd.get("companyName") or ticker,
+                    "price": price, "change": float(net or 0),
+                    "change_pct": float(pct or 0) / 100.0}
+        except Exception:
+            continue
+    return {}
+
+
 def get_quote(ticker: str) -> dict:
     try:
         t    = yf.Ticker(ticker)
@@ -639,6 +665,20 @@ def get_quote(ticker: str) -> dict:
         prev    = float(info.get("previousClose", price) or price)
         chg     = price - prev
         chg_pct = chg / prev if prev else 0
+        if price <= 0:                       # Yahoo 레이트리밋 → Nasdaq 폴백
+            nq = _nasdaq_quote(ticker)
+            if nq.get("price"):
+                return {**{"ticker": ticker, "name": nq["name"], "price": nq["price"],
+                           "change": nq["change"], "change_pct": nq["change_pct"],
+                           "volume": 0, "market_cap": info.get("marketCap", 0),
+                           "pe": info.get("trailingPE"), "forward_pe": info.get("forwardPE"),
+                           "eps": info.get("trailingEps"),
+                           "revenue_growth": info.get("revenueGrowth"),
+                           "target_price": info.get("targetMeanPrice"),
+                           "sector": info.get("sector", ""),
+                           "52w_high": info.get("fiftyTwoWeekHigh"),
+                           "52w_low": info.get("fiftyTwoWeekLow"),
+                           "description": info.get("longBusinessSummary", "")[:300]}}
         return {
             "ticker":      ticker,
             "name":        info.get("shortName", ticker),
@@ -658,6 +698,11 @@ def get_quote(ticker: str) -> dict:
             "description": info.get("longBusinessSummary", "")[:300],
         }
     except Exception:
+        nq = _nasdaq_quote(ticker)          # Yahoo 예외 시에도 Nasdaq 폴백
+        if nq.get("price"):
+            return {**nq, "volume": 0, "market_cap": 0, "pe": None, "eps": None,
+                    "target_price": None, "sector": "", "52w_high": None,
+                    "52w_low": None, "description": ""}
         return {"ticker": ticker, "name": ticker, "price": 0, "change": 0,
                 "change_pct": 0, "volume": 0, "market_cap": 0}
 
