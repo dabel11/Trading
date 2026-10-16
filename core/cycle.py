@@ -11,6 +11,15 @@ from core import scoring
 from core.execution import execute_orders
 
 
+def _ai_snapshot() -> Optional[dict]:
+    """AI 인플루언서 엔진의 최신 판단 요약 (텔레그램/UI용). 실패 시 None."""
+    try:
+        from influence import engine as _eng
+        return _eng.snapshot(top=12)
+    except Exception:
+        return None
+
+
 def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     """설정(cfg = autotrader_config.json 스키마)대로 사이클 1회 실행.
 
@@ -66,7 +75,7 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             L(f"발굴 건너뜀: {e}")
 
     universe = wl.load()
-    scores_raw, prices, regime = scoring.score(sn, universe)
+    scores_raw, prices, regime = scoring.score(sn, universe, log=L)
 
     # 실시간 가격 오버레이 — 채점 번들(일봉, 3분 캐시)의 종가 대신 실시간
     # 피드(5초 폴링) 가격으로 갱신. 짧은 사이클(10초~)에서 손절·트레일링이
@@ -173,6 +182,8 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             "n_positions": len(pm.positions), "positions": pos_b,
             "buy_th": int(cfg.get("min_score", 60)),
             "top_scores": scores_raw[:10],
+            "engine": "ai_influencer" if sn == "ai_influencer" else "strategy",
+            "ai": (_ai_snapshot() if sn == "ai_influencer" else None),
         })
     except Exception as e:
         L(f"상태기록 건너뜀: {e}")

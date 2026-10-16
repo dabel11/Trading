@@ -76,9 +76,10 @@ def cmd_status(s: dict) -> str:
         return "상태 정보가 없습니다. 앱이 실행 중이고 자동매매가 한 번 돌았는지 확인하세요."
     up = s.get("upnl", 0)
     arrow = "▲" if up >= 0 else "▼"
+    eng = "🧠 AI 인플루언서" if s.get("engine") == "ai_influencer" else s.get("strategy", "—")
     return (
         f"📊 트레이딩 현황\n"
-        f"모드: {s.get('mode','—')} · 전략: {s.get('strategy','—')}\n"
+        f"모드: {s.get('mode','—')} · 엔진: {eng}\n"
         f"기간: {s.get('horizon','—')} · 배분: {s.get('alloc','—')}\n"
         f"자동매매: {'ON' if s.get('auto_on') else 'OFF'} · 시장 {'개장' if s.get('market_open') else '마감'}\n"
         f"\n"
@@ -125,11 +126,57 @@ def cmd_scores(s: dict) -> str:
     return "\n".join(lines)
 
 
+def cmd_ai(args: list, s: dict) -> str:
+    """AI 인플루언서 엔진 — 인자 없으면 현황, 티커 주면 즉시 실시간 판단."""
+    buy_th = s.get("buy_th", 60)
+    if args:
+        tk = args[0].upper().lstrip("$")
+        try:
+            from influence import engine as eng
+            v = eng.verdict_for(tk, buy_th=buy_th)
+        except Exception as e:
+            return f"AI 판단 불가: {e}"
+        emoji = {"BUY": "🟢 매수", "SELL": "🔴 매도", "HOLD": "⚪ 관망"}.get(v.action, "·")
+        lines = [f"🧠 AI 판단 · {tk}",
+                 f"{emoji}  확신점수 {v.score:.0f}/100 (확신도 {int(v.conviction*100)}%)",
+                 "", "· 공신력 소스별 의견"]
+        if v.evidence:
+            for e in sorted(v.evidence, key=lambda x: -x.weight):
+                ar = "▲" if e.stance > 0.1 else ("▼" if e.stance < -0.1 else "─")
+                lines.append(f"  {ar} {e.source_label}: {e.detail} (공신력 {int(e.credibility*100)})")
+        else:
+            lines.append("  (수집된 근거 없음)")
+        lines.append("")
+        lines.append(f"엔진: {'LLM' if v.by == 'llm' else '규칙(공신력 가중)'} · {v.rationale}")
+        return "\n".join(lines)
+
+    ai = s.get("ai") or {}
+    try:
+        from influence import roster
+        active = ", ".join(x["label"] for x in roster.summary() if x["active"])
+    except Exception:
+        active = "—"
+    lines = ["🧠 AI 인플루언서 엔진",
+             f"활성 소스: {active}",
+             f"판단기: {'LLM' if ai.get('llm_active') else '규칙(공신력 가중)'}"]
+    vs = ai.get("verdicts") or []
+    if vs:
+        lines.append(f"\n최신 판단 · 국면 {ai.get('regime', '-')}  (매수문턱 {buy_th})")
+        for v in vs[:8]:
+            tag = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(v.get("action"), "·")
+            lines.append(f"{tag} {v['ticker']:<5} {v['score']:>4.0f}  {v.get('action')}")
+    else:
+        lines.append("\n아직 판단 없음 — 자동매매가 한 사이클 돌면 표시됩니다.")
+    lines.append("\n개별 종목 즉시 판단: /ai AAPL")
+    return "\n".join(lines)
+
+
 def cmd_help(_s: dict) -> str:
     return ("🤖 AI 트레이딩 봇 명령어\n"
             "/id — 내 Chat ID 확인(최초 설정용)\n"
             "/ping — 정상 동작 확인\n"
             "/status — 전체 현황\n"
+            "/ai — AI 인플루언서 판단 현황 (/ai AAPL = 종목 즉시 판단)\n"
             "/balance — 잔액·손익\n"
             "/portfolio — 보유 종목\n"
             "/scores — 상위 점수 후보\n"
@@ -329,6 +376,9 @@ def handle(text: str, chat_id: str = "") -> str:
         return (f"🆔 이 채팅의 Chat ID\n{chat_id}\n\n"
                 "앱 ⚙️ 설정 → 텔레그램 봇 → Chat ID 칸에 위 숫자를 입력하고 저장하세요.\n"
                 "그러면 /buy /sell /mode 등 매매·모드 명령이 열립니다.")
+    if cmd in ("ai", "에이아이", "판단"):
+        # 읽기 전용 — 제한 없음
+        return cmd_ai(args, _status())
     if cmd in _MODE_CMDS:
         if not _allowed_chat or chat_id != _allowed_chat:
             return "⛔ 모드 전환은 설정된 Chat ID에서만 가능합니다 (설정 → 알림)."

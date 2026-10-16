@@ -14,8 +14,8 @@ CONFIG_FILE = DIR / "autotrader_config.json"
 PID_FILE = DIR / "autotrader.pid"
 
 DEFAULT_CONFIG = {
-    "enabled": True, "paper": True, "strategy": "composite",
-    "strategy_name": "복합 (기본)", "horizon": "단기", "interval": 300,
+    "enabled": True, "paper": True, "strategy": "ai_influencer",
+    "strategy_name": "AI 인플루언서", "horizon": "단기", "interval": 300,
     "dynamic": True, "stop_loss": 0.07, "take_profit": 0.15, "trail": 0.07,
     "min_score": 60, "sell_score": 35, "hold_strong": 60, "hold_medium": 30,
     "daily_loss_limit": 0.05, "discover": {"enabled": False},

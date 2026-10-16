@@ -581,6 +581,53 @@ TOSS2_STYLE = """
 ui.add_head_html(TOSS2_STYLE, shared=True)
 
 
+# AI 인플루언서 엔진 스타일
+AI_STYLE = """
+<style>
+.ai-hero{ background:linear-gradient(135deg, rgba(124,92,252,.16), rgba(124,92,252,.03));
+  border:1px solid rgba(124,92,252,.35); border-radius:14px; padding:15px 17px; }
+.ai-hero .t{ font-size:1.02rem; font-weight:800; display:flex; align-items:center; gap:8px; }
+.ai-hero .d{ font-size:.76rem; color:var(--t2); margin-top:6px; line-height:1.55; }
+.ai-chips{ display:flex; gap:7px; flex-wrap:wrap; margin-top:11px; }
+.ai-chip{ font-size:.66rem; font-weight:800; padding:4px 10px; border-radius:999px;
+  background:var(--bg3); color:var(--t2); border:1px solid var(--line2); }
+.ai-chip.on{ background:rgba(124,92,252,.2); color:#C9BBFF; border-color:rgba(124,92,252,.5); }
+.ai-chip.llm{ background:rgba(48,209,88,.16); color:#4ADE80; border-color:rgba(48,209,88,.4); }
+.src-row{ display:grid; grid-template-columns:30px 1fr 128px 58px; gap:11px; align-items:center;
+  padding:10px 2px; border-bottom:1px solid var(--line); }
+.src-row:last-child{ border-bottom:none; }
+.src-emoji{ font-size:1.1rem; text-align:center; }
+.src-nm{ font-size:.84rem; font-weight:700; } .src-nm small{ display:block; font-size:.64rem; color:var(--t3); font-weight:500; margin-top:1px; }
+.cbar{ height:7px; border-radius:4px; background:var(--bg3); overflow:hidden; }
+.cbar > i{ display:block; height:100%; background:linear-gradient(90deg,#7C5CFC,#A58BFF); }
+.src-badge{ font-size:.6rem; font-weight:800; text-align:center; padding:3px 0; border-radius:6px; }
+.src-badge.on{ background:rgba(48,209,88,.16); color:#4ADE80; }
+.src-badge.off{ background:var(--bg3); color:var(--t3); }
+.vcard{ background:var(--bg1); border:1px solid var(--line2); border-radius:12px; padding:12px 14px; margin-bottom:9px; }
+.vtop{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.vtk{ font-size:.96rem; font-weight:800; } .vtk small{ color:var(--t3); font-weight:600; font-size:.66rem; margin-left:6px; }
+.vpill{ font-size:.68rem; font-weight:800; padding:3px 11px; border-radius:999px; }
+.vpill.BUY{ background:rgba(240,69,79,.16); color:#FF8A91; }
+.vpill.SELL{ background:rgba(49,130,246,.16); color:#78B6FF; }
+.vpill.HOLD{ background:var(--bg3); color:var(--t2); }
+.vscore{ font-size:.72rem; color:var(--t2); font-variant-numeric:tabular-nums; }
+.vrat{ font-size:.73rem; color:var(--t2); margin-top:7px; line-height:1.5; }
+.vev{ margin-top:9px; display:flex; flex-direction:column; gap:4px; }
+.vev-row{ display:flex; align-items:center; gap:7px; font-size:.7rem; color:var(--t2); }
+.vev-ar{ width:13px; text-align:center; font-weight:800; }
+.vev-ar.up{ color:#FF8A91; } .vev-ar.dn{ color:#78B6FF; } .vev-ar.fl{ color:var(--t3); }
+.vev-src{ color:var(--t3); min-width:120px; }
+/* 상세 패널 AI 미니 */
+.dai{ margin-top:11px; padding:10px 12px; background:rgba(124,92,252,.08);
+  border:1px solid rgba(124,92,252,.28); border-radius:11px; }
+.dai-top{ display:flex; align-items:center; justify-content:space-between; }
+.dai-ttl{ font-size:.66rem; font-weight:800; color:#C9BBFF; letter-spacing:.03em; }
+.dai-rat{ font-size:.7rem; color:var(--t2); margin-top:6px; line-height:1.45; }
+</style>
+"""
+ui.add_head_html(AI_STYLE, shared=True)
+
+
 # ── 유틸 ─────────────────────────────────────────────────────────────────────
 def _col(v: float) -> str:
     return "var(--up)" if v > 0 else ("var(--dn)" if v < 0 else "var(--t2)")
@@ -993,6 +1040,19 @@ def render_detail(d, state):
             ui.html('<div class="dstats">' + "".join(
                 f'<div class="dstat"><span class="k">{k}</span><span class="v">{v}</span></div>'
                 for k, v in stats) + '</div>')
+        # AI 판단 미니 (최신 사이클 캐시 — 네트워크 없음)
+        try:
+            from influence import engine as _eng
+            v = _eng.LAST.get("verdicts", {}).get(sel)
+            if v is not None:
+                ui.html(
+                    f'<div class="dai"><div class="dai-top">'
+                    f'<span class="dai-ttl">🧠 AI 판단</span>'
+                    f'<span style="display:flex;gap:8px;align-items:center">'
+                    f'<span class="vscore">{v.score:.0f}/100</span>{_vpill(v.action)}</span>'
+                    f'</div><div class="dai-rat">{v.rationale}</div></div>')
+        except Exception:
+            pass
 
 
 def render_watchlist(d, n=10):
@@ -1432,10 +1492,124 @@ def _set_strategy(key, name):
     _screen["refresh"]()
 
 
+def render_ai_sources():
+    """공신력 소스 로스터 (활성 여부 + 공신력 바)."""
+    try:
+        from influence import roster as _ros
+        rows = _ros.summary()
+    except Exception:
+        ui.html('<div class="empty">소스 정보를 불러올 수 없습니다.</div>')
+        return
+    with ui.element("div").classes("card"):
+        ui.html('<div class="sh2">공신력 소스 <small>· 공신력 높은 순</small></div>')
+        for s in rows:
+            pct = int(s["credibility"] * 100)
+            badge = ('<span class="src-badge on">활성</span>' if s["active"]
+                     else '<span class="src-badge off">대기</span>')
+            ui.html(
+                f'<div class="src-row">'
+                f'<div class="src-emoji">{s["emoji"]}</div>'
+                f'<div class="src-nm">{s["label"]}<small>{s["who"]}</small></div>'
+                f'<div><div class="cbar"><i style="width:{pct}%"></i></div>'
+                f'<div style="font-size:.6rem;color:var(--t3);margin-top:3px">공신력 {pct}</div></div>'
+                f'{badge}</div>')
+
+
+def _vpill(action):
+    ko = {"BUY": "매수", "SELL": "매도", "HOLD": "관망"}.get(action, action)
+    return f'<span class="vpill {action}">{ko}</span>'
+
+
+def render_ai_verdicts(snap):
+    """AI 판단 카드 목록. snap = influence.engine.snapshot()."""
+    verdicts = (snap or {}).get("verdicts") or []
+    if not verdicts:
+        ui.html('<div class="empty">아직 판단 결과가 없습니다. '
+                '자동매매가 한 사이클 돌거나 아래 <b>지금 재분석</b>을 누르세요.</div>')
+        return
+    for v in verdicts:
+        ev_html = ""
+        for e in sorted(v.get("evidence", []), key=lambda x: -(x.get("credibility", 0) * x.get("confidence", 0))):
+            st = e.get("stance", 0)
+            cls = "up" if st > 0.1 else ("dn" if st < -0.1 else "fl")
+            ar = "▲" if st > 0.1 else ("▼" if st < -0.1 else "─")
+            ev_html += (f'<div class="vev-row"><span class="vev-ar {cls}">{ar}</span>'
+                        f'<span class="vev-src">{e.get("source_label","")}</span>'
+                        f'<span>{e.get("detail","")}</span></div>')
+        ui.html(
+            f'<div class="vcard"><div class="vtop">'
+            f'<div class="vtk">{v["ticker"]}<small>확신도 {int(v.get("conviction",0)*100)}%</small></div>'
+            f'<div style="display:flex;align-items:center;gap:9px">'
+            f'<span class="vscore">{v.get("score",50):.0f}/100</span>{_vpill(v.get("action","HOLD"))}</div>'
+            f'</div>'
+            f'<div class="vrat">{v.get("rationale","")}</div>'
+            f'<div class="vev">{ev_html}</div></div>')
+
+
+def page_ai():
+    import ai_judge as _aj
+    from influence import engine as _eng
+    cfg = load_config()
+    using_ai = cfg.get("strategy") == "ai_influencer"
+    llm = _aj.llm_active()
+
+    ui.html('<div class="sec-h">🧠 AI 인플루언서 엔진</div>')
+    chips = (f'<span class="ai-chip {"llm" if llm else "on"}">'
+             f'{"🟢 LLM 판단 활성" if llm else "⚙️ 규칙 판단(공신력 가중)"}</span>'
+             f'<span class="ai-chip {"on" if using_ai else ""}">'
+             f'{"✓ 자동매매 적용 중" if using_ai else "비활성 — 폴백 전략 사용 중"}</span>')
+    ui.html(
+        '<div class="ai-hero"><div class="t">🧠 공신력 기반 AI 실시간 판단</div>'
+        '<div class="d">전략 공식 대신, 월가 애널리스트·기업 내부자·금융 미디어·SNS·시장 군중의 '
+        '의견을 종목마다 실시간으로 모아 각 소스의 공신력으로 가중합니다. '
+        'AI가 그 증거를 읽고 매수·매도·관망과 0~100 확신 점수·근거를 내려 매매를 결정합니다.'
+        f'</div><div class="ai-chips">{chips}</div></div>')
+
+    if not using_ai:
+        ui.button("이 엔진으로 자동매매 전환", on_click=lambda: confirm(
+            "AI 인플루언서 엔진 활성화",
+            "자동매매 결정을 전략 공식 대신 AI 인플루언서 엔진이 담당하도록 전환합니다.",
+            lambda: _set_strategy("ai_influencer", "AI 인플루언서"),
+            ok_label="전환")).classes("tbtn tbtn-primary").style("margin:10px 0")
+    if not llm:
+        ui.html('<div style="font-size:.68rem;color:var(--t3);margin:8px 2px;line-height:1.5">'
+                'LLM 키(ANTHROPIC_API_KEY / OPENAI_API_KEY)를 .env 에 넣으면 판단이 '
+                'LLM 추론으로 자동 업그레이드됩니다. 지금은 공신력 가중 규칙으로 동일하게 동작합니다.</div>')
+
+    render_ai_sources()
+
+    ui.html('<div class="sh2" style="margin-top:14px">최신 AI 판단 <small>· 점수 내림차순</small></div>')
+
+    @ui.refreshable
+    def vbox():
+        render_ai_verdicts(_eng.snapshot(top=16))
+    vbox()
+
+    def _run():
+        try:
+            tickers = [r["tk"] for r in collect()["rows"]][:12] or ["AAPL", "MSFT", "NVDA"]
+        except Exception:
+            tickers = ["AAPL", "MSFT", "NVDA"]
+
+        def work():
+            try:
+                _eng.score_universe(tickers, ttl=0)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+        ui.notify("보유 종목을 AI로 재분석 중… (수초)", position="top")
+        ui.timer(6.0, vbox.refresh, once=True)
+
+    with ui.row().style("margin-top:10px;gap:8px"):
+        ui.button("지금 재분석", on_click=_run).classes("tbtn tbtn-primary")
+        ui.button("새로고침", on_click=vbox.refresh).classes("tbtn")
+        ui.button("폴백 전략 선택", on_click=lambda: _hooks["open_page"](page_strategy)).classes("tbtn")
+
+
 def page_strategy():
     cfg = load_config()
     active = cfg.get("strategy", "composite")
-    ui.html('<div class="sec-h">전략 선택</div>')
+    ui.html('<div class="sec-h">폴백 전략 선택 <small style="font-size:.7rem;color:var(--t3)">· AI 엔진 미사용 시</small></div>')
     try:
         m = scat.meta(active)
     except Exception:
@@ -1646,9 +1820,9 @@ def page_settings():
 
 
 PAGE_FUNCS = {
-    "대시보드": page_dashboard, "전략 선택": page_strategy, "자동 트레이딩": page_auto,
-    "포트폴리오": page_portfolio, "주식 열람": page_stocks, "직접 주문": page_order,
-    "설정": page_settings,
+    "대시보드": page_dashboard, "AI 엔진": page_ai, "전략 선택": page_strategy,
+    "자동 트레이딩": page_auto, "포트폴리오": page_portfolio, "주식 열람": page_stocks,
+    "직접 주문": page_order, "설정": page_settings,
 }
 
 
@@ -1760,8 +1934,8 @@ def main_page():
 
     # 플로팅 우측 레일 — 거래 메뉴
     with ui.element("div").classes("frail"):
-        for label, icon, fn in [("주문", "💵", page_order), ("자동", "🤖", page_auto),
-                                ("전략", "🎯", page_strategy), ("열람", "🔍", page_stocks),
+        for label, icon, fn in [("AI", "🧠", page_ai), ("주문", "💵", page_order),
+                                ("자동", "🤖", page_auto), ("열람", "🔍", page_stocks),
                                 ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
             it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
             it.on("click", lambda e, f=fn: open_page(f))
