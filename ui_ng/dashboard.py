@@ -1739,6 +1739,26 @@ def page_lookup(ticker):
 
     ui.html(f'<div class="sec-h">{ticker} <small style="font-size:.7rem;color:var(--t3)">· 종목 상세</small></div>')
 
+    def _retry_chart():
+        def w():
+            try:
+                data["hist"] = sb.chart_closes(ticker, "6mo", "1d", 160)
+            except Exception:
+                pass
+        threading.Thread(target=w, daemon=True).start()
+        ui.notify("차트 다시 불러오는 중…", position="top")
+        cnt = {"n": 0}
+        rh = {}
+
+        def rr():
+            cnt["n"] += 1
+            body.refresh()
+            if data["hist"] or cnt["n"] >= 4:
+                t = rh.get("t")
+                if t:
+                    t.active = False
+        rh["t"] = ui.timer(2.0, rr)
+
     @ui.refreshable
     def body():
         q = data["quote"]
@@ -1759,7 +1779,9 @@ def page_lookup(ticker):
             ui.echart(_area_option(data["hist"], pct >= 0)).classes("dchart").style("height:200px")
         elif data["done"]:
             ui.html('<div class="dchart" style="display:flex;align-items:center;'
-                    'justify-content:center;color:var(--t3);font-size:.76rem">차트 데이터를 불러오지 못했습니다</div>')
+                    'justify-content:center;color:var(--t3);font-size:.76rem">'
+                    '차트 데이터를 불러오지 못했습니다 (시세 제공처 일시 제한)</div>')
+            ui.button("차트 다시 시도", on_click=_retry_chart).classes("tbtn").style("margin:2px 0 6px")
         else:
             ui.html('<div class="dchart" style="display:flex;align-items:center;'
                     'justify-content:center;color:var(--t3);font-size:.76rem">차트 불러오는 중…</div>')

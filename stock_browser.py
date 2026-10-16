@@ -671,30 +671,42 @@ def get_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+_CHART_CACHE: dict = {}      # (ticker,rng,interval) -> (ts, closes)
+_CHART_TTL = 900             # 15분 — 한 번 받으면 재사용(레이트리밋 완화)
+
+
 def chart_closes(ticker: str, rng: str = "6mo", interval: str = "1d",
                  n: int = 160) -> list[float]:
-    """차트용 종가 리스트 — Yahoo 차트 API 직접 호출.
+    """차트용 종가 리스트 — Yahoo 차트 API 직접 호출(캐시+듀얼호스트 재시도).
 
-    yfinance 의 download 경로는 서버에서 레이트리밋으로 자주 빈 결과를 내므로,
-    더 가볍고 덜 막히는 chart 엔드포인트를 직접 호출한다(브라우저 UA).
-    실패 시 빈 리스트.
+    yfinance download 경로는 서버에서 레이트리밋(429)으로 자주 빈 결과를 내므로
+    가벼운 chart 엔드포인트를 직접 호출한다. 15분 캐시로 재호출을 줄이고,
+    429 시 query1→query2 로 재시도. 모두 실패하면 만료 캐시라도 반환.
     """
-    import json as _j, urllib.request
-    try:
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-               f"?range={rng}&interval={interval}")
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0 Safari/537.36"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = _j.loads(r.read().decode())
-        res = d["chart"]["result"][0]
-        closes = res["indicators"]["quote"][0]["close"]
-        closes = [float(c) for c in closes if c is not None]
-        return closes[-n:]
-    except Exception:
-        return []
+    import json as _j, urllib.request, time as _t
+    key = (ticker.upper(), rng, interval)
+    hit = _CHART_CACHE.get(key)
+    if hit and hit[1] and _t.time() - hit[0] < _CHART_TTL:
+        return hit[1][-n:]
+    hdr = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = (f"https://{host}/v8/finance/chart/{ticker}"
+                   f"?range={rng}&interval={interval}")
+            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr),
+                                        timeout=8) as r:
+                d = _j.loads(r.read().decode())
+            res = d["chart"]["result"][0]
+            closes = [float(c) for c in res["indicators"]["quote"][0]["close"]
+                      if c is not None]
+            if closes:
+                _CHART_CACHE[key] = (_t.time(), closes)
+                return closes[-n:]
+        except Exception:
+            continue
+    # 모두 실패 → 만료된 캐시라도 있으면 사용
+    return hit[1][-n:] if hit and hit[1] else []
 
 
 def get_bulk_quotes(tickers: list[str]) -> list[dict]:
