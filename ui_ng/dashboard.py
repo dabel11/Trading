@@ -1580,30 +1580,57 @@ def page_ai():
 
     ui.html('<div class="sh2" style="margin-top:14px">최신 AI 판단 <small>· 점수 내림차순</small></div>')
 
+    busy = {"on": False}
+
     @ui.refreshable
     def vbox():
+        if busy["on"] and not _eng.LAST.get("verdicts"):
+            ui.html('<div class="empty">🧠 공신력 소스를 모아 AI가 판단 중… (수초)</div>')
+            return
         render_ai_verdicts(_eng.snapshot(top=16))
     vbox()
 
-    def _run():
+    def _tickers():
         try:
-            tickers = [r["tk"] for r in collect()["rows"]][:12] or ["AAPL", "MSFT", "NVDA"]
+            return [r["tk"] for r in collect()["rows"]][:12] or ["AAPL", "MSFT", "NVDA"]
         except Exception:
-            tickers = ["AAPL", "MSFT", "NVDA"]
+            return ["AAPL", "MSFT", "NVDA"]
+
+    def _run(force=True):
+        tickers = _tickers()
+        busy["on"] = True
+        vbox.refresh()
 
         def work():
             try:
-                _eng.score_universe(tickers, ttl=0)
+                _eng.score_universe(tickers, ttl=0 if force else _eng._TTL)
             except Exception:
                 pass
+            finally:
+                busy["on"] = False
         threading.Thread(target=work, daemon=True).start()
-        ui.notify("보유 종목을 AI로 재분석 중… (수초)", position="top")
-        ui.timer(6.0, vbox.refresh, once=True)
+        # 결과가 채워질 때까지 폴링(최대 ~30초), 나오면 자동 중지.
+        tries = {"n": 0}
+        holder = {}
+
+        def poll():
+            tries["n"] += 1
+            vbox.refresh()
+            if _eng.LAST.get("verdicts") or tries["n"] >= 16:
+                t = holder.get("t")
+                if t:
+                    t.active = False
+        holder["t"] = ui.timer(2.0, poll)
 
     with ui.row().style("margin-top:10px;gap:8px"):
-        ui.button("지금 재분석", on_click=_run).classes("tbtn tbtn-primary")
+        ui.button("지금 재분석", on_click=lambda: (_run(True),
+                   ui.notify("보유 종목을 AI로 재분석 중…", position="top"))).classes("tbtn tbtn-primary")
         ui.button("새로고침", on_click=vbox.refresh).classes("tbtn")
         ui.button("폴백 전략 선택", on_click=lambda: _hooks["open_page"](page_strategy)).classes("tbtn")
+
+    # 패널 진입 시 판단 결과가 없거나 오래됐으면 자동으로 1회 분석.
+    if not _eng.LAST.get("verdicts") or (time.time() - _eng.LAST.get("ts", 0)) > _eng._TTL:
+        _run(force=False)
 
 
 def page_strategy():

@@ -41,15 +41,20 @@ def score_universe(tickers: list, held: set | None = None, regime: str = "neutra
                 {t: v[t] for t in tickers if t in v})
 
     # 1) 증거 수집 (IO 바운드 → 제한 병렬). Finnhub 무료 한도 보호 위해 보수적.
-    evidence_map: dict = {}
+    #    전체 타임아웃을 둬, 특정 소스가 멈춰도 엔진이 영원히 매달리지 않게 한다
+    #    (남은 종목은 빈 증거로 진행 → 최소 '중립' 판단은 보장).
+    evidence_map: dict = {t: [] for t in tickers}
+    deadline = 30.0
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         futs = {pool.submit(providers.gather, t): t for t in tickers}
-        for f in concurrent.futures.as_completed(futs):
-            t = futs[f]
-            try:
-                evidence_map[t] = f.result()
-            except Exception:
-                evidence_map[t] = []
+        try:
+            for f in concurrent.futures.as_completed(futs, timeout=deadline):
+                try:
+                    evidence_map[futs[f]] = f.result() or []
+                except Exception:
+                    evidence_map[futs[f]] = []
+        except concurrent.futures.TimeoutError:
+            L(f"일부 소스 응답 지연 — {deadline:.0f}s 초과분은 건너뜀")
 
     # 2) AI 판단 (LLM 1콜 배치 or 규칙)
     items = [(t, evidence_map.get(t, []), _ctx(t, held, regime)) for t in tickers]
