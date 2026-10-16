@@ -1872,7 +1872,10 @@ def page_stocks():
         render_search_results(search_in.value, results)
 
     with ui.row().classes("items-center gap-2").style("margin-bottom:8px"):
-        search_in = ui.input("전 종목 검색 (티커·회사명)").props("outlined dense dark clearable").style("min-width:280px")
+        search_in = ui.input("전 종목 검색 (티커·회사명)").props(
+            "outlined dense dark clearable debounce=450").style("min-width:280px")
+        # 타이핑하면 자동 검색(디바운스) — 버튼/엔터에 의존하지 않음
+        search_in.on("update:model-value", lambda e: _do_search())
         search_in.on("keydown.enter", lambda e: _do_search())
         ui.button("검색", on_click=_do_search).classes("tbtn tbtn-primary")
     results = ui.column().style("gap:4px;margin-bottom:14px")
