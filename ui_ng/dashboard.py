@@ -629,6 +629,13 @@ AI_STYLE = """
   padding:9px 12px; border:1px solid var(--line); border-radius:9px; background:var(--bg1);
   cursor:pointer; }
 .srow:hover{ background:var(--bg3); border-color:var(--line2); }
+/* 섹터 칩 */
+.sec-chip{ font-size:.72rem; font-weight:700; padding:5px 13px; border-radius:999px;
+  background:var(--bg2); color:var(--t2); border:1px solid var(--line2); cursor:pointer; }
+.sec-chip:hover{ background:var(--bg3); color:var(--t1); }
+.sec-chip.on{ background:rgba(124,92,252,.2); color:#C9BBFF; border-color:rgba(124,92,252,.5); }
+/* 섹터 테이블 그리드 (종목명 | 현재가 | 변동%) */
+.tr.sec-g{ display:grid; grid-template-columns:1fr 92px 84px; }
 /* 자동매매 타겟 스캔 */
 .tgt-sum{ display:grid; grid-template-columns:repeat(3,1fr); gap:9px; margin:10px 0; }
 .tgt-kpi{ background:var(--bg1); border:1px solid var(--line2); border-radius:10px; padding:10px 12px; text-align:center; }
@@ -1882,75 +1889,64 @@ def page_stocks():
     with results:
         ui.html('<div class="empty">티커 또는 회사명으로 미국장 모든 종목을 조회하세요.</div>')
 
-    ui.html('<div class="sh2">인덱스 둘러보기</div>')
+    # ── 섹터별 둘러보기 (섹터당 최대 50종목, 행 클릭 시 상세) ──
+    import stock_browser as _sb
     try:
-        idx_opts = ["주요 지수"] + list(uni.available_indexes())
+        sec_list = _sb.sectors()
     except Exception:
-        idx_opts = ["주요 지수"]
-    state = {"tickers": [s for s, _ in INDEX_SYMS], "loading": False}
+        sec_list = ["테크", "금융", "헬스케어"]
+    sstate = {"sector": sec_list[0] if sec_list else "테크"}
+
+    ui.html('<div class="sh2" style="margin-top:4px">섹터별 둘러보기 '
+            '<small>· 섹터당 최대 50종목 · 행 클릭 시 상세</small></div>')
+
+    def _set_sector(s):
+        sstate["sector"] = s
+        chips.refresh()
+        sec_table.refresh()
 
     @ui.refreshable
-    def table():
-        _subscribe(state["tickers"], interval=5.0)
+    def chips():
+        with ui.row().style("gap:6px;flex-wrap:wrap;margin-bottom:10px"):
+            for s in sec_list:
+                on = " on" if s == sstate["sector"] else ""
+                ch = ui.html(f'<span class="sec-chip{on}">{s}</span>')
+                ch.on("click", lambda e, x=s: _set_sector(x))
+
+    @ui.refreshable
+    def sec_table():
+        try:
+            stocks = _sb.stocks_by_sector(sstate["sector"], 50)
+        except Exception:
+            stocks = []
+        _subscribe([s["ticker"] for s in stocks], interval=6.0)
+        ui.html(f'<div style="font-size:.72rem;color:var(--t3);margin-bottom:6px">'
+                f'{sstate["sector"]} · {len(stocks)}종목</div>')
         with ui.element("div").classes("tbl"):
-            ui.html('<div class="tr h univ-g"><div>종목</div><div class="num">현재가</div>'
-                    '<div class="num">변동</div><div class="num">변동%</div></div>')
-            if state["loading"]:
-                ui.html('<div class="empty">인덱스 종목을 불러오는 중…</div>')
+            ui.html('<div class="tr h sec-g"><div>종목</div><div class="num">현재가</div>'
+                    '<div class="num">변동%</div></div>')
+            if not stocks:
+                ui.html('<div class="empty">종목이 없습니다.</div>')
                 return
-            shown = state["tickers"][:60]
-            if not shown:
-                ui.html('<div class="empty">표시할 종목이 없습니다.</div>')
-                return
-            for tk in shown:
-                dpx = rtf.get_price(tk)
-                if dpx:
-                    chg = dpx.get("change", 0)
-                    pct = dpx.get("change_pct", 0) * 100
-                    c = _col(pct)
-                    rowel = ui.html(f'<div class="tr r univ-g" style="cursor:pointer"><div class="tk">{tk}</div>'
-                            f'<div class="num mono">{_fmt(dpx.get("price",0))}</div>'
-                            f'<div class="num mono" style="color:{c}">{"+" if chg>=0 else ""}{_fmt(chg)}</div>'
-                            f'<div class="num mono" style="color:{c}">{"+" if pct>=0 else ""}{pct:.2f}%</div></div>')
-                else:
-                    rowel = ui.html(f'<div class="tr r univ-g" style="cursor:pointer"><div class="tk">{tk}</div>'
-                            '<div class="num" style="color:var(--t3)">로딩…</div><div></div><div></div></div>')
+            for s in stocks:
+                tk = s["ticker"]; nm = (s.get("name") or "")[:26]
+                dpx = rtf.get_price(tk) or {}
+                px = dpx.get("price", 0)
+                pct = (dpx.get("change_pct", 0) or 0) * 100
+                c = _col(pct) if px else "var(--t3)"
+                pxs = f'{_fmt(px)}' if px else '<span style="color:var(--t3)">…</span>'
+                pcts = f'{"+" if pct>=0 else ""}{pct:.2f}%' if px else ''
+                rowel = ui.html(
+                    f'<div class="tr r sec-g" style="cursor:pointer">'
+                    f'<div><b>{tk}</b> <span style="color:var(--t3);font-size:.68rem">{nm}</span></div>'
+                    f'<div class="num mono">{pxs}</div>'
+                    f'<div class="num mono" style="color:{c}">{pcts}</div></div>')
                 rowel.on("click", lambda e, t=tk: _hooks["open_page"](lambda: page_lookup(t)))
 
-    async def load_index(name):
-        if name == "주요 지수":
-            state["tickers"] = [s for s, _ in INDEX_SYMS]
-            table.refresh()
-            return
-        state["loading"] = True
-        table.refresh()
-        try:
-            if "코스피" in (name or ""):
-                tks = await run.io_bound(uni.get_kr_universe)
-            else:
-                tks = await run.io_bound(uni.get_index, name)
-            state["tickers"] = list(tks)[:60]
-        except Exception:
-            state["tickers"] = []
-        state["loading"] = False
-        table.refresh()
-
-    def add_ticker():
-        tk = (add_in.value or "").upper().strip()
-        if tk and tk not in state["tickers"]:
-            state["tickers"].insert(0, tk)
-            add_in.value = ""
-            table.refresh()
-
-    with ui.row().classes("items-center gap-2").style("margin-bottom:10px"):
-        sel = ui.select(idx_opts or ["(인덱스 없음)"], label="인덱스",
-                        value=(idx_opts[0] if idx_opts else None)).props("outlined dense dark").style("min-width:200px")
-        sel.on("update:model-value", lambda e: load_index(sel.value))
-        add_in = ui.input("티커 추가").props("outlined dense dark").style("min-width:140px")
-        add_in.on("keydown.enter", lambda e: add_ticker())
-        ui.button("추가", on_click=add_ticker).classes("tbtn")
-        ui.button("↻", on_click=lambda: table.refresh()).classes("tbtn")
-    table()
+    chips()
+    with ui.row().style("margin-bottom:8px"):
+        ui.button("↻ 시세 새로고침", on_click=lambda: sec_table.refresh()).classes("tbtn")
+    sec_table()
 
 
 def page_settings():

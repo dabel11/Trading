@@ -521,6 +521,34 @@ def search(query: str, sector: str = "전체") -> list[dict]:
     return results[:80]  # 최대 80개
 
 
+_US_SECTOR_ORDER = ["테크", "금융", "헬스케어", "산업재", "소비재", "필수소비",
+                    "에너지", "통신", "유틸리티", "리츠", "소재"]
+
+
+def sectors() -> list[str]:
+    """미국장 섹터 목록(종목 많은 순, 국내·ETF 제외)."""
+    db, _ = _get_db()
+    from collections import Counter
+    c = Counter(r[3] for r in db if r[3] not in ("국내", "ETF", ""))
+    present = {s for s, _ in c.items()}
+    ordered = [s for s in _US_SECTOR_ORDER if s in present]
+    # 순서표에 없는 섹터는 뒤에 종목수 순으로
+    rest = [s for s, _ in c.most_common() if s not in ordered]
+    return ordered + rest
+
+
+def stocks_by_sector(sector: str, limit: int = 50) -> list[dict]:
+    """해당 섹터 종목을 최대 limit개 반환(DB 순서=대형주 우선). ETF 제외."""
+    db, _ = _get_db()
+    out = []
+    for ticker, name, etf, sec in db:
+        if sec == sector and not (name or "").upper().endswith("ETF"):
+            out.append({"ticker": ticker, "name": name, "sector": sec})
+            if len(out) >= limit:
+                break
+    return out
+
+
 _SYMSEARCH_CACHE: dict = {}
 
 
