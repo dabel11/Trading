@@ -523,12 +523,19 @@ class PortfolioManager:
                     cash += qty * price
 
         # ── 5) 매수/추가(저비중) — 점수 높은 순, 가용 현금 한도 내 ──────────
+        # 하드캡: 회전 매도로 비워지지 않은 보유 종목 수 + 신규 매수가
+        # MAX_POSITIONS 를 넘지 않게 한다. 보유는 유지(히스테리시스)하되
+        # 신규 진입은 남은 슬롯까지만 — 유동형이 한도를 초과하지 않도록.
+        retained = set(held_now.keys()) - rotated
+        new_bought: set = set()
         for s in cands:
             t = s.ticker
             price = current_prices.get(t, 0)
             if price <= 0 or t in rotated or cash <= 0:
                 continue
             p = held_now.get(t)
+            if p is None and (len(retained) + len(new_bought)) >= MAX_POSITIONS:
+                continue          # 하드캡: 신규 매수로 보유 종목 수 초과 금지
             cur_val = (p.shares * price) if p else 0.0
             gap = target_val[t] - cur_val
             if gap > REBAL_BAND * target_val[t]:           # 저비중/신규
@@ -539,6 +546,8 @@ class PortfolioManager:
                     buys.append({"ticker": t, "shares": qty, "score": s.total,
                                  "est_price": price, "est_cost": cost})
                     cash -= cost
+                    if p is None:
+                        new_bought.add(t)
 
         return {"sell": sells, "buy": buys}
 
