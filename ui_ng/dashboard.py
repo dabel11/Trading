@@ -642,6 +642,14 @@ AI_STYLE = """
 .tgt-kpi .l{ font-size:.6rem; color:var(--t3); font-weight:700; }
 .tgt-kpi .v{ font-size:1.25rem; font-weight:800; margin-top:3px; }
 .tgt-line{ font-size:.7rem; color:var(--t3); margin:2px 0 10px; }
+/* 클릭 위치 미니 팝업 */
+.pop-anchor{ position:relative; }
+.mini-menu .q-menu, .mini-menu{ background:transparent!important; box-shadow:none!important; }
+.mini-pop{ width:260px; background:var(--bg1); border:1px solid var(--line2);
+  border-radius:13px; padding:13px 14px; box-shadow:0 12px 34px rgba(0,0,0,.55); }
+.mini-head{ display:flex; align-items:center; gap:9px; }
+.mini-ai{ display:flex; align-items:center; gap:7px; margin-top:7px; padding-top:7px;
+  border-top:1px solid var(--line); flex-wrap:wrap; }
 </style>
 """
 ui.add_head_html(AI_STYLE, shared=True)
@@ -1210,6 +1218,91 @@ def render_market_pulse():
                 f'<span>극도의 공포</span><span>극도의 탐욕</span></div></div>')
 
 
+def render_mini(tk, store=None):
+    """클릭 위치에 뜨는 미니 상세 팝업 내용 (시세·스파크라인·AI 판단·액션)."""
+    store = store or {}
+    q = store.get("quote") or {}
+    dd = rtf.get_price(tk) or {}
+    px = q.get("price") or dd.get("price", 0) or 0
+    raw_pct = q.get("change_pct") if q.get("change_pct") is not None else dd.get("change_pct", 0)
+    pct = (raw_pct or 0) * 100
+    c = _col(pct)
+    ini, lc = _logo(tk)
+    sub = SECTOR_KO.get(_sector_of(tk), "") or q.get("sector", "")
+    vals = store.get("hist") or get_hist(tk)
+    if vals:
+        spark = sparkline(vals, pct >= 0, w=224, h=46)
+    elif store.get("done"):
+        spark = '<div style="height:46px;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:.62rem">차트 없음</div>'
+    else:
+        spark = '<div style="height:46px;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:.62rem">차트 불러오는 중…</div>'
+    pxs = f'${_fmt(px)}' if px else ('…' if not store.get("done") else '—')
+    vhtml = ""
+    try:
+        from influence import engine as _eng
+        v = _eng.LAST.get("verdicts", {}).get(tk)
+        if v is not None:
+            vhtml = (f'<div class="mini-ai">{_vpill(v.action)}'
+                     f'<span class="vscore">{v.score:.0f}/100</span>'
+                     f'<span style="font-size:.64rem;color:var(--t3)">{v.rationale[:44]}</span></div>')
+    except Exception:
+        pass
+    with ui.element("div").classes("mini-pop"):
+        ui.html(
+            f'<div class="mini-head"><span class="tlogo" style="background:{lc}">{ini}</span>'
+            f'<div style="flex:1"><div style="font-weight:800;font-size:.9rem">{tk}</div>'
+            f'<div style="font-size:.62rem;color:var(--t3)">{sub or "—"}</div></div>'
+            f'<div style="text-align:right"><div class="mono" style="font-weight:800">{pxs}</div>'
+            f'<div style="color:{c};font-weight:700;font-size:.74rem">{"+" if pct>=0 else ""}{pct:.2f}%</div></div></div>'
+            f'<div style="margin:6px 0">{spark}</div>{vhtml}')
+        with ui.row().style("gap:6px;margin-top:8px"):
+            ui.button("자세히", on_click=lambda t=tk: _hooks["open_page"](lambda: page_lookup(t))).classes("tbtn").style("flex:1")
+            ui.button("💵 주문", on_click=lambda t=tk: _hooks["open_page"](lambda: page_order(t))).classes("tbtn tbtn-primary").style("flex:1")
+
+
+def _row_with_popup(html_str, tk, extra_classes=""):
+    """클릭 시 그 자리(행 아래)에 미니 팝업이 뜨는 행을 만든다. 열 때 시세·차트 지연 로드."""
+    store = {"loaded": False}
+    with ui.element("div").classes("pop-anchor" + ((" " + extra_classes) if extra_classes else "")):
+        el = ui.html(html_str)
+        menu = ui.menu().props('anchor="bottom middle" self="top middle"').classes("mini-menu")
+        with menu:
+            @ui.refreshable
+            def body():
+                render_mini(tk, store)
+            body()
+
+        def _open(e=None):
+            menu.open()
+            if store.get("loaded"):
+                return
+            store["loaded"] = True
+            import stock_browser as _sb
+
+            def work():
+                try:
+                    store["quote"] = _sb.get_quote(tk)
+                except Exception:
+                    pass
+                try:
+                    store["hist"] = _sb.chart_closes(tk, "6mo", "1d", 60) or get_hist(tk)
+                except Exception:
+                    pass
+                store["done"] = True
+            threading.Thread(target=work, daemon=True).start()
+            cnt = {"n": 0}; hold = {}
+
+            def poll():
+                cnt["n"] += 1
+                body.refresh()
+                if store.get("done") or cnt["n"] >= 10:
+                    t = hold.get("t")
+                    if t:
+                        t.active = False
+            hold["t"] = ui.timer(0.7, poll)
+        el.on("click", _open)
+
+
 def render_movers(state):
     tab = state.get("mv", "gainers")
     data = _MKT.get(tab, [])
@@ -1226,12 +1319,12 @@ def render_movers(state):
             chg = it.get("chg", 0)
             c = _col(chg)
             ini, lc = _logo(tk)
-            el = ui.html(
+            _row_with_popup(
                 f'<div class="mv-row"><span class="mv-rank">{i}</span>'
                 f'<span class="tlogo" style="background:{lc};width:22px;height:22px;flex:0 0 22px;font-size:.54rem">{ini}</span>'
                 f'<b style="font-weight:700">{tk}</b>'
-                f'<span class="tnum mono" style="color:{c};font-size:.82rem">{"+" if chg>=0 else ""}{chg:.2f}%</span></div>')
-            el.on("click", lambda e, t=tk: _hooks["select"](t))
+                f'<span class="tnum mono" style="color:{c};font-size:.82rem">{"+" if chg>=0 else ""}{chg:.2f}%</span></div>',
+                tk)
 
 
 def render_heatmap():
@@ -1311,14 +1404,12 @@ def render_my_account(d, state):
             for r in d["rows"]:
                 c2 = _col(r["pnl"])
                 ini, lc = _logo(r["tk"])
-                sel = " sel" if state.get("sel") == r["tk"] else ""
-                el = ui.html(
-                    f'<div class="hl-row{sel}">'
+                _row_with_popup(
+                    f'<div class="hl-row">'
                     f'<span class="tlogo" style="background:{lc};width:24px;height:24px;flex:0 0 24px;font-size:.56rem">{ini}</span>'
                     f'<div class="hl-nm"><b>{r["tk"]}</b><small>{r["sh"]:g}주 · {SECTOR_KO.get(r["sector"],"")}</small></div>'
-                    f'<div class="tnum mono" style="color:{c2};font-size:.78rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div>')
-                el.on("click", lambda e, tk=r["tk"]: _hooks["select"](tk))
-    render_detail(d, state)
+                    f'<div class="tnum mono" style="color:{c2};font-size:.78rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div>',
+                    r["tk"])
 
 
 def page_dashboard():
@@ -1523,6 +1614,153 @@ def _set_strategy(key, name):
     _ctl_mod.save_config(cfg)
     ui.notify(f'전략을 "{name}"(으)로 변경했습니다.', type="positive", position="top")
     _screen["refresh"]()
+
+
+def _equity_line_option(dates, values, start_cap):
+    """자산곡선 ECharts 라인 옵션 (시작자본 기준선 포함)."""
+    up = (values[-1] >= start_cap) if values else True
+    col = "#F0454F" if up else "#4E7BF5"
+    return {
+        "animation": False,
+        "grid": {"left": 54, "right": 14, "top": 14, "bottom": 28},
+        "xAxis": {"type": "category", "data": dates, "boundaryGap": False,
+                  "axisLabel": {"color": "#8A8F98", "fontSize": 10,
+                                "showMaxLabel": True, "interval": max(1, len(dates)//6)},
+                  "axisLine": {"lineStyle": {"color": "#2A2E37"}}},
+        "yAxis": {"type": "value", "scale": True,
+                  "axisLabel": {"color": "#8A8F98", "fontSize": 10,
+                                "formatter": "${value}"},
+                  "splitLine": {"lineStyle": {"color": "#1E2127"}}},
+        "tooltip": {"trigger": "axis",
+                    "valueFormatter": "function(v){return '$'+Math.round(v).toLocaleString();}"},
+        "series": [{
+            "type": "line", "data": values, "showSymbol": False, "smooth": False,
+            "lineStyle": {"color": col, "width": 2},
+            "areaStyle": {"color": col, "opacity": 0.08},
+            "markLine": {"silent": True, "symbol": "none",
+                         "lineStyle": {"color": "#5A6472", "type": "dashed", "width": 1},
+                         "data": [{"yAxis": start_cap}],
+                         "label": {"color": "#8A8F98", "fontSize": 9,
+                                   "formatter": "시작 ${c}"}},
+        }],
+    }
+
+
+def page_backtest():
+    """백테스트 — 과거 데이터로 전략을 라이브와 동일한 로직으로 시뮬레이션."""
+    import backtester as _bt
+    import functools
+    ui.html('<div class="sec-h">📊 백테스트 <small style="font-size:.7rem;color:var(--t3)">· 과거 데이터로 전략 검증 (라이브와 동일 로직)</small></div>')
+
+    # 전략 목록 — ai_influencer 제외(과거 심리/애널리스트 스냅샷이 없어 백테스트 불가)
+    try:
+        keys = [k for k in scat.sorted_keys() if k != "ai_influencer"]
+        opts = {k: scat.meta(k).get("name", k) for k in keys}
+    except Exception:
+        opts = {"composite": "복합 (기본)", "momentum": "모멘텀"}
+    try:
+        idx_opts = ["현재 워치리스트"] + list(uni.available_indexes())
+    except Exception:
+        idx_opts = ["현재 워치리스트"]
+
+    from datetime import date as _date
+    state = {"running": False, "result": None, "error": None, "meta": {}}
+
+    with ui.element("div").classes("card"):
+        with ui.row().classes("items-center").style("gap:8px;flex-wrap:wrap"):
+            strat = ui.select(opts, value=("composite" if "composite" in opts else next(iter(opts))),
+                              label="전략").props("outlined dense dark").style("min-width:170px")
+            uni_sel = ui.select(idx_opts, value="현재 워치리스트",
+                                label="유니버스").props("outlined dense dark").style("min-width:160px")
+            start_in = ui.input("시작일", value="2023-01-01").props("outlined dense dark").style("width:120px")
+            end_in = ui.input("종료일", value=_date.today().isoformat()).props("outlined dense dark").style("width:120px")
+        with ui.row().classes("items-center").style("gap:8px;flex-wrap:wrap;margin-top:8px"):
+            cap_in = ui.number("자본($)", value=10000, format="%g").props("outlined dense dark").style("width:120px")
+            min_in = ui.number("매수문턱", value=60, format="%g").props("outlined dense dark").style("width:100px")
+            sl_in = ui.number("손절%", value=7, format="%g").props("outlined dense dark").style("width:90px")
+            tp_in = ui.number("익절%", value=15, format="%g").props("outlined dense dark").style("width:90px")
+            run_bt = ui.button("백테스트 실행").classes("tbtn tbtn-primary")
+
+    @ui.refreshable
+    def out():
+        if state["running"]:
+            ui.html('<div class="empty">📊 과거 데이터를 내려받아 시뮬레이션 중… (유니버스·기간에 따라 수~수십초)</div>')
+            return
+        if state["error"]:
+            ui.html(f'<div class="empty" style="color:#FF8A91">백테스트 실패: {state["error"]}</div>')
+            return
+        r = state["result"]
+        if r is None:
+            ui.html('<div class="empty">전략·기간·유니버스를 정하고 <b>백테스트 실행</b>을 누르세요.</div>')
+            return
+        m = state["meta"]
+        tr = r.total_return
+        kpis = [("총 수익률", f'{"+" if tr>=0 else ""}{tr*100:.1f}%', _col(tr)),
+                ("CAGR", f'{"+" if r.cagr>=0 else ""}{r.cagr*100:.1f}%', _col(r.cagr)),
+                ("최대 낙폭", f'{r.mdd*100:.1f}%', "var(--dn)"),
+                ("샤프", f'{r.sharpe:.2f}', None),
+                ("승률", f'{r.win_rate*100:.0f}%', None),
+                ("거래", f'{len(r.trades)}건', None),
+                ("최종 자산", f'${r.equity_curve.iloc[-1]:,.0f}', _col(tr)),
+                ("평균 보유", f'{r.avg_hold_days:.0f}일', None)]
+        ui.html(f'<div style="font-size:.74rem;color:var(--t3);margin-bottom:8px">'
+                f'{m.get("name","")} · {m.get("start")}~{m.get("end")} · {m.get("uni_n",0)}종목 · 시작 ${m.get("cap",0):,.0f}</div>')
+        ui.html('<div class="tgt-sum" style="grid-template-columns:repeat(4,1fr)">' + "".join(
+            f'<div class="tgt-kpi"><div class="l">{k}</div>'
+            f'<div class="v" style="{"color:"+c if c else ""};font-size:1.05rem">{v}</div></div>'
+            for k, v, c in kpis) + '</div>')
+        # 자산곡선
+        try:
+            ec = r.equity_curve
+            dates = [str(d)[:10] for d in ec.index]
+            vals = [round(float(x), 2) for x in ec.tolist()]
+            ui.echart(_equity_line_option(dates, vals, r.start_capital)).classes("dchart").style("height:240px")
+        except Exception:
+            pass
+        # 거래 내역
+        ui.html('<div class="sh2" style="margin-top:12px">거래 내역 <small>· 최근순</small></div>')
+        with ui.element("div").classes("tbl"):
+            ui.html('<div class="tr h" style="display:grid;grid-template-columns:70px 1fr 80px 1fr">'
+                    '<div>종목</div><div>기간</div><div class="num">손익</div><div>사유</div></div>')
+            trades = sorted(r.trades, key=lambda t: t.exit_date, reverse=True)[:40]
+            if not trades:
+                ui.html('<div class="empty">거래가 없습니다 (기간/문턱을 조정해 보세요).</div>')
+            for t in trades:
+                c = _col(t.pnl_pct)
+                ui.html(f'<div class="tr r" style="display:grid;grid-template-columns:70px 1fr 80px 1fr;font-size:.74rem">'
+                        f'<div class="tk">{t.ticker}</div>'
+                        f'<div style="color:var(--t3)">{str(t.entry_date)[:10]}~{str(t.exit_date)[:10]}</div>'
+                        f'<div class="num mono" style="color:{c}">{"+" if t.pnl_pct>=0 else ""}{t.pnl_pct*100:.1f}%</div>'
+                        f'<div style="color:var(--t3)">{t.reason}</div></div>')
+    out()
+
+    async def _run():
+        state.update(running=True, result=None, error=None)
+        out.refresh()
+        try:
+            if uni_sel.value == "현재 워치리스트":
+                import watchlist as _wl
+                universe = list(_wl.load())
+            else:
+                universe = list(uni.get_index(uni_sel.value))[:40]
+            universe = universe or ["AAPL", "MSFT", "NVDA", "META", "GOOGL"]
+            fn = functools.partial(
+                _bt.run, strategy=strat.value, start=start_in.value.strip(),
+                end=end_in.value.strip(), capital=float(cap_in.value or 10000),
+                universe=universe, min_score=float(min_in.value or 60),
+                stop_loss=float(sl_in.value or 7) / 100.0,
+                take_profit=float(tp_in.value or 15) / 100.0)
+            state["meta"] = {"name": opts.get(strat.value, strat.value),
+                             "start": start_in.value.strip(), "end": end_in.value.strip(),
+                             "uni_n": len(universe), "cap": float(cap_in.value or 10000)}
+            res = await run.io_bound(fn)
+            state["result"] = res
+        except Exception as e:
+            state["error"] = str(e)[:200]
+        state["running"] = False
+        out.refresh()
+
+    run_bt.on("click", _run)
 
 
 def render_ai_sources():
@@ -2110,9 +2348,9 @@ def page_settings():
 
 
 PAGE_FUNCS = {
-    "대시보드": page_dashboard, "AI 엔진": page_ai, "전략 선택": page_strategy,
-    "자동 트레이딩": page_auto, "포트폴리오": page_portfolio, "주식 열람": page_stocks,
-    "직접 주문": page_order, "설정": page_settings,
+    "대시보드": page_dashboard, "AI 엔진": page_ai, "백테스트": page_backtest,
+    "전략 선택": page_strategy, "자동 트레이딩": page_auto, "포트폴리오": page_portfolio,
+    "주식 열람": page_stocks, "직접 주문": page_order, "설정": page_settings,
 }
 
 
@@ -2226,7 +2464,8 @@ def main_page():
     # 플로팅 우측 레일 — 거래 메뉴
     with ui.element("div").classes("frail"):
         for label, icon, fn in [("AI", "🧠", page_ai), ("주문", "💵", page_order),
-                                ("자동", "🤖", page_auto), ("열람", "🔍", page_stocks),
+                                ("자동", "🤖", page_auto), ("백테", "📊", page_backtest),
+                                ("열람", "🔍", page_stocks),
                                 ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
             it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
             it.on("click", lambda e, f=fn: open_page(f))
