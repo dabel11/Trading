@@ -1680,6 +1680,7 @@ def page_backtest():
             sl_in = ui.number("손절%", value=7, format="%g").props("outlined dense dark").style("width:90px")
             tp_in = ui.number("익절%", value=15, format="%g").props("outlined dense dark").style("width:90px")
             run_bt = ui.button("백테스트 실행").classes("tbtn tbtn-primary")
+            cmp_bt = ui.button("🏆 최고 수익 전략 찾기").classes("tbtn tbtn-danger")
 
     @ui.refreshable
     def out():
@@ -1688,6 +1689,42 @@ def page_backtest():
             return
         if state["error"]:
             ui.html(f'<div class="empty" style="color:#FF8A91">백테스트 실패: {state["error"]}</div>')
+            return
+        rk = state.get("ranking")
+        if rk:
+            m = state["meta"]
+            best = rk[0]
+            ui.html(f'<div style="font-size:.74rem;color:var(--t3);margin-bottom:8px">'
+                    f'전 전략 비교 · {m.get("start")}~{m.get("end")} · {m.get("uni_n",0)}종목 · '
+                    f'총수익률 순 · 시작 ${m.get("cap",0):,.0f}</div>')
+            ui.html(f'<div class="ai-hero" style="margin-bottom:10px"><div class="t">🏆 최고 수익 전략 · {best["name"]}</div>'
+                    f'<div class="d">총수익률 <b style="color:var(--up)">{best["ret"]*100:+.1f}%</b> · '
+                    f'CAGR {best["cagr"]*100:+.1f}% · 샤프 {best["sharpe"]:.2f} · MDD {best["mdd"]*100:.1f}% · '
+                    f'승률 {best["win"]*100:.0f}% · 최종 ${best["eq"]:,.0f}</div></div>')
+            with ui.element("div").classes("tbl"):
+                ui.html('<div class="tr h" style="display:grid;grid-template-columns:40px 1fr 90px 70px 70px 60px">'
+                        '<div></div><div>전략</div><div class="num">총수익률</div>'
+                        '<div class="num">CAGR</div><div class="num">MDD</div><div class="num">샤프</div></div>')
+                for i, row in enumerate(rk):
+                    medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f'<span style="color:var(--t3)">{i+1}</span>'
+                    rc = _col(row["ret"])
+                    bg = "background:rgba(240,59,48,.08);" if i == 0 else ""
+                    ui.html(f'<div class="tr r" style="display:grid;grid-template-columns:40px 1fr 90px 70px 70px 60px;font-size:.76rem;{bg}">'
+                            f'<div>{medal}</div><div class="tk">{row["name"]}</div>'
+                            f'<div class="num mono" style="color:{rc};font-weight:800">{"+" if row["ret"]>=0 else ""}{row["ret"]*100:.1f}%</div>'
+                            f'<div class="num mono">{row["cagr"]*100:.1f}%</div>'
+                            f'<div class="num mono" style="color:var(--dn)">{row["mdd"]*100:.0f}%</div>'
+                            f'<div class="num mono">{row["sharpe"]:.2f}</div></div>')
+            with ui.row().style("margin-top:12px;gap:8px"):
+                ui.button(f'🥇 {best["name"]}(으)로 자동매매 전환', on_click=lambda b=best: confirm(
+                    f'전략 전환 · {b["name"]}',
+                    f'백테스트 최고 수익 전략 "{b["name"]}"(총수익률 {b["ret"]*100:+.1f}%)으로 '
+                    f'자동매매 전략을 전환합니다. (모의 모드)',
+                    (lambda b=b: _set_strategy(b["key"], b["name"])), ok_label="전환")
+                ).classes("tbtn tbtn-primary")
+            ui.html('<div style="font-size:.64rem;color:var(--t3);margin-top:8px;line-height:1.5">'
+                    '※ 과거 성과가 미래를 보장하지 않습니다. 기간·유니버스에 따라 순위가 달라질 수 있어, '
+                    '여러 기간으로 교차 검증하는 것을 권합니다.</div>')
             return
         r = state["result"]
         if r is None:
@@ -1734,16 +1771,57 @@ def page_backtest():
                         f'<div style="color:var(--t3)">{t.reason}</div></div>')
     out()
 
-    async def _run():
-        state.update(running=True, result=None, error=None)
+    def _resolve_universe():
+        if uni_sel.value == "현재 워치리스트":
+            import watchlist as _wl
+            u = list(_wl.load())
+        else:
+            u = list(uni.get_index(uni_sel.value))[:40]
+        return u or ["AAPL", "MSFT", "NVDA", "META", "GOOGL"]
+
+    async def _compare():
+        state.update(running=True, ranking=None, result=None, error=None)
         out.refresh()
         try:
-            if uni_sel.value == "현재 워치리스트":
-                import watchlist as _wl
-                universe = list(_wl.load())
+            universe = _resolve_universe()
+            start = start_in.value.strip(); end = end_in.value.strip()
+            cap = float(cap_in.value or 10000); ms = float(min_in.value or 60)
+            sl = float(sl_in.value or 7) / 100.0; tp = float(tp_in.value or 15) / 100.0
+            cands = [k for k in opts.keys()]
+
+            def work():
+                bundle = _bt.load_market_data(universe, start, end)
+                rows = []
+                for k in cands:
+                    try:
+                        r = _bt.run(strategy=k, start=start, end=end, capital=cap,
+                                    universe=universe, min_score=ms, stop_loss=sl,
+                                    take_profit=tp, prefetched=bundle)
+                        rows.append({"key": k, "name": opts.get(k, k),
+                                     "ret": r.total_return, "cagr": r.cagr, "mdd": r.mdd,
+                                     "sharpe": r.sharpe, "win": r.win_rate,
+                                     "eq": float(r.equity_curve.iloc[-1])})
+                    except Exception:
+                        pass
+                rows.sort(key=lambda x: -x["ret"])
+                return rows
+            ranking = await run.io_bound(work)
+            if not ranking:
+                state["error"] = "비교할 결과가 없습니다 (데이터·기간 확인)."
             else:
-                universe = list(uni.get_index(uni_sel.value))[:40]
-            universe = universe or ["AAPL", "MSFT", "NVDA", "META", "GOOGL"]
+                state["ranking"] = ranking
+                state["meta"] = {"start": start, "end": end,
+                                 "uni_n": len(universe), "cap": cap}
+        except Exception as e:
+            state["error"] = str(e)[:200]
+        state["running"] = False
+        out.refresh()
+
+    async def _run():
+        state.update(running=True, result=None, error=None, ranking=None)
+        out.refresh()
+        try:
+            universe = _resolve_universe()
             fn = functools.partial(
                 _bt.run, strategy=strat.value, start=start_in.value.strip(),
                 end=end_in.value.strip(), capital=float(cap_in.value or 10000),
@@ -1761,6 +1839,7 @@ def page_backtest():
         out.refresh()
 
     run_bt.on("click", _run)
+    cmp_bt.on("click", _compare)
 
 
 def render_ai_sources():
