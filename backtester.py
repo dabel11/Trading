@@ -484,6 +484,42 @@ def _strategy_score_bt(strategy, ticker, stock_data, etf_data, idx) -> float:
         f_guard = 10 if rsi < 70 else (5 if rsi < 80 else 0)
         return round(min(100, max(0, f_mom + f_lowvol + f_quality + f_guard)), 1)
 
+    if name == "momentum_max":
+        # ── 최대수익 모멘텀 (연구 근거 기반 수익 극대화) ─────────────────────
+        # 모멘텀은 1927~2024 미국 연 9.2%, 31개국에서 재현된 가장 강력한 수익
+        # 프리미엄. 최고 성과 백테스트 레시피를 결합한다:
+        #   ① 6개월 모멘텀(최근 1개월 스킵) 중심 + 3·12개월 블렌드(다차원 모멘텀)
+        #      — 6개월 룩백이 raw 수익 최강(연 24.7%·샤프 1.27), 스킵으로 단기반전 회피
+        #   ② 변동성 역비례 위험조정 (Barroso & Santa-Clara 2015) — 샤프 거의 2배,
+        #      모멘텀 크래시 완화. '덜 흔들리며 오른' 종목 선호.
+        #   ③ 절대모멘텀/추세 게이트 (듀얼 모멘텀) — 200일선 아래/음(-) 모멘텀은
+        #      신규 매수 배제(하락추세에서 터지는 모멘텀 붕괴 회피)
+        #   ④ 52주 신고가 근접 보너스 (George & Hwang 52주 신고가 모멘텀)
+        if idx < 273:
+            return 0.0
+        px = float(close.iloc[idx])
+        p21 = float(close.iloc[idx - 21])            # 최근 1개월 스킵 기준점
+
+        def _ret(lb):
+            base = float(close.iloc[idx - 21 - lb])
+            return (p21 / base - 1.0) if base > 0 else 0.0
+        r3, r6, r12 = _ret(63), _ret(126), _ret(252)
+        blended = 0.5 * r6 + 0.25 * r3 + 0.25 * r12  # 6개월 중심 다차원 모멘텀(연구 최적 룩백)
+        rets = close.iloc[idx - 126:idx].pct_change().dropna()
+        vol = float(rets.std()) * (252 ** 0.5)       # 6개월 연율 변동성
+        ram = (blended / vol) if vol > 0 else 0.0    # 위험조정(≈샤프) 모멘텀
+        ma200 = float(close.iloc[idx - 200:idx].mean())
+        # ③ 절대모멘텀/추세 게이트
+        if px < ma200 or blended <= 0:
+            return round(max(0.0, 18 + ram * 8), 1)  # 추세 이탈/음수 → 약하게(거의 미매수)
+        # ④ 52주 신고가 근접도 (0.90~1.00 → 0~12점)
+        hi = float(close.iloc[max(0, idx - 252):idx + 1].max())
+        near_bonus = max(0.0, min(12.0, (px / hi - 0.90) * 120)) if hi > 0 else 0.0
+        # 위험조정 모멘텀(Barroso·Santa-Clara: 위험조정이 수익·샤프 모두 개선, 크래시 완화)을
+        # 핵심 랭킹으로. 추세 게이트가 하락장 붕괴를 막아 상승 추세에서 승자를 끝까지 끈다.
+        score = 50.0 + ram * 28.0 + near_bonus
+        return round(min(100.0, max(0.0, score)), 1)
+
     if name == "adaptive":
         # ── 국면 적응형 (Regime-Switching) ──────────────────────────────────
         # 시장은 만변하므로 한 가지 로직에 매이지 않는다. 종목의 현재 국면을
