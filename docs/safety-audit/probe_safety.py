@@ -78,7 +78,12 @@ class FakeOrder:
 
 
 class FakeTrading:
-    """script: 주문별 (status, filled_qty) 시퀀스. 체결 누적을 broker_pos 에 반영."""
+    """script: 주문별 (status, filled_qty) 시퀀스. 체결 누적을 broker_pos 에 반영.
+
+    실제 Alpaca 와 같게: 체결 수량은 그 주문의 수량을 넘지 않고, 취소 요청을 받은
+    미종결 주문은 canceled 가 된다(체결분은 남는다)."""
+
+    _FINAL = ("filled", "canceled", "expired", "rejected")
 
     def __init__(self, script, price=100.0):
         self.script, self.price = script, price
@@ -91,8 +96,10 @@ class FakeTrading:
         oid = f"o{self.n}"
         status, fq = self.script[min(self.n, len(self.script) - 1)]
         self.n += 1
+        fq = min(fq, int(float(req.qty)))
         self.orders[oid] = FakeOrder(oid, status, self.price if fq else None, fq)
-        self.submitted.append((req.client_order_id, float(req.qty)))
+        kind = "limit" if getattr(req, "limit_price", None) else "market"
+        self.submitted.append((req.client_order_id, float(req.qty), kind))
         return self.orders[oid]
 
     def get_order_by_id(self, oid):
@@ -100,6 +107,9 @@ class FakeTrading:
 
     def cancel_order_by_id(self, oid):
         self.cancels.append(oid)
+        o = self.orders[oid]
+        if o.status not in self._FINAL:
+            o.status = "canceled"
 
     def filled_total(self):
         return sum(int(o.filled_qty or 0) for o in self.orders.values())
@@ -141,13 +151,15 @@ B.Broker.execute_order.__defaults__  # noqa
 res = bk.execute_order("AMD", 50, "buy", 100.0, max_retries=0)
 v = B.validate_fill(res, est_price=100.0, req_shares=50)
 report("canceled-with-partial-fill not recorded", not v["ok"] and bk._trading.filled_total() > 0,
-       f"브로커 20주 체결됐지만 validate_fill ok={v['ok']} → 장부 0주")
+       f"브로커 20주 체결 → validate_fill ok={v['ok']} → 장부 {v['filled_qty']}주")
 
 # ── 5. 손절 매도가 급락 시 '추격 포기'로 미집행 ─────────────────────────
-bk = fake_broker([("new", 0)], price=92.0, requote=88.0)   # 지정가 미체결, 재조회 -4.3%
+# 지정가 미체결, 재조회 -4.3%. 추격(재가격·시장가)으로 낸 주문은 체결된다 —
+# 예전 스크립트 [("new",0)] 는 시장가까지 영원히 미체결이라 어떤 구현도 통과 불가였다.
+bk = fake_broker([("new", 0), ("new", 0), ("filled", 10)], price=92.0, requote=88.0)
 res = bk.execute_order("TSLA", 10, "sell", 92.0)
 report("stop-loss sell abandoned on fast drop", res.get("status") != "filled",
-       f"status={res.get('status')} · note={res.get('note')}")
+       f"status={res.get('status')} · note={res.get('note')} · 제출 {bk._trading.submitted}")
 
 # ── 6. execute_manual(실거래) 시장가 미체결 → 예외만, 주문 취소 없음 ─────
 fb = fake_broker([("accepted", 0)])
@@ -162,7 +174,8 @@ try:
 finally:
     B.Broker = orig_cls
 report("manual live order left open on timeout", err is not None and not fb._trading.cancels,
-       f"예외='{(err or '')[:40]}…' · 취소 호출 {len(fb._trading.cancels)}회 (주문은 브로커에 살아있음)")
+       f"예외='{(err or '')[:40]}…' · 취소 호출 {len(fb._trading.cancels)}회"
+       + ("" if fb._trading.cancels else " (주문은 브로커에 살아있음)"))
 
 B.time.time, B.time.sleep = _orig_time, _orig_sleep   # time 모듈 전역 원복
 

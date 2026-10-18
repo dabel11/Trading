@@ -48,7 +48,8 @@ def _on_tick(ticker: str, price: float, ts: float):
         pass
 
 
-def _evaluate(ticker: str, price: float, log: Callable[[str], None]):
+def _evaluate(ticker: str, price: float, log: Callable[[str], None],
+              ts: Optional[float] = None):
     """보유 종목이면 하드 리스크 룰(손절/트레일링)만 평가, 발동 시 즉시 매도."""
     cfg = _cfg()
     if not cfg.get("enabled"):
@@ -88,15 +89,16 @@ def _evaluate(ticker: str, price: float, log: Callable[[str], None]):
     execute_orders(
         {"sell": [{"ticker": ticker, "shares": pos.shares,
                    "reason": reason, "est_price": price}], "buy": []},
-        {ticker: price}, paper, pm, log=log)
+        {ticker: price}, paper, pm, log=log, cfg=cfg,
+        price_ts={ticker: ts or now}, cycle_id=f"g{int(now) % 1000000:06d}")
 
 
 def _run(log: Callable[[str], None]):
     while True:
         try:
-            ticker, price, _ts = _q.get()
+            ticker, price, ts = _q.get()
             _stats["ticks"] += 1
-            _evaluate(ticker, price, log)
+            _evaluate(ticker, price, log, ts=ts)
         except Exception as e:
             try:
                 log(f"틱 가드 오류: {e}")

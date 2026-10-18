@@ -86,9 +86,23 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
 
     pm = PortfolioManager(paper=paper)
     broker = None
+    blocked: set = set()
+    halted = None
+    import market_hours as _mh
+    cycle_id = "c" + _mh.now_et().strftime("%H%M%S")
     if not paper:
         from broker import Broker
+        from core.execution import reconcile_live
         broker = Broker(paper=False)
+        # 브로커 대조 — 크래시로 남은 미해결 주문 확정·장부 반영, 불일치면 매매 중단.
+        # 조회 실패는 예외로 올려 러너의 연속 실패 백오프·경보가 처리한다.
+        rec = reconcile_live(broker, pm, cfg, log=L)
+        if rec["halted"]:
+            halted = rec
+            L("브로커 대조 불일치 — 매수 중단, 손절·청산 매도만 진행(일치하면 자동 재개)")
+        blocked = set(rec.get("blocked") or [])
+        if blocked:
+            L(f"열린 주문이 있는 종목은 이번 사이클 제외: {sorted(blocked)}")
 
     # 보유종목 워치리스트 동기화 (유니버스 밖 보유가 점수 0으로 강제매도 방지)
     try:
@@ -126,6 +140,9 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             pass
     universe = list(dict.fromkeys(list(universe) + list(pm.positions.keys())))
     scores_raw, prices, regime = scoring.score(sn, universe, log=L)
+    # 가격별 시각(실시간 피드 오버레이분만). 없는 종목은 채점 번들 가격 = 신선도 미상 →
+    # 실거래 게이트가 브로커 호가로 재확인한다.
+    price_ts: dict = {}
 
     # 실시간 가격 오버레이 — 채점 번들(일봉, 3분 캐시)의 종가 대신 실시간
     # 피드(5초 폴링) 가격으로 갱신. 짧은 사이클(10초~)에서 손절·트레일링이
@@ -147,6 +164,8 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             d = rtf.get_price(t)
             if d and d.get("price"):
                 prices[t] = float(d["price"])
+                if d.get("ts"):
+                    price_ts[t] = float(d["ts"])
                 _fresh += 1
         if _fresh:
             L(f"실시간 가격 갱신 {_fresh}/{len(prices)}종목")
@@ -210,6 +229,13 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
         L(f"약세장 → 매수 {len(orders['buy'])}건 보류")
         orders["buy"] = []
 
+    if blocked:
+        orders = {k: [o for o in v if o["ticker"] not in blocked]
+                  for k, v in orders.items()}
+    if halted and orders["buy"]:
+        L(f"대조 불일치 → 매수 {len(orders['buy'])}건 보류")
+        orders["buy"] = []
+
     top = scores_raw[0] if scores_raw else None
     n_b, n_s = len(orders["buy"]), len(orders["sell"])
     if not n_b and not n_s:
@@ -219,8 +245,11 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     else:
         L(f"주문 · 국면 {regime} · 매수 {n_b} / 매도 {n_s}")
 
-    result = execute_orders(orders, prices, paper, pm, broker=broker, log=L)
+    result = execute_orders(orders, prices, paper, pm, broker=broker, log=L,
+                            cycle_id=cycle_id, price_ts=price_ts, cfg=cfg)
     result["regime"] = regime
+    if halted:
+        result["halted"], result["reconcile"] = True, halted
     result["top"] = scores_raw[:10]
     result["prices"] = {r["ticker"]: prices.get(r["ticker"])
                         for r in scores_raw[:10]}
