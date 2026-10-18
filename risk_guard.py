@@ -13,8 +13,9 @@ day_state.json:
   }
 """
 
-from datetime import date
 from pathlib import Path
+
+import market_hours as mh
 from safe_store import atomic_write_json, safe_read_json
 
 DAY_FILE = Path(__file__).parent / "day_state.json"
@@ -40,7 +41,7 @@ def start_of_day(current_equity: float, start_equity: float | None = None) -> di
     가능하면 전일 종가 기준 앵커를 넘기는 것이 정확하다.
     """
     d = _load()
-    today = date.today().isoformat()
+    today = mh.trading_day().isoformat()     # ET 기준 — KST 자정은 미국 장중이다
     if d.get("date") != today:
         anchor = float(start_equity) if start_equity else float(current_equity)
         d = {
@@ -79,7 +80,7 @@ def check(current_equity: float, loss_limit: float = DEFAULT_DAILY_LOSS_LIMIT,
 
 def is_halted() -> bool:
     d = _load()
-    if d.get("date") != date.today().isoformat():
+    if d.get("date") != mh.trading_day().isoformat():
         return False        # 날짜 바뀌면 자동 해제
     return d.get("halted", False)
 

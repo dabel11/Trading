@@ -6,10 +6,11 @@
 """
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+import market_hours as _mh
 from safe_store import atomic_write_json, safe_read_json, trade_lock
 
 DIR = Path(__file__).resolve().parent.parent
@@ -45,7 +46,7 @@ def log_order(ticker, side, shares, price, source="manual", *,
     orders = data.setdefault("orders", [])
     orders.append({
         "ts": datetime.now().isoformat(timespec="seconds"),
-        "date": date.today().isoformat(),
+        "date": _mh.trading_day().isoformat(),
         "ticker": ticker, "side": side,
         "shares": float(shares), "price": float(price),
         "source": source,
@@ -112,9 +113,18 @@ def execute_orders(orders: dict, prices: dict, paper: bool, pm,
     # ── 매도 먼저 (자본 회수 → 매수 여력 확보) ───────────────────────────
     for o in orders.get("sell", []):
         try:
+            # 결정(generate_orders)은 락 밖의 묵은 스냅샷 기준이다. 그 사이 틱 가드·
+            # 수동·텔레그램 매도가 먼저 팔았을 수 있으므로, 락 안에서 다시 읽은 장부로
+            # 재검증한다: 미보유면 건너뛰고(이중 매도 → 모의 유령 현금 / 실거래 공매도
+            # 방지), 수량은 현재 보유량으로 자른다.
             pos = pm.positions.get(o["ticker"])
+            if pos is None or int(pos.shares) < 1:
+                L(f"매도 건너뜀(이미 미보유) {o['ticker']}")
+                out["skipped"].append(o["ticker"]); continue
             fp = prices.get(o["ticker"], o["est_price"])
-            qty = int(o["shares"])
+            qty = min(int(o["shares"]), int(pos.shares))
+            if qty < 1:
+                out["skipped"].append(o["ticker"]); continue
             if not paper:
                 from broker import validate_fill
                 res = broker.execute_order(o["ticker"], qty, "sell", o["est_price"])
@@ -132,8 +142,12 @@ def execute_orders(orders: dict, prices: dict, paper: bool, pm,
                 fp, qty = v["fill_price"], v["filled_qty"]
             pnl = ((fp - pos.entry_price) / pos.entry_price
                    if pos and pos.entry_price else 0.0)
-            pm.record_sell(o["ticker"], exit_price=fp, reason=o["reason"], shares=qty)
+            sold = pm.record_sell(o["ticker"], exit_price=fp, reason=o["reason"],
+                                  shares=qty)
             if paper:
+                qty = int(sold or 0)
+                if qty < 1:
+                    out["skipped"].append(o["ticker"]); continue
                 _pa.adjust(qty * fp)
             log_order(o["ticker"], "sell", qty, fp, source=src,
                       pnl_pct=pnl, reason=o["reason"])
@@ -225,14 +239,19 @@ def execute_manual(ticker: str, shares: float, side: str, paper: bool,
                 "warning": v.get("warning")}
 
     # ── sell ──
+    # 호출부가 넘긴 pm 은 묵은 스냅샷일 수 있다(UI 보관본 등) — 락 안에서 최신화.
+    pm._load_state()
     pos = pm.positions.get(ticker)
-    if not pos:
+    if not pos or int(pos.shares) < 1:
         raise RuntimeError(f"{ticker} — 보유하지 않은 종목입니다")
     qty = min(qty, int(pos.shares)) if qty >= 1 else int(pos.shares)
     if paper:
         pnl = ((est_price - pos.entry_price) / pos.entry_price
                if pos.entry_price else 0.0)
-        pm.record_sell(ticker, exit_price=est_price, reason=reason, shares=qty)
+        qty = int(pm.record_sell(ticker, exit_price=est_price, reason=reason,
+                                 shares=qty) or 0)
+        if qty < 1:
+            raise RuntimeError(f"{ticker} — 보유하지 않은 종목입니다")
         _pa.adjust(qty * est_price)
         log_order(ticker, "sell", qty, est_price, source=src,
                   pnl_pct=pnl, reason=reason)

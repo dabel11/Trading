@@ -64,14 +64,18 @@ MAX_PER_SECTOR = 3
 
 
 # 백테스트가 '오늘'을 시뮬레이션 날짜로 갈아끼울 수 있게 하는 인디렉션.
-# 평소엔 실제 오늘(date.today())을 그대로 쓰고, 백테스터만 set_clock()으로
+# 평소엔 실제 오늘(ET 거래일)을 그대로 쓰고, 백테스터만 set_clock()으로
 # 과거 날짜를 주입한다. 이렇게 해야 보유기간·재진입 쿨다운 등 '날짜에 의존하는'
 # 라이브 로직을 백테스트에서 그대로(같은 코드로) 재현할 수 있다.
 _CLOCK: Optional[date] = None
 
 
 def _today() -> date:
-    return _CLOCK if _CLOCK is not None else date.today()
+    # ET 기준 날짜 — 진입일·보유일·쿨다운이 KST 자정(미국 장중)에 넘어가지 않게.
+    if _CLOCK is not None:
+        return _CLOCK
+    import market_hours as _mh
+    return _mh.trading_day()
 
 
 def set_clock(d: Optional[date]):
@@ -585,6 +589,7 @@ class PortfolioManager:
         shares=None → 전량 매도(포지션 삭제).
         shares 지정 → 그만큼만 차감(분할 매도). 보유량 이상이면 전량 처리.
         부분 매도 시 평단가·진입일·진입점수는 그대로 유지된다.
+        반환: 실제로 장부에서 차감한 수량(미보유면 0) — 현금 반영은 이 값 기준.
         """
         # record_buy 와 동일 — 락 안에서 디스크 최신 장부를 다시 읽고 수정해
         # 다른 프로세스의 동시 기록이 유실되지 않게 한다.
@@ -592,16 +597,17 @@ class PortfolioManager:
             self._load_state()
             pos = self.positions.get(ticker)
             if pos is None:
-                return
+                return 0.0
             sold = pos.shares if shares is None else min(float(shares), pos.shares)
             if sold <= 0:
-                return
+                return 0.0
             if sold >= pos.shares:
                 self.positions.pop(ticker, None)
             else:
                 pos.shares -= sold
             self._save_state()
             self._append_trade(pos, exit_price, reason, shares=sold)
+            return sold
 
     def _append_trade(self, pos: "Position", exit_price: float, reason: str,
                       shares: Optional[float] = None):

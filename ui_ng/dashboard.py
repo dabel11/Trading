@@ -909,7 +909,6 @@ class _PoCDaemon:
     def __init__(self):
         self._t = None
         self._stop = threading.Event()
-        self._lock = threading.Lock()
         self.runs = 0
         self.last_run = 0.0
         self.last_log = []
@@ -955,31 +954,55 @@ class _PoCDaemon:
             _tg_push("■ 자동매매 정지")
 
     def run_once(self):
-        threading.Thread(target=self._cycle, daemon=True).start()
-
-    def _cycle(self):
-        if not self._lock.acquire(blocking=False):
-            return  # 이미 사이클 실행 중 — 중복 방지
-        try:
-            from core.cycle import run_cycle
+        """'지금 1회 실행' — 장 시간·중복 실행 게이트는 core.runner 가 판정."""
+        def _go():
             logs = []
-            run_cycle(load_config(), log=lambda m: logs.append(str(m)))
+            try:
+                from core.runner import run_cycle_guarded
+                ran = run_cycle_guarded(load_config(), log=lambda m: logs.append(str(m)))
+                self._publish(logs, ran is not None)
+            except Exception as e:
+                self.last_log = [f"오류: {e}"]
+        threading.Thread(target=_go, daemon=True).start()
+
+    def _publish(self, logs: list, ran: bool):
+        if ran:
             self.runs += 1
             self.last_run = time.time()
+        if logs or ran:
             self.last_log = logs[-10:] or ["완료 — 변동 없음"]
-        except Exception as e:
-            self.last_log = [f"오류: {e}"]
-        finally:
-            self._lock.release()
+
+    def _guard_log(self, m):
+        self.last_log = (list(self.last_log) + [str(m)])[-10:]
 
     def _loop(self):
-        self._cycle()
+        # 루프 본문(PID·enabled·장 시간·실패 백오프/경보)은 데몬과 같은 core.runner.
+        from core.runner import Runner
+        logs: list = []
+        runner = Runner(log=lambda m: logs.append(str(m)), min_interval=30,
+                        alert_fn=_tg_push)
+        try:
+            from core import guard
+            guard.start(log=self._guard_log)   # 틱 손절 가드 (중복 기동 안전)
+        except Exception as e:
+            self._guard_log(f"틱 가드 비활성: {e}")
         while not self._stop.is_set():
-            interval = max(30, int(load_config().get("interval", 300) or 300))
-            if self._stop.wait(interval):
+            logs.clear()
+            try:
+                delay = runner.step()
+            except Exception as e:
+                logs.append(f"루프 오류: {e}")
+                delay = 60
+            self._publish(logs, runner.ran)
+            if delay is None:
                 break
-            if load_config().get("enabled", True):
-                self._cycle()
+            if self._stop.wait(delay):
+                break
+        if not self._stop.is_set():       # enabled=false·PID 상실로 스스로 끝남
+            try:
+                _ctl_mod.cleanup_pid()
+            except Exception:
+                pass
 
 
 DAEMON = _PoCDaemon()
@@ -1890,7 +1913,7 @@ def _equity_line_option(dates, values, start_cap):
 
 def page_backtest():
     """백테스트 — 과거 데이터로 전략을 라이브와 동일한 로직으로 시뮬레이션."""
-    import backtester as _bt
+    from core import isolated as _iso
     import functools
     ui.html('<div class="sec-h">📊 백테스트 <small style="font-size:.7rem;color:var(--t3)">· 과거 데이터로 전략 검증 (라이브와 동일 로직)</small></div>')
 
@@ -2030,24 +2053,13 @@ def page_backtest():
             cap = float(cap_in.value or 10000); ms = float(min_in.value or 60)
             sl = float(sl_in.value or 7) / 100.0; tp = float(tp_in.value or 15) / 100.0
             cands = [k for k in opts.keys()]
-
-            def work():
-                bundle = _bt.load_market_data(universe, start, end)
-                rows = []
-                for k in cands:
-                    try:
-                        r = _bt.run(strategy=k, start=start, end=end, capital=cap,
-                                    universe=universe, min_score=ms, stop_loss=sl,
-                                    take_profit=tp, prefetched=bundle)
-                        rows.append({"key": k, "name": opts.get(k, k),
-                                     "ret": r.total_return, "cagr": r.cagr, "mdd": r.mdd,
-                                     "sharpe": r.sharpe, "win": r.win_rate,
-                                     "eq": float(r.equity_curve.iloc[-1])})
-                    except Exception:
-                        pass
-                rows.sort(key=lambda x: -x["ret"])
-                return rows
-            ranking = await run.io_bound(work)
+            # 백테스트는 portfolio 모듈 전역(시계·자본·보유한도)을 바꾸므로 반드시 별도
+            # 프로세스에서 — 같은 프로세스의 자동매매 사이클이 오염되지 않게 한다.
+            ranking = await run.io_bound(functools.partial(
+                _iso.call, "backtester:compare_strategies", cands, universe, start, end,
+                cap, ms, sl, tp))
+            for row in ranking or []:
+                row["name"] = opts.get(row["key"], row["key"])
             if not ranking:
                 state["error"] = "비교할 결과가 없습니다 (데이터·기간 확인)."
             else:
@@ -2064,8 +2076,8 @@ def page_backtest():
         out.refresh()
         try:
             universe = _resolve_universe()
-            fn = functools.partial(
-                _bt.run, strategy=strat.value, start=start_in.value.strip(),
+            fn = functools.partial(           # 별도 프로세스 — 위 _compare 주석 참고
+                _iso.call, "backtester:run", strategy=strat.value, start=start_in.value.strip(),
                 end=end_in.value.strip(), capital=float(cap_in.value or 10000),
                 universe=universe, min_score=float(min_in.value or 60),
                 stop_loss=float(sl_in.value or 7) / 100.0,

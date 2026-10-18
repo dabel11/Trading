@@ -940,3 +940,26 @@ def run(
 
     equity_series = pd.Series(equity_curve, index=date_index)
     return BacktestResult(trades=trades, equity_curve=equity_series, start_capital=capital)
+
+
+def compare_strategies(keys: list[str], universe: list[str], start: str, end: str,
+                       capital: float, min_score: float, stop_loss: float,
+                       take_profit: float) -> list[dict]:
+    """여러 전략을 같은 데이터 번들로 백테스트해 총수익률 내림차순 지표 목록 반환.
+
+    앱의 '최고 수익 전략 찾기'가 core.isolated 로 별도 프로세스에서 부른다
+    (모듈 최상위 함수여야 자식 프로세스가 import 할 수 있다)."""
+    bundle = load_market_data(universe, start, end)
+    rows = []
+    for k in keys:
+        try:
+            r = run(strategy=k, start=start, end=end, capital=capital,
+                    universe=universe, min_score=min_score, stop_loss=stop_loss,
+                    take_profit=take_profit, prefetched=bundle)
+            rows.append({"key": k, "ret": r.total_return, "cagr": r.cagr,
+                         "mdd": r.mdd, "sharpe": r.sharpe, "win": r.win_rate,
+                         "eq": float(r.equity_curve.iloc[-1])})
+        except Exception:
+            pass
+    rows.sort(key=lambda x: -x["ret"])
+    return rows

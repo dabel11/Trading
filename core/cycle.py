@@ -20,6 +20,18 @@ def _ai_snapshot() -> Optional[dict]:
         return None
 
 
+def mark_to_market_equity(pm, prices: dict, paper: bool) -> float:
+    """킬스위치용 시가평가 자산 = 현금 + Σ(보유수량 × 현재가).
+
+    원가(cost basis)로 합치면 평가손실이 안 보여 '실제 -15%인데 손실 0%'가 된다.
+    현재가가 없는 종목만 진입가로 대체한다. (실거래는 호출부가 브로커 equity 로 덮어씀)"""
+    import paper_account as _pa
+    mv = sum(p.shares * float(prices.get(t) or p.entry_price)
+             for t, p in pm.positions.items())
+    cash = _pa.cash() if paper else pm.available_capital()
+    return cash + mv
+
+
 def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     """설정(cfg = autotrader_config.json 스키마)대로 사이클 1회 실행.
 
@@ -129,8 +141,7 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     # 일일 손실 kill switch
     try:
         import risk_guard as rg
-        cur_eq = ((_pa.cash() + pm.invested_capital()) if paper
-                  else (pm.invested_capital() + pm.available_capital()))
+        cur_eq = mark_to_market_equity(pm, prices, paper)
         last_eq = None
         if broker is not None:
             try:

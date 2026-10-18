@@ -22,6 +22,8 @@ trades_paper.json
 orders_log.json
 # 일일 손실 킬스위치 상태
 day_state.json
+# 실행 루프 상태 (daily 모드 마지막 실행 ET 날짜)
+runner_state.json
 # 가격 알림
 price_alerts.json
 # 매매 규칙 + 가중치

@@ -54,7 +54,12 @@ def load_config() -> dict:
         except Exception:
             pass
         time.sleep(0.03)
-    return dict(_LAST_GOOD) if _LAST_GOOD else dict(DEFAULT_CONFIG)
+    if _LAST_GOOD:
+        return dict(_LAST_GOOD)
+    # 정상값을 한 번도 못 읽은 채 파일이 손상돼 있다 — 사용자의 실제 의도(ON/OFF·
+    # 모의/실거래)를 알 수 없으므로 매매는 끈 상태로 본다(fail-closed).
+    print(f"[control] 설정 파일 손상 — 매매 비활성으로 간주: {CONFIG_FILE}", flush=True)
+    return {**DEFAULT_CONFIG, "enabled": False}
 
 
 def save_config(cfg: dict):
