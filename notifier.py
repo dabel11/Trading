@@ -22,16 +22,29 @@ NOTIFY_CONFIG_FILE = Path(__file__).parent / "notify_config.json"
 # 설정 로드/저장
 # ──────────────────────────────────────────────────────────────────────────────
 
+_NOTIFY_LAST_GOOD: dict = {}
+
+
 def load_config() -> dict:
+    """알림 설정 읽기. 동시 쓰기 중 잘린 파일이면 재시도 → 마지막 정상값.
+    (실패 시 기본값을 돌려주면 그 값이 다시 저장되며 봇 토큰이 지워질 수 있었다)"""
+    global _NOTIFY_LAST_GOOD
     if NOTIFY_CONFIG_FILE.exists():
-        try:
-            cfg = json.loads(NOTIFY_CONFIG_FILE.read_text())
-            # 새 채널 기본값 병합
-            cfg.setdefault("macos",    {"enabled": True})
-            cfg.setdefault("telegram", {"enabled": False, "bot_token": "", "chat_id": ""})
-            return cfg
-        except Exception:
-            pass
+        import time as _t
+        for _ in range(6):
+            try:
+                cfg = json.loads(NOTIFY_CONFIG_FILE.read_text())
+                if isinstance(cfg, dict) and cfg:
+                    # 새 채널 기본값 병합
+                    cfg.setdefault("macos",    {"enabled": True})
+                    cfg.setdefault("telegram", {"enabled": False, "bot_token": "", "chat_id": ""})
+                    _NOTIFY_LAST_GOOD = json.loads(json.dumps(cfg))
+                    return cfg
+            except Exception:
+                pass
+            _t.sleep(0.03)
+        if _NOTIFY_LAST_GOOD:
+            return json.loads(json.dumps(_NOTIFY_LAST_GOOD))
     return {
         "macos":    {"enabled": True},
         "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
@@ -43,7 +56,11 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    NOTIFY_CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    """원자적 쓰기(임시파일→rename)."""
+    global _NOTIFY_LAST_GOOD
+    from safe_store import atomic_write_json
+    atomic_write_json(NOTIFY_CONFIG_FILE, cfg)
+    _NOTIFY_LAST_GOOD = json.loads(json.dumps(cfg))
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 DIR = Path(__file__).resolve().parent.parent
@@ -26,20 +27,42 @@ DEFAULT_CONFIG = {
 
 # ── 설정 ──────────────────────────────────────────────────────────────────
 
+_LAST_GOOD: dict = {}
+
+
 def load_config() -> dict:
-    """설정 읽기. 없으면 안전 기본값(모의·복합) 생성 — 단독 실행 가능."""
-    try:
-        return json.loads(CONFIG_FILE.read_text())
-    except Exception:
+    """설정 읽기. 파일이 '없을 때만' 안전 기본값(모의)을 생성한다.
+
+    읽기 실패(다른 스레드가 쓰는 중 잘린 파일 등)는 짧게 재시도하고, 그래도 실패하면
+    마지막 정상값(없으면 기본값)을 반환하되 파일은 절대 덮어쓰지 않는다 — 예전엔
+    파싱 실패 시 파일 전체를 기본값으로 덮어써 사용자 설정(주기·전략·모드)이 날아갔다.
+    """
+    global _LAST_GOOD
+    if not CONFIG_FILE.exists():
+        cfg = dict(DEFAULT_CONFIG)
         try:
-            CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
+            save_config(cfg)
         except Exception:
             pass
-        return dict(DEFAULT_CONFIG)
+        return cfg
+    for _ in range(6):
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            if isinstance(cfg, dict) and cfg:
+                _LAST_GOOD = dict(cfg)
+                return cfg
+        except Exception:
+            pass
+        time.sleep(0.03)
+    return dict(_LAST_GOOD) if _LAST_GOOD else dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg: dict):
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False))
+    """원자적 쓰기(임시파일→rename) — 동시 읽기가 잘린 파일을 보지 않는다."""
+    global _LAST_GOOD
+    from safe_store import atomic_write_json
+    atomic_write_json(CONFIG_FILE, cfg)
+    _LAST_GOOD = dict(cfg)
 
 
 def set_enabled(on: bool):

@@ -642,6 +642,11 @@ AI_STYLE = """
 .tgt-kpi .l{ font-size:.6rem; color:var(--t3); font-weight:700; }
 .tgt-kpi .v{ font-size:1.25rem; font-weight:800; margin-top:3px; }
 .tgt-line{ font-size:.7rem; color:var(--t3); margin:2px 0 10px; }
+/* 자동매매 통합 탭 */
+.at-tabs{ border-bottom:1px solid var(--line2); color:var(--t3); }
+.at-tabs .q-tab{ min-height:38px; padding:0 14px; font-weight:700; font-size:.82rem; }
+.at-tabs .q-tab--active{ color:var(--t1); }
+.at-panels, .at-panels .q-tab-panel{ background:transparent!important; }
 /* 클릭 위치 미니 팝업 */
 .pop-anchor{ position:relative; }
 .mini-menu .q-menu, .mini-menu{ background:transparent!important; box-shadow:none!important; }
@@ -1197,7 +1202,7 @@ def render_index_grid():
                 f'<div class="idx-name">{lbl}</div>'
                 f'<div class="idx-val mono">{_idx_fmt(px)}</div>'
                 f'<div class="idx-chg" style="color:{c}">'
-                f'{"+" if chg>=0 else ""}{_idx_fmt(chg) if abs(chg)>=1 else f"{chg:+.2f}"} '
+                f'{"+" if chg>=0 else ""}{_idx_fmt(chg) if abs(chg)>=1 else f"{chg:.2f}"} '
                 f'({"+" if pct>=0 else ""}{pct:.2f}%)</div>'
                 f'{spark}{extra}</div>')
 
@@ -1365,7 +1370,7 @@ def render_bottom_bar():
             html.append(
                 f'<div class="bb-item"><span class="l">{lbl}</span>'
                 f'<span class="p">{_idx_fmt(dd.get("price",0))}</span>'
-                f'<span class="c" style="color:{c}">{"+" if chg>=0 else ""}{chg:+.2f} '
+                f'<span class="c" style="color:{c}">{"+" if chg>=0 else ""}{chg:.2f} '
                 f'({"+" if pct>=0 else ""}{pct:.2f}%)</span></div>')
         ui.html("".join(html) or '<span style="color:var(--t3);font-size:.76rem;padding:0 14px">시세 불러오는 중…</span>')
 
@@ -1555,6 +1560,7 @@ def render_auto_panel(d):
                 "지금 1회 실행", "run_cycle 사이클을 1회 실행합니다.",
                 lambda: (DAEMON.run_once(), ui.notify("사이클 1회 실행 중…", position="top")),
                 ok_label="실행")).classes("tbtn")
+            ui.button("⚙ 전략·백테스트·설정", on_click=lambda: _hooks["open_page"](page_autotrade)).classes("tbtn")
         if DAEMON.last_log:
             ui.html('<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">'
                     + "".join(f'<div class="auto-log">· {str(m)[:120]}</div>' for m in DAEMON.last_log[-4:])
@@ -2181,7 +2187,8 @@ def page_ai():
         ui.button("유니버스 전체 재스캔", on_click=lambda: (_run(True),
                    ui.notify(f"유니버스 {uni_n}종목을 AI로 재스캔 중…", position="top"))).classes("tbtn tbtn-primary")
         ui.button("새로고침", on_click=vbox.refresh).classes("tbtn")
-        ui.button("폴백 전략 선택", on_click=lambda: _hooks["open_page"](page_strategy)).classes("tbtn")
+        ui.button("전략 선택 →", on_click=lambda: _goto("전략")
+                  if "goto_tab" in _hooks else _hooks["open_page"](page_strategy)).classes("tbtn")
 
     # 패널 진입 시 판단 결과가 없거나 오래됐으면 자동으로 1회 분석.
     if not _eng.LAST.get("verdicts") or (time.time() - _eng.LAST.get("ts", 0)) > _eng._TTL:
@@ -2621,62 +2628,253 @@ def page_settings():
                 '· 알림: 매매 체결 · AI 신규 매수신호(장중 30분) · 자동매매 시작/정지 · 장 개장/마감 요약<br>'
                 '· 명령: <b>/help /status /ai /mode /모의 /실거래 /buy AAPL 500 /sell AAPL /confirm</b></div>')
 
-    ui.html('<div class="sec-h" style="margin-top:4px">자동매매 파라미터</div>')
-    # (key, label, value, kind)  kind: pct | int | text
-    specs = [
-        ("strategy_name", "전략", cfg.get("strategy_name", ""), "text"),
-        ("horizon", "투자 기간", cfg.get("horizon", ""), "text"),
-        ("interval", "실행 주기(초)", cfg.get("interval", 300), "int"),
-        ("min_score", "매수 스코어", cfg.get("min_score", 60), "int"),
-        ("sell_score", "매도 스코어", cfg.get("sell_score", 35), "int"),
-        ("stop_loss", "손절(%)", round(cfg.get("stop_loss", 0.07) * 100, 1), "pct"),
-        ("take_profit", "익절(%)", round(cfg.get("take_profit", 0.15) * 100, 1), "pct"),
-        ("trail", "트레일링(%)", round(cfg.get("trail", 0.07) * 100, 1), "pct"),
-        ("daily_loss_limit", "일일 손실한도(%)", round(cfg.get("daily_loss_limit", 0.05) * 100, 1), "pct"),
-        ("daily_time", "예약 실행 시각", cfg.get("daily_time", "10:00"), "text"),
-    ]
+    with ui.element("div").classes("card"):
+        ui.html('<div class="sh2">자동매매 설정 <small>· 전략·파라미터·백테스트</small></div>'
+                '<div style="font-size:.74rem;color:var(--t2);line-height:1.6">자동매매 관련 설정은 '
+                '<b>🤖 자동매매</b> 탭 한 곳에 모았습니다.</div>')
+        ui.button("🤖 자동매매 탭 열기", on_click=lambda: _hooks["open_page"](
+            lambda: page_autotrade("파라미터"))).classes("tbtn tbtn-primary").style("margin-top:8px")
+
+
+# ── 🤖 자동매매 통합 탭 ────────────────────────────────────────────────────────
+_PARAM_SPECS = [
+    # (key, label, kind)  kind: pct | int | text
+    ("interval", "실행 주기(초)", "int"),
+    ("min_score", "매수 문턱(점수)", "int"),
+    ("sell_score", "매도 문턱(점수)", "int"),
+    ("stop_loss", "손절(%)", "pct"),
+    ("take_profit", "익절(%)", "pct"),
+    ("trail", "트레일링(%)", "pct"),
+    ("daily_loss_limit", "일일 손실한도(%)", "pct"),
+    ("daily_time", "예약 실행 시각(ET)", "text"),
+]
+
+
+def _at_params():
+    cfg = load_config()
+    ui.html('<div class="sec-h">파라미터 <small style="font-size:.7rem;color:var(--t3)">· 다음 사이클부터 반영</small></div>')
     inputs = {}
     with ui.element("div").classes("card"):
         with ui.element("div").classes("form-grid"):
-            for key, label, val, kind in specs:
+            for key, label, kind in _PARAM_SPECS:
+                val = cfg.get(key, _ctl_mod.DEFAULT_CONFIG.get(key))
                 if kind == "text":
-                    inputs[key] = (ui.input(label, value=str(val)).props("outlined dense dark"), kind)
+                    inputs[key] = (ui.input(label, value=str(val or "")).props("outlined dense dark"), kind)
                 else:
-                    inputs[key] = (ui.number(label, value=val, format="%g").props("outlined dense dark"), kind)
+                    shown = round(float(val or 0) * 100, 1) if kind == "pct" else val
+                    inputs[key] = (ui.number(label, value=shown, format="%g").props("outlined dense dark"), kind)
+
+        def _apply_profile():
+            prof = scat.exit_profile(load_config().get("strategy", ""))
+            if not prof:
+                ui.notify("이 전략은 권장 청산값이 없어 전역 기본값을 씁니다.", position="top")
+                return
+            inputs["take_profit"][0].value = round(prof["take_profit"] * 100, 1)
+            inputs["stop_loss"][0].value = round(prof["stop_loss"] * 100, 1)
+            inputs["trail"][0].value = round(prof["trailing"] * 100, 1)
+            ui.notify("현재 전략의 권장 손절·익절·트레일링을 채웠습니다 — 저장을 눌러 반영하세요.", position="top")
 
         def _save():
             newcfg = dict(load_config())
             for key, (el, kind) in inputs.items():
                 v = el.value
-                if kind == "pct":
-                    newcfg[key] = float(v) / 100.0
-                elif kind == "int":
-                    newcfg[key] = int(float(v))
-                else:
-                    newcfg[key] = v
+                try:
+                    if kind == "pct":
+                        newcfg[key] = float(v) / 100.0
+                    elif kind == "int":
+                        newcfg[key] = int(float(v))
+                    else:
+                        newcfg[key] = str(v or "").strip()
+                except Exception:
+                    pass
             _ctl_mod.save_config(newcfg)
-            ui.notify("설정을 저장했습니다.", type="positive", position="top")
-            _screen["refresh"]()
+            ui.notify("파라미터를 저장했습니다 — 다음 사이클부터 반영됩니다.", type="positive", position="top")
+            _hooks.get("at_refresh", lambda: None)()
 
         def _reset():
-            d = dict(_ctl_mod.DEFAULT_CONFIG)
-            d["enabled"] = load_config().get("enabled", False)
-            d["paper"] = True
-            _ctl_mod.save_config(d)
-            ui.notify("기본값으로 복원했습니다.", type="positive", position="top")
-            _screen["refresh"]()
+            newcfg = dict(load_config())
+            for key, _l, _k in _PARAM_SPECS:          # 파라미터만 기본값(전략·모드·실행상태 보존)
+                newcfg[key] = _ctl_mod.DEFAULT_CONFIG.get(key, newcfg.get(key))
+            _ctl_mod.save_config(newcfg)
+            for key, (el, kind) in inputs.items():
+                v = newcfg.get(key)
+                el.value = round(float(v or 0) * 100, 1) if kind == "pct" else v
+            ui.notify("파라미터를 기본값으로 되돌렸습니다.", type="positive", position="top")
 
         with ui.row().style("margin-top:14px;gap:8px"):
-            ui.button("설정 저장", on_click=lambda: confirm(
-                "설정 저장", "변경한 설정을 저장합니다. 다음 사이클부터 반영됩니다.",
+            ui.button("저장", on_click=lambda: confirm(
+                "파라미터 저장", "변경한 값을 저장합니다. 다음 사이클부터 반영됩니다.",
                 _save, ok_label="저장")).classes("tbtn tbtn-primary")
+            ui.button("전략 권장값 채우기", on_click=_apply_profile).classes("tbtn")
             ui.button("기본값", on_click=lambda: confirm(
-                "기본값 복원", "설정을 기본값으로 되돌립니다.", _reset,
+                "기본값 복원", "파라미터만 기본값으로 되돌립니다(전략·모드는 유지).", _reset,
                 ok_label="복원", danger=True)).classes("tbtn")
+    ui.html('<div style="font-size:.66rem;color:var(--t3);margin-top:8px;line-height:1.6">'
+            '· 매수 문턱 이상 점수 종목을 매수, 매도 문턱 이하로 떨어지면 매도<br>'
+            '· 손절은 항상 우선, 익절 도달 후엔 고점 대비 트레일링 폭만큼 되돌리면 청산<br>'
+            '· 실거래에선 실행 주기를 300초(5분) 이상으로 권장</div>')
+
+
+def _goto(name):
+    _hooks.get("goto_tab", lambda n: None)(name)
+
+
+def _at_run():
+    @ui.refreshable
+    def status():
+        cfg = load_config()
+        running = DAEMON.running()
+        dot = "var(--green)" if running else "var(--t3)"
+        last = time.strftime("%H:%M:%S", time.localtime(DAEMON.last_run)) if DAEMON.last_run else "—"
+        paper = bool(cfg.get("paper", True))
+        try:
+            d = collect()
+        except Exception:
+            d = {"equity": 0, "cash": 0, "rows": [], "total_pnl": 0}
+        ui.html(
+            f'<div class="ai-hero"><div class="t"><span class="auto-dot" style="background:{dot}"></span>'
+            f'자동매매 {"실행 중" if running else "정지"}'
+            f'<span class="ind-tag" style="margin-left:6px">{"모의" if paper else "🔴 실거래"}</span></div>'
+            f'<div class="d">전략 <b>{cfg.get("strategy_name", cfg.get("strategy", "—"))}</b> · '
+            f'{cfg.get("interval", 0)}초 주기 · 매수 {cfg.get("min_score", 60)}점↑ / 매도 {cfg.get("sell_score", 35)}점↓ · '
+            f'손절 {cfg.get("stop_loss", 0)*100:.0f}% / 익절 {cfg.get("take_profit", 0)*100:.0f}% / 트레일 {cfg.get("trail", 0)*100:.0f}%</div></div>')
+        ui.html('<div class="tgt-sum" style="grid-template-columns:repeat(4,1fr);margin-top:10px">'
+                f'<div class="tgt-kpi"><div class="l">사이클 실행</div><div class="v mono">{DAEMON.runs}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">마지막 실행</div><div class="v mono" style="font-size:.95rem">{last}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">총자산</div><div class="v mono" style="font-size:.95rem">${d["equity"]:,.0f}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">보유 · 현금</div><div class="v mono" style="font-size:.95rem">'
+                f'{len(d["rows"])}종목 · ${d["cash"]:,.0f}</div></div></div>')
+        logs = DAEMON.last_log or ["아직 실행 기록이 없습니다."]
+        ui.html('<div class="card" style="margin-top:4px"><div class="sh2">최근 사이클 로그</div>'
+                + "".join(f'<div class="auto-log">· {str(m)[:150]}</div>' for m in logs[-10:]) + '</div>')
+    status()
+
+    def _start():
+        if DAEMON.start():
+            ui.notify("자동매매를 시작했습니다 — 첫 사이클 실행 중…", position="top")
+        else:
+            ui.notify("이미 실행 중이거나 외부 데몬이 가동 중입니다.", type="warning", position="top")
+        status.refresh(); _hooks["auto"]()
+
+    def _stop():
+        DAEMON.stop()
+        ui.notify("자동매매를 정지했습니다.", position="top")
+        status.refresh(); _hooks["auto"]()
+
+    def _once():
+        DAEMON.run_once()
+        ui.notify("사이클 1회 실행 중… (몇 초 뒤 로그 갱신)", position="top")
+
+    # 버튼은 새로고침 영역 밖(주기 갱신이 클릭을 삼키지 않도록)
+    with ui.row().style("gap:8px;margin-top:10px;flex-wrap:wrap"):
+        ui.button("▶ 시작", on_click=lambda: confirm(
+            "자동매매 시작", f'{load_config().get("interval", 300)}초 주기로 발굴·채점·주문을 실행합니다.',
+            _start, ok_label="시작")).classes("tbtn tbtn-primary")
+        ui.button("■ 정지", on_click=_stop).classes("tbtn tbtn-danger")
+        ui.button("↻ 지금 1회 실행", on_click=lambda: confirm(
+            "지금 1회 실행", "사이클을 1회 실행합니다. 계좌에 주문이 발생할 수 있습니다.",
+            _once, ok_label="실행")).classes("tbtn")
+    with ui.row().style("gap:8px;margin-top:6px;flex-wrap:wrap"):
+        ui.button("전략 변경 →", on_click=lambda: _goto("전략")).classes("tbtn")
+        ui.button("파라미터 →", on_click=lambda: _goto("파라미터")).classes("tbtn")
+        ui.button("백테스트 →", on_click=lambda: _goto("백테스트")).classes("tbtn")
+    _hooks["at_refresh"] = status.refresh
+    ui.timer(3.0, status.refresh)
+
+
+def _at_strategy():
+    @ui.refreshable
+    def body():
+        cfg = load_config()
+        active = cfg.get("strategy", "ai_influencer")
+        try:
+            m = scat.meta(active)
+        except Exception:
+            m = {"name": active, "desc": "", "color": "#888"}
+        buy_r, sell_r = scat.rules(active)
+        prof = scat.exit_profile(active)
+        prof_s = (f'권장 청산: 익절 {prof["take_profit"]*100:.0f}% · 손절 {prof["stop_loss"]*100:.0f}% · '
+                  f'트레일 {prof["trailing"]*100:.0f}%') if prof else "청산: 파라미터 탭 전역값 사용"
+        ui.html(f'<div class="ai-hero"><div class="t"><span style="width:10px;height:10px;border-radius:50%;'
+                f'background:{m.get("color", "#888")};display:inline-block"></span>현재 전략 · {m.get("name", active)}</div>'
+                f'<div class="d">{m.get("desc", "")}<br><b>매수</b> {buy_r}<br><b>매도</b> {sell_r}<br>'
+                f'<span style="color:var(--t3)">{prof_s}</span></div></div>')
+        try:
+            cats = scat.keys_by_category()
+        except Exception:
+            cats = {}
+        for cat, keys in cats.items():
+            if not keys:
+                continue
+            label = {"AI": "AI · 공신력 인플루언서 (실시간 판단, 백테스트 불가)"}.get(cat, cat)
+            ui.html(f'<div class="scat-cat">{label}</div>')
+            with ui.element("div").classes("scards"):
+                for k in keys:
+                    mm = scat.meta(k)
+                    on = " on" if k == active else ""
+                    risk = "●" * int(mm.get("risk", 0) or 0) + "○" * (5 - int(mm.get("risk", 0) or 0))
+                    card = ui.html(
+                        f'<div class="scard{on}">'
+                        f'<div class="sn" style="color:{mm.get("color", "#fff")}">{mm.get("name", k)}'
+                        f'{" ✓" if on else ""}</div>'
+                        f'<div class="sd">{mm.get("desc", "")}</div>'
+                        f'<div class="smeta"><span>위험 {risk}</span><span>· {mm.get("horizon", "")}</span></div></div>')
+                    card.on("click", lambda e, key=k, nm=mm.get("name", k): confirm(
+                        f"전략 변경 · {nm}", f'자동매매 전략을 "{nm}"(으)로 변경합니다. 다음 사이클부터 반영됩니다.',
+                        (lambda key=key, nm=nm: _pick(key, nm)), ok_label="변경"))
+
+    def _pick(key, name):
+        _set_strategy(key, name)
+        body.refresh()
+        _hooks.get("at_refresh", lambda: None)()
+
+    ui.html('<div class="sec-h">전략 선택</div>')
+    with ui.row().style("gap:8px;margin-bottom:10px;flex-wrap:wrap"):
+        ui.button("🏆 백테스트로 최고 수익 전략 찾기", on_click=lambda: _goto("백테스트")).classes("tbtn tbtn-danger")
+        ui.button("🧠 AI 판단 보기", on_click=lambda: _goto("AI 판단")).classes("tbtn")
+    body()
+
+
+_AT_TABS = [("실행", "▶"), ("전략", "🎯"), ("AI 판단", "🧠"), ("백테스트", "📊"), ("파라미터", "⚙")]
+
+
+def page_autotrade(initial: str = "실행"):
+    """🤖 자동매매 통합 탭 — 실행·전략·AI 판단·백테스트·파라미터를 한곳에."""
+    builders = {"실행": _at_run, "전략": _at_strategy, "AI 판단": page_ai,
+                "백테스트": page_backtest, "파라미터": _at_params}
+    if initial not in builders:
+        initial = "실행"
+    ui.html('<div class="sec-h" style="font-size:1rem">🤖 자동매매</div>')
+    with ui.tabs().props('dense no-caps align="left" active-color="white" indicator-color="red"'
+                         ).classes("at-tabs") as tabs:
+        for name, icon in _AT_TABS:
+            ui.tab(name, label=f"{icon} {name}")
+    built: set = set()
+    holders: dict = {}
+    with ui.tab_panels(tabs, value=initial).classes("at-panels w-full") as panels:
+        for name, _i in _AT_TABS:
+            with ui.tab_panel(name).style("padding:12px 2px 0"):
+                holders[name] = ui.column().classes("w-full").style("gap:0")
+
+    def _build(name):
+        if name in built or name not in holders:
+            return
+        built.add(name)
+        with holders[name]:
+            builders[name]()
+
+    def _go(name):
+        _build(name)
+        panels.set_value(name)
+        tabs.set_value(name)
+
+    _hooks["goto_tab"] = _go
+    _build(initial)
+    panels.on_value_change(lambda e: _build(e.value))
 
 
 PAGE_FUNCS = {
-    "대시보드": page_dashboard, "AI 엔진": page_ai, "백테스트": page_backtest,
+    "자동매매": page_autotrade, "대시보드": page_dashboard, "AI 엔진": page_ai, "백테스트": page_backtest,
     "전략 선택": page_strategy, "자동 트레이딩": page_auto, "포트폴리오": page_portfolio,
     "주식 열람": page_stocks, "직접 주문": page_order, "설정": page_settings,
 }
@@ -2727,9 +2925,18 @@ def main_page():
 
     def open_page(fn):
         with ui.dialog() as pg, ui.card().classes("drawer-card").style(
-                "min-width:720px;max-width:96vw;max-height:88vh;overflow:auto"):
+                "min-width:760px;max-width:96vw;max-height:88vh;overflow:auto"):
             fn()
             ui.button("닫기", on_click=pg.close).classes("tbtn").style("margin-top:10px")
+
+        def _cleanup(_=None):
+            if fn is page_autotrade or getattr(fn, "__name__", "") == "<lambda>":
+                _hooks.pop("goto_tab", None); _hooks.pop("at_refresh", None)
+            try:
+                pg.delete()             # 내부 ui.timer 까지 함께 정리
+            except Exception:
+                pass
+        pg.on("hide", _cleanup)
         pg.open()
 
     _hooks["select"] = select
@@ -2791,8 +2998,7 @@ def main_page():
 
     # 플로팅 우측 레일 — 거래 메뉴
     with ui.element("div").classes("frail"):
-        for label, icon, fn in [("AI", "🧠", page_ai), ("주문", "💵", page_order),
-                                ("자동", "🤖", page_auto), ("백테", "📊", page_backtest),
+        for label, icon, fn in [("자동매매", "🤖", page_autotrade), ("주문", "💵", page_order),
                                 ("열람", "🔍", page_stocks),
                                 ("보유", "📁", page_portfolio), ("설정", "⚙️", page_settings)]:
             it = ui.html(f'<div class="frail-item"><span class="fi">{icon}</span>{label}</div>')
