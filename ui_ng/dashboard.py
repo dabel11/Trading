@@ -539,7 +539,7 @@ TOSS2_STYLE = """
 .mv-tabs{ display:flex; gap:4px; margin-bottom:6px; }
 .mv-tab{ font-size:.72rem; font-weight:700; color:var(--t3); padding:4px 11px; border-radius:7px; cursor:pointer; user-select:none; }
 .mv-tab.on{ background:var(--bg3); color:var(--t1); }
-.mv-row{ display:grid; grid-template-columns:20px 24px 1fr auto; gap:9px; align-items:center;
+.mv-row{ display:grid; grid-template-columns:20px 24px 1fr auto 66px; gap:9px; align-items:center;
   padding:7px 2px; border-bottom:1px solid var(--line); font-size:.82rem; cursor:pointer; }
 .mv-row:last-child{ border-bottom:none; }
 .mv-row:hover{ background:var(--bg3); }
@@ -681,14 +681,84 @@ def _age(ts) -> str:
     return f"{d//3600}시간 전"
 
 
+# ── 가격 폴백 캐시 — 실시간 피드에 없는 종목도 '항상' 가격을 표시 ───────────
+# 피드(Finnhub/yfinance)는 구독 종목만, 그리고 yfinance 는 레이트리밋(429)에 자주
+# 걸린다. 화면에 보이는 종목 중 피드 가격이 없으면 Nasdaq 공개 시세로 백그라운드
+# 채움(장중 60초·장외 15분 캐시). 행은 다음 새로고침 때 자동으로 가격이 채워진다.
+_LASTPX: dict = {}            # TK -> (ts, {"price","change","change_pct"})
+_PX_Q: set = set()
+_PX_LOCK = threading.Lock()
+_PX_ON = {"on": False}
+
+
+def _px_ttl() -> float:
+    try:
+        import market_hours as _mh
+        return 60.0 if _mh.is_market_open() else 900.0
+    except Exception:
+        return 120.0
+
+
+def _px_worker():
+    import stock_browser as _sb
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        try:
+            q = _sb._nasdaq_quote(t)
+            if q.get("price"):
+                _LASTPX[t] = (time.time(), {"price": float(q["price"]),
+                                            "change": float(q.get("change", 0) or 0),
+                                            "change_pct": float(q.get("change_pct", 0) or 0)})
+        except Exception:
+            pass
+    while True:
+        with _PX_LOCK:
+            batch = list(_PX_Q)[:24]
+            for t in batch:
+                _PX_Q.discard(t)
+        if not batch:
+            time.sleep(0.4)
+            continue
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(one, batch))
+
+
+def _px(tk: str):
+    """종목 시세 dict(price/change/change_pct). 피드 우선 → Nasdaq 폴백 캐시.
+    없으면 백그라운드 조회를 예약하고 (있다면 만료된 값이라도) 반환."""
+    tk = (tk or "").upper().strip()
+    if not tk:
+        return None
+    d = rtf.get_price(tk) or {}
+    if d.get("price"):
+        return d
+    hit = _LASTPX.get(tk)
+    if hit and time.time() - hit[0] < _px_ttl():
+        return hit[1]
+    if tk.startswith("^") or "=" in tk or "-USD" in tk:
+        return hit[1] if hit else None        # 지수·환율·코인은 피드 전용
+    with _PX_LOCK:
+        _PX_Q.add(tk)
+    if not _PX_ON["on"]:
+        _PX_ON["on"] = True
+        threading.Thread(target=_px_worker, daemon=True).start()
+    return hit[1] if hit else None
+
+
 def _price(tk: str):
-    d = rtf.get_price(tk)
+    d = _px(tk)
     return d.get("price") if d else None
 
 
 def _subscribe(tickers, interval=5.0):
+    """실시간 피드 구독 — Finnhub 키를 넘겨 레이트리밋 걸리는 yfinance 대신 Finnhub 사용."""
     try:
-        rtf.subscribe(list(dict.fromkeys(tickers)), interval=interval)
+        try:
+            from config import FINNHUB_API_KEY as _fk
+        except Exception:
+            _fk = ""
+        rtf.subscribe(list(dict.fromkeys(tickers)), api_key=_fk, interval=interval)
     except Exception:
         pass
 
@@ -801,6 +871,7 @@ class _PoCDaemon:
             pass
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
+        _set_auto_flag(True)      # 재시작 후 자동 재개용 의도 기록
         try:
             c = load_config()
             _tg_push(f"▶ 자동매매 시작\n전략 {c.get('strategy_name', c.get('strategy', '-'))} · "
@@ -817,6 +888,7 @@ class _PoCDaemon:
             _ctl_mod.cleanup_pid()
         except Exception:
             pass
+        _set_auto_flag(False)
         if was:
             _tg_push("■ 자동매매 정지")
 
@@ -849,6 +921,24 @@ class _PoCDaemon:
 
 
 DAEMON = _PoCDaemon()
+
+
+def _set_auto_flag(on: bool):
+    try:
+        c = load_config()
+        c["auto_running"] = bool(on)
+        _ctl_mod.save_config(c)
+    except Exception:
+        pass
+
+
+def _resume_auto():
+    """앱 재시작 전 사용자가 자동매매를 켜 두었다면 그대로 재개(의도 보존)."""
+    try:
+        if load_config().get("auto_running"):
+            DAEMON.start()
+    except Exception:
+        pass
 
 # 쓰기 후 현재 페이지를 다시 그리기 위한 훅(main_page에서 content.refresh 로 설정)
 _screen = {"refresh": lambda: None}
@@ -1305,7 +1395,7 @@ def render_mini(tk, store=None):
     """클릭 위치에 뜨는 미니 상세 팝업 내용 (시세·스파크라인·AI 판단·액션)."""
     store = store or {}
     q = store.get("quote") or {}
-    dd = rtf.get_price(tk) or {}
+    dd = _px(tk) or {}
     px = q.get("price") or dd.get("price", 0) or 0
     raw_pct = q.get("change_pct") if q.get("change_pct") is not None else dd.get("change_pct", 0)
     pct = (raw_pct or 0) * 100
@@ -1402,10 +1492,13 @@ def render_movers(state):
             chg = it.get("chg", 0)
             c = _col(chg)
             ini, lc = _logo(tk)
+            pxd = _px(tk) or {}
+            pxs = f'${_fmt(pxd["price"])}' if pxd.get("price") else '<span style="color:var(--t3)">…</span>'
             _row_with_popup(
                 f'<div class="mv-row"><span class="mv-rank">{i}</span>'
                 f'<span class="tlogo" style="background:{lc};width:22px;height:22px;flex:0 0 22px;font-size:.54rem">{ini}</span>'
                 f'<b style="font-weight:700">{tk}</b>'
+                f'<span class="tnum mono" style="font-size:.8rem;color:var(--t1)">{pxs}</span>'
                 f'<span class="tnum mono" style="color:{c};font-size:.82rem">{"+" if chg>=0 else ""}{chg:.2f}%</span></div>',
                 tk)
 
@@ -1491,7 +1584,8 @@ def render_my_account(d, state):
                     f'<div class="hl-row">'
                     f'<span class="tlogo" style="background:{lc};width:24px;height:24px;flex:0 0 24px;font-size:.56rem">{ini}</span>'
                     f'<div class="hl-nm"><b>{r["tk"]}</b><small>{r["sh"]:g}주 · {SECTOR_KO.get(r["sector"],"")}</small></div>'
-                    f'<div class="tnum mono" style="color:{c2};font-size:.78rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div>',
+                    f'<div style="text-align:right"><div class="tnum mono" style="font-size:.82rem;color:var(--t1)">${_fmt(r["cur"])}</div>'
+                    f'<div class="tnum mono" style="color:{c2};font-size:.7rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div></div>',
                     r["tk"])
 
 
@@ -2298,10 +2392,9 @@ def render_search_results(query, container):
         if not res:
             ui.html('<div class="empty">검색 결과가 없습니다.</div>')
             return
-        _subscribe([r["ticker"] for r in res[:30]], interval=6.0)
         for r in res:
             tk = r["ticker"]
-            dpx = rtf.get_price(tk) or {}
+            dpx = _px(tk) or {}
             px = dpx.get("price", 0)
             pct = (dpx.get("change_pct", 0) or 0) * 100
             c = _col(pct) if px else "var(--t3)"
@@ -2318,8 +2411,21 @@ def page_stocks():
     ui.html('<div class="sec-h">주식 열람 <small style="font-size:.7rem;color:var(--t3)">· 미국장 전 종목</small></div>')
 
     # ── 전 종목 검색 ──
+    _srch = {"t": None, "n": 0}
+
     def _do_search():
         render_search_results(search_in.value, results)
+        _srch["n"] = 0
+        if _srch["t"] is None:
+            def _tick():
+                _srch["n"] += 1
+                q = (search_in.value or "").strip()
+                if q:
+                    render_search_results(q, results)
+                if _srch["n"] >= 8 and _srch["t"]:
+                    _srch["t"].active = False
+                    _srch["t"] = None
+            _srch["t"] = ui.timer(2.0, _tick)
 
     with ui.row().classes("items-center gap-2").style("margin-bottom:8px"):
         search_in = ui.input("전 종목 검색 (티커·회사명)").props(
@@ -2343,8 +2449,11 @@ def page_stocks():
     ui.html('<div class="sh2" style="margin-top:4px">섹터별 둘러보기 '
             '<small>· 섹터당 최대 50종목 · 행 클릭 시 상세</small></div>')
 
+    _sec_tick = {"n": 0}
+
     def _set_sector(s):
         sstate["sector"] = s
+        _sec_tick["n"] = 0
         chips.refresh()
         sec_table.refresh()
 
@@ -2362,7 +2471,6 @@ def page_stocks():
             stocks = _sb.stocks_by_sector(sstate["sector"], 50)
         except Exception:
             stocks = []
-        _subscribe([s["ticker"] for s in stocks], interval=6.0)
         ui.html(f'<div style="font-size:.72rem;color:var(--t3);margin-bottom:6px">'
                 f'{sstate["sector"]} · {len(stocks)}종목</div>')
         with ui.element("div").classes("tbl"):
@@ -2373,7 +2481,7 @@ def page_stocks():
                 return
             for s in stocks:
                 tk = s["ticker"]; nm = (s.get("name") or "")[:26]
-                dpx = rtf.get_price(tk) or {}
+                dpx = _px(tk) or {}
                 px = dpx.get("price", 0)
                 pct = (dpx.get("change_pct", 0) or 0) * 100
                 c = _col(pct) if px else "var(--t3)"
@@ -2390,6 +2498,13 @@ def page_stocks():
     with ui.row().style("margin-bottom:8px"):
         ui.button("↻ 시세 새로고침", on_click=lambda: sec_table.refresh()).classes("tbtn")
     sec_table()
+
+    def _sec_auto():
+        # 가격 폴백 캐시가 채워지는 동안(최대 ~45초) 자동 갱신
+        _sec_tick["n"] += 1
+        if _sec_tick["n"] <= 15:
+            sec_table.refresh()
+    ui.timer(3.0, _sec_auto)
 
 
 def page_settings():
@@ -2717,6 +2832,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     try:
         from nicegui import app as _ngapp
         _ngapp.on_startup(ensure_telegram_running)
+        _ngapp.on_startup(_resume_auto)
     except Exception:
         pass
     ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
