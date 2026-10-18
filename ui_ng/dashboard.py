@@ -664,6 +664,59 @@ AI_STYLE = """
 ui.add_head_html(AI_STYLE, shared=True)
 
 
+# 라이브 시세 스트리밍 — 목록을 다시 그리지 않고 가격 숫자만 제자리 갱신(팝업 유지)
+LIVE_HEAD = """
+<style>
+.lv{ border-radius:4px; padding:0 2px; }
+.tk-up{ animation: tkup .9s ease; } .tk-dn{ animation: tkdn .9s ease; }
+@keyframes tkup{ 0%{ background:rgba(240,69,79,.38);} 100%{ background:transparent;} }
+@keyframes tkdn{ 0%{ background:rgba(49,130,246,.38);} 100%{ background:transparent;} }
+</style>
+<script>
+window.__lvPrev = window.__lvPrev || {};
+window.__lv = function(d){
+  const fmt = v => v.toLocaleString('en-US',{minimumFractionDigits:2, maximumFractionDigits:2});
+  const col = v => v>0 ? 'var(--up)' : (v<0 ? 'var(--dn)' : 'var(--t2)');
+  document.querySelectorAll('.lv').forEach(el => {
+    const q = d[el.dataset.t]; if (!q) return;
+    const k = el.dataset.k;
+    if (k === 'px') {
+      const txt = '$' + fmt(q.p);
+      if (el.textContent !== txt) {
+        const prev = window.__lvPrev[el.dataset.t];
+        el.textContent = txt;
+        if (prev !== undefined && q.p !== prev) {
+          el.classList.remove('tk-up','tk-dn'); void el.offsetWidth;
+          el.classList.add(q.p > prev ? 'tk-up' : 'tk-dn');
+        }
+      }
+    } else if (k === 'cp') {
+      el.textContent = (q.cp >= 0 ? '+' : '') + q.cp.toFixed(2) + '%';
+      el.style.color = col(q.cp);
+    } else if (k === 'pnl') {
+      const ep = parseFloat(el.dataset.ep);
+      if (ep > 0) { const v = (q.p - ep) / ep * 100;
+        el.textContent = (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; el.style.color = col(v); }
+    }
+  });
+  for (const t in d) window.__lvPrev[t] = d[t].p;
+};
+</script>
+"""
+ui.add_head_html(LIVE_HEAD, shared=True)
+
+
+def _lv(kind, tk, text, color=None, ep=None):
+    """라이브 갱신 대상 span. kind: px(현재가) | cp(일간 등락%) | pnl(평단 대비 손익%)."""
+    try:
+        _hooks.get("live_add", lambda t: None)(tk)
+    except Exception:
+        pass
+    st = ' style="color:%s"' % color if color else ""
+    epa = ' data-ep="%s"' % ep if ep else ""
+    return '<span class="lv" data-k="%s" data-t="%s"%s%s>%s</span>' % (kind, tk, epa, st, text)
+
+
 # ── 유틸 ─────────────────────────────────────────────────────────────────────
 def _col(v: float) -> str:
     return "var(--up)" if v > 0 else ("var(--dn)" if v < 0 else "var(--t2)")
@@ -1507,8 +1560,8 @@ def render_movers(state):
                 f'<div class="mv-row"><span class="mv-rank">{i}</span>'
                 f'<span class="tlogo" style="background:{lc};width:22px;height:22px;flex:0 0 22px;font-size:.54rem">{ini}</span>'
                 f'<b style="font-weight:700">{tk}</b>'
-                f'<span class="tnum mono" style="font-size:.8rem;color:var(--t1)">{pxs}</span>'
-                f'<span class="tnum mono" style="color:{c};font-size:.82rem">{"+" if chg>=0 else ""}{chg:.2f}%</span></div>',
+                f'<span class="tnum mono" style="font-size:.8rem;color:var(--t1)">{_lv("px", tk, pxs)}</span>'
+                f'<span class="tnum mono" style="font-size:.82rem">{_lv("cp", tk, "%+.2f%%" % chg, c)}</span></div>',
                 tk)
 
 
@@ -1590,12 +1643,14 @@ def render_my_account(d, state):
             for r in d["rows"]:
                 c2 = _col(r["pnl"])
                 ini, lc = _logo(r["tk"])
+                _pxh = _lv("px", r["tk"], "$" + _fmt(r["cur"]))
+                _pnh = _lv("pnl", r["tk"], "%+.2f%%" % r["pnl_pct"], c2, ep=r["ep"])
                 _row_with_popup(
                     f'<div class="hl-row">'
                     f'<span class="tlogo" style="background:{lc};width:24px;height:24px;flex:0 0 24px;font-size:.56rem">{ini}</span>'
                     f'<div class="hl-nm"><b>{r["tk"]}</b><small>{r["sh"]:g}주 · {SECTOR_KO.get(r["sector"],"")}</small></div>'
-                    f'<div style="text-align:right"><div class="tnum mono" style="font-size:.82rem;color:var(--t1)">${_fmt(r["cur"])}</div>'
-                    f'<div class="tnum mono" style="color:{c2};font-size:.7rem">{"+" if r["pnl_pct"]>=0 else ""}{r["pnl_pct"]:.2f}%</div></div></div>',
+                    f'<div style="text-align:right"><div class="tnum mono" style="font-size:.82rem;color:var(--t1)">{_pxh}</div>'
+                    f'<div class="tnum mono" style="font-size:.7rem">{_pnh}</div></div></div>',
                     r["tk"])
 
 
@@ -2957,6 +3012,8 @@ PAGE_FUNCS = {
 @ui.page("/")
 def main_page():
     state = {"sel": None, "mv": "gainers"}
+    live_set: set = set()
+    _hooks["live_add"] = live_set.add
     try:
         _subscribe([s for s, _ in INDEX_CARDS] + [r["tk"] for r in collect()["rows"]])
     except Exception:
@@ -2980,7 +3037,14 @@ def main_page():
             now = datetime.now().strftime("%H:%M:%S")
             badge = ('<span class="badge">모의투자</span>' if paper else
                      '<span class="badge" style="background:rgba(240,69,79,.16);color:#FF8A91">🔴 실거래</span>')
-            ui.html(f'<div class="hmeta">{badge}'
+            try:
+                _fh = rtf.feed_health()
+                _wsl = bool(_fh.get("ws")) and (_fh.get("ws_stale_sec") or 9e9) < 15
+            except Exception:
+                _wsl = False
+            live = ('<span style="color:var(--green);font-weight:800">● LIVE</span>' if _wsl else
+                    '<span style="color:var(--t3)" title="실시간 체결 없음(장외) — 시세 폴링">● 시세</span>')
+            ui.html(f'<div class="hmeta">{badge}{live}'
                     f'<span><span class="dot" style="background:{dcol}"></span>자동매매 {"실행 중" if alive else "정지"}</span>'
                     f'<span class="mono">{now}</span></div>')
         meta_box()
@@ -3086,6 +3150,8 @@ def main_page():
 
     def tick_med():
         auto_box.refresh()
+
+    def tick_acct():
         acct_box.refresh()
 
     def tick_slow():
@@ -3093,9 +3159,24 @@ def main_page():
         movers_box.refresh()
         heat_box.refresh()
 
+    # 1초 시세 스트림: 화면의 라이브 가격만 제자리 갱신(목록 재구성·팝업 닫힘 없음)
+    def tick_live():
+        if not live_set:
+            return
+        data = {}
+        for t in list(live_set):
+            d = _px(t)
+            if d and d.get("price"):
+                data[t] = {"p": round(float(d["price"]), 2),
+                           "cp": round(float(d.get("change_pct", 0) or 0) * 100, 2)}
+        if data:
+            ui.run_javascript("window.__lv && window.__lv(%s)" % json.dumps(data))
+
+    ui.timer(1.0, tick_live)
     ui.timer(2.0, tick_fast)
-    ui.timer(5.0, tick_med)
-    ui.timer(12.0, tick_slow)
+    ui.timer(10.0, tick_med)
+    ui.timer(20.0, tick_acct)        # 보유 구성 변화(체결) 반영 — 가격은 1초 스트림
+    ui.timer(30.0, tick_slow)
     ui.timer(4.0, tick_slow, once=True)   # 시장 데이터 초기 조기 표시
 
 

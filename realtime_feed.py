@@ -326,9 +326,37 @@ def _fetch_yf(ticker: str) -> dict | None:
         return None
 
 
+def _fetch_nasdaq(ticker: str) -> dict | None:
+    """Nasdaq 공개 시세(레이트리밋 없음) — REST 폴링 1순위.
+    Finnhub 무료 한도(분당 60)는 WebSocket 체결 스트림과 AI 분석에 남겨둔다."""
+    if ticker.startswith("^") or "=" in ticker or "-USD" in ticker or ":" in ticker:
+        return None
+    try:
+        import stock_browser as _sb
+        q = _sb._nasdaq_quote(ticker)
+        p = float(q.get("price") or 0)
+        if p <= 0:
+            return None
+        ch = float(q.get("change") or 0)
+        old = _cache.get(ticker, {})
+        return {
+            "price":      p,
+            "prev":       p - ch,
+            "open":       old.get("open", p),
+            "high":       max(p, old.get("high", p) or p),
+            "low":        min(p, old.get("low", p) or p),
+            "change":     ch,
+            "change_pct": float(q.get("change_pct") or 0),
+            "source":     "nasdaq",
+            "ts":         time.time(),
+        }
+    except Exception:
+        return None
+
+
 def _poll_one(ticker: str) -> bool:
     """단일 종목 갱신. 성공 True."""
-    data = _fetch_finnhub(ticker) or _fetch_yf(ticker)
+    data = _fetch_nasdaq(ticker) or _fetch_finnhub(ticker) or _fetch_yf(ticker)
     if data:
         old = _cache.get(ticker, {})
         # 가격 변동 이력 기록
@@ -409,17 +437,12 @@ def _run_loop():
             continue
 
         global _consecutive_fails, _last_success_ts
-        if _api_key:
-            # Finnhub: 분당 60건 → 종목당 ~1초 간격, 단 상위 우선순위부터
-            if len(tickers) <= 50:
-                got = 0
-                for tk in tickers:
-                    if _poll_one(tk): got += 1
-                    time.sleep(min(1.0, 60.0 / max(len(tickers), 1)))
-            else:
-                got = _batch_yf(tickers)
-        else:
-            got = _batch_yf(tickers)      # 단일 배치 호출
+        # 종목별 갱신: Nasdaq(1순위, 한도 없음) → Finnhub → yfinance. 3병렬.
+        # (예전: Finnhub REST 를 종목당 ~1초 간격으로 돌려 무료 한도를 혼자 소진,
+        #  50종목 초과 시 429 잦은 yfinance 배치로 강등)
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=3) as _ex:
+            got = sum(1 for ok in _ex.map(_poll_one, tickers) if ok)
 
         # 건강 상태 갱신
         if got > 0:
