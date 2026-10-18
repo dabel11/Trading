@@ -78,6 +78,9 @@ def feed_health() -> dict:
         "ws":           _ws_connected,
         "ws_symbols":   len(_ws_symbols),
         "ws_stale_sec": (time.time() - _ws_last_msg) if _ws_last_msg else None,
+        "alp_ws":       _alp["authenticated"],
+        "alp_symbols":  len(_alp["symbols"]),
+        "alp_stale_sec": (time.time() - _alp["last_msg"]) if _alp["last_msg"] else None,
     }
 
 
@@ -96,6 +99,7 @@ def subscribe(tickers: list[str], api_key: str = "", interval: float = 5.0,
     _ensure_running()
     _ensure_ws()
     _ws_sync_symbols()
+    _ensure_alpaca()
 
 
 def set_focus(tickers: list[str]):
@@ -250,6 +254,162 @@ def _ws_loop():
         backoff = min(backoff * 2, 60.0)   # 재연결 성공하면 아래에서 리셋
         if _ws_last_msg and time.time() - _ws_last_msg < 120:
             backoff = 2.0
+
+
+# ── Alpaca IEX WebSocket (무료 30종목) — Finnhub 50종목 다음 우선순위를 실시간으로 ──
+_ALP_MAX = 30
+_alp = {"thread": None, "ws": None, "connected": False, "authenticated": False,
+        "symbols": set(), "last_msg": 0.0, "error": "", "auth_fail_ts": 0.0}
+
+
+def alpaca_stream_state() -> dict:
+    return {"connected": _alp["connected"], "authenticated": _alp["authenticated"],
+            "symbols": len(_alp["symbols"]), "error": _alp["error"],
+            "stale_sec": (time.time() - _alp["last_msg"]) if _alp["last_msg"] else None}
+
+
+def _alp_ready() -> bool:
+    try:
+        import config as _c
+        return _c.alpaca_ready()
+    except Exception:
+        return False
+
+
+def _alp_pick_symbols() -> list:
+    """Finnhub ws 가 맡은 상위 50 다음 30종목(Finnhub 미연결이면 상위 30)."""
+    with _lock:
+        ranked = sorted(_subscribed, key=lambda t: -_subscribed[t])
+    us = [t for t in ranked if not (t.endswith((".KS", ".KQ")) or t.startswith("^")
+                                    or "=" in t or "-USD" in t or ":" in t)]
+    taken = set(_ws_symbols) if _ws_connected else set()
+    return [t for t in us if t not in taken][:_ALP_MAX]
+
+
+def _alp_apply_trade(tk: str, p: float):
+    now = time.time()
+    old = _cache.get(tk, {})
+    prev = old.get("prev") or 0.0
+    if old.get("price") and abs(float(p) - old["price"]) > 0.001:
+        _change_log.append({"ticker": tk, "from": old["price"], "to": float(p), "ts": now})
+    d = dict(old)
+    d.update({"price": float(p),
+              "change": float(p) - prev if prev else old.get("change", 0.0),
+              "change_pct": ((float(p) - prev) / prev) if prev else old.get("change_pct", 0.0),
+              "source": "alpaca-ws", "ts": now})
+    _cache[tk] = d
+    for cb in _tick_callbacks:
+        try:
+            cb(tk, float(p), now)
+        except Exception:
+            pass
+
+
+def _alp_sync():
+    ws = _alp["ws"]
+    if not (ws and _alp["authenticated"]):
+        return
+    want = set(_alp_pick_symbols())
+    add, rem = want - _alp["symbols"], _alp["symbols"] - want
+    try:
+        if rem:
+            ws.send(json.dumps({"action": "unsubscribe", "trades": sorted(rem)}))
+        if add:
+            ws.send(json.dumps({"action": "subscribe", "trades": sorted(add)}))
+        _alp["symbols"] = want
+    except Exception:
+        pass
+
+
+def _alp_loop():
+    import websocket
+    backoff = 3
+    while True:
+        if not _alp_ready():
+            time.sleep(10)
+            continue
+        # 인증 실패 후엔 5분 쉬었다 재시도(설정에서 키를 바꿨을 수 있음)
+        if _alp["auth_fail_ts"] and time.time() - _alp["auth_fail_ts"] < 300:
+            time.sleep(10)
+            continue
+        try:
+            import config as _c
+
+            def on_message(ws, message):
+                try:
+                    for m in json.loads(message):
+                        t = m.get("T")
+                        if t == "t":
+                            _alp["last_msg"] = time.time()
+                            _alp_apply_trade(str(m.get("S", "")).upper(), m.get("p"))
+                        elif t == "success" and m.get("msg") == "authenticated":
+                            _alp["authenticated"], _alp["error"] = True, ""
+                            _alp["symbols"] = set()
+                            _alp_sync()
+                        elif t == "error":
+                            _alp["error"] = f'{m.get("code", "")} {m.get("msg", "")}'.strip()
+                            if m.get("code") in (401, 402, 404, 406, 409):
+                                _alp["auth_fail_ts"] = time.time()
+                                ws.close()
+                except Exception:
+                    pass
+
+            def on_open(ws):
+                _alp["connected"] = True
+                ws.send(json.dumps({"action": "auth", "key": _c.ALPACA_API_KEY,
+                                    "secret": _c.ALPACA_SECRET_KEY}))
+
+            def on_close(ws, *a):
+                _alp["connected"] = _alp["authenticated"] = False
+
+            app = websocket.WebSocketApp(
+                "wss://stream.data.alpaca.markets/v2/iex",
+                on_open=on_open, on_message=on_message, on_close=on_close,
+                on_error=lambda ws, e: _alp.update(error=str(e)[:120]))
+            _alp["ws"] = app
+            app.run_forever(ping_interval=20, ping_timeout=10)
+            backoff = 3
+        except Exception as e:
+            _alp["error"] = str(e)[:120]
+        _alp["connected"] = _alp["authenticated"] = False
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
+def _ensure_alpaca():
+    if not _alp_ready():
+        return
+    try:
+        import websocket  # noqa: F401
+    except Exception:
+        return
+    t = _alp["thread"]
+    if t is None or not t.is_alive():
+        _alp["thread"] = threading.Thread(target=_alp_loop, daemon=True, name="rt-feed-alpaca")
+        _alp["thread"].start()
+    else:
+        _alp_sync()
+
+
+def _alp_batch(tickers: list) -> set:
+    """Alpaca 일괄 시세(snapshots)로 한 번에 갱신 — 갱신된 종목 집합 반환."""
+    if not _alp_ready():
+        return set()
+    try:
+        import alpaca_api as _aa
+        snaps = _aa.snapshots(tickers)
+    except Exception:
+        return set()
+    done = set()
+    for tk, d in snaps.items():
+        old = _cache.get(tk, {})
+        # 실시간 ws 가 방금 준 가격은 덮지 않음
+        if old.get("source", "").endswith("-ws") and time.time() - old.get("ts", 0) < 10:
+            done.add(tk)
+            continue
+        _cache[tk] = {**d, "source": "alpaca", "ts": time.time()}
+        done.add(tk)
+    return done
 
 
 def _ensure_ws():
@@ -441,8 +601,11 @@ def _run_loop():
         # (예전: Finnhub REST 를 종목당 ~1초 간격으로 돌려 무료 한도를 혼자 소진,
         #  50종목 초과 시 429 잦은 yfinance 배치로 강등)
         from concurrent.futures import ThreadPoolExecutor as _TPE
+        done = _alp_batch(tickers)          # Alpaca 키가 있으면 1회 호출로 일괄 갱신
+        rest = [t for t in tickers if t not in done]
         with _TPE(max_workers=3) as _ex:
-            got = sum(1 for ok in _ex.map(_poll_one, tickers) if ok)
+            got = len(done) + sum(1 for ok in _ex.map(_poll_one, rest) if ok)
+        _alp_sync()
 
         # 건강 상태 갱신
         if got > 0:

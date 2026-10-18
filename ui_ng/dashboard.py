@@ -2666,6 +2666,82 @@ def page_settings():
             else:
                 ui.button("🟢 모의투자로 전환", on_click=lambda: _switch_mode(True)).classes("tbtn tbtn-primary")
 
+    # ── Alpaca (실시간 시세 스트림·과거 데이터·실거래 주문) ──
+    import config as _cfgm
+    with ui.element("div").classes("card").style("margin-bottom:12px"):
+        ui.html('<div class="sh2">Alpaca <small>· 실시간 시세 스트림·일괄 시세·실거래 주문</small></div>')
+
+        @ui.refreshable
+        def alp_status():
+            if not _cfgm.alpaca_ready():
+                ui.html('<div class="dai" style="border-color:rgba(255,159,10,.45);background:rgba(255,159,10,.08)">'
+                        '<div class="dai-ttl" style="color:#FFB340">⏳ 키 미설정</div>'
+                        '<div class="dai-rat">아래에 API Key ID·Secret 을 붙여넣고 <b>저장 + 연결 테스트</b>를 누르세요.</div></div>')
+                return
+            kind = _cfgm.alpaca_key_kind()
+            try:
+                import realtime_feed as _rf
+                st = _rf.alpaca_stream_state()
+            except Exception:
+                st = {}
+            stream = (f'실시간 스트림 연결 · {st.get("symbols", 0)}종목' if st.get("authenticated")
+                      else (f'스트림 오류: {st.get("error")}' if st.get("error") else "스트림 연결 대기"))
+            kind_s = {"paper": "페이퍼(모의) 계좌", "live": "실계좌"}.get(kind, "키 형식 미확인")
+            ui.html(f'<div class="dai" style="border-color:rgba(48,209,88,.4);background:rgba(48,209,88,.08)">'
+                    f'<div class="dai-ttl" style="color:#4ADE80">✅ 키 설정됨 · {kind_s}</div>'
+                    f'<div class="dai-rat">{stream}</div></div>')
+        alp_status()
+
+        alp_k = ui.input("API Key ID").props("outlined dense dark").classes("w-full")
+        alp_s = ui.input("Secret Key", password=True, password_toggle_button=True).props(
+            "outlined dense dark").classes("w-full")
+        alp_res = ui.html("")
+
+        def _alp_render(res):
+            a, d, sv = res.get("account", {}), res.get("data", {}), res.get("stream", {})
+            rows = [
+                ("계좌", (f'✅ {"페이퍼" if a.get("paper") else "실계좌"} · {a.get("account", "")} · {a.get("status", "")} · '
+                         f'자산 ${a.get("equity", 0):,.2f} · 매수가능 ${a.get("buying_power", 0):,.0f}')
+                 if a.get("ok") else f'❌ {a.get("error", "")}'),
+                ("시세", (f'✅ IEX {d.get("sample")} · {d.get("ms", 0)}ms') if d.get("ok") else f'❌ {d.get("error", "")}'),
+                ("스트림", (f'✅ 인증 성공{(" · " + sv["note"]) if sv.get("note") else ""}')
+                 if sv.get("ok") else f'❌ {sv.get("error", "")}'),
+            ]
+            alp_res.content = ('<div class="card" style="margin-top:8px">' + "".join(
+                f'<div class="kv"><span class="k">{k}</span><span class="v" style="font-size:.74rem">{v}</span></div>'
+                for k, v in rows) + '</div>')
+
+        async def _alp_test():
+            alp_res.content = '<div class="empty">연결 테스트 중… (계좌·시세·스트림)</div>'
+            import alpaca_api as _aa
+            _alp_render(await run.io_bound(_aa.check))
+            alp_status.refresh()
+
+        async def _alp_save():
+            kid, sec = (alp_k.value or "").strip(), (alp_s.value or "").strip()
+            if len(kid) < 16 or len(sec) < 20:
+                ui.notify("API Key ID 와 Secret 을 모두 입력하세요.", type="warning", position="top")
+                return
+            base = _cfgm.save_alpaca_keys(kid, sec)
+            alp_k.value = ""
+            alp_s.value = ""
+            ui.notify(f'저장됨 — {"페이퍼" if "paper" in base else "실계좌"} 계좌로 연결을 확인합니다.', position="top")
+            try:
+                import realtime_feed as _rf
+                _rf._alp["auth_fail_ts"] = 0.0
+                _rf._ensure_alpaca()
+            except Exception:
+                pass
+            await _alp_test()
+
+        with ui.row().style("margin-top:8px;gap:8px"):
+            ui.button("저장 + 연결 테스트", on_click=_alp_save).classes("tbtn tbtn-primary")
+            ui.button("연결 테스트", on_click=_alp_test).classes("tbtn")
+        ui.html('<div style="font-size:.66rem;color:var(--t3);margin-top:8px;line-height:1.6">'
+                '· 키는 이 PC의 .env 에만 저장됩니다(개발 폴더·앱 번들 모두) — 다른 곳으로 보내지 않습니다<br>'
+                '· PK… = 페이퍼(모의) 계좌, AK… = 실계좌 · 무료 플랜 실시간 스트림은 30종목(IEX)<br>'
+                '· Finnhub 스트림(50종목)과 합쳐 우선순위 상위 최대 80종목을 실시간으로 받습니다</div>')
+
     # ── 텔레그램 봇 ──
     import notifier as _ntf
     import telegram_bot as _tgb
