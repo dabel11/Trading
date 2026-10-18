@@ -79,3 +79,5 @@ ev_decisions.json
 backups/
 equity_history.json
 monitor_state.json
+.monitor.lock
+ui_ng/_server.log.1
