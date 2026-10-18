@@ -1,7 +1,8 @@
 """자동매매 사이클 1회 — 유일한 자동매매 결정·실행 흐름.
 
 데몬(autotrader.py)과 앱의 '지금 1회 실행'이 같은 함수를 부른다.
-순서: 파라미터 주입 → 발굴 → 채점 → 주문 결정 → 일일손실/약세장 방어
+순서: 파라미터 주입 → 발굴 → 채점 → EV 판단(매수/대기/보유/매도) → 주문 결정
+      → 일일손실/약세장 방어
       → core.execution.execute_orders → 텔레그램 상태 스냅샷.
 """
 from datetime import datetime
@@ -16,6 +17,14 @@ def _ai_snapshot() -> Optional[dict]:
     try:
         from influence import engine as _eng
         return _eng.snapshot(top=12)
+    except Exception:
+        return None
+
+
+def _ev_summary(decisions: list) -> Optional[dict]:
+    try:
+        from core import ev as _ev
+        return _ev.summary(decisions, top=10)
     except Exception:
         return None
 
@@ -143,7 +152,21 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             L(f"실시간 가격 갱신 {_fresh}/{len(prices)}종목")
     except Exception:
         pass
-    scores = [StockScore(r["ticker"], r["score"], 0, 0, 0, 0) for r in scores_raw]
+    # EV(기대값) 판단 — 매수 후보·보유 종목별 '매수/대기/보유/매도'.
+    # 주문 로직이 읽는 점수만 조정(대기 → 매수 문턱 아래, 매도 → 매도 문턱 아래)해
+    # 기존 청산·하드캡·이중매도 방지를 그대로 거친다. 표시용 scores_raw 는 원점수 유지.
+    ev_decisions: list = []
+    gated = {r["ticker"]: r["score"] for r in scores_raw}
+    if cfg.get("ev_enabled", True):
+        try:
+            from core import ev as _ev
+            ev_decisions = _ev.decide_live(cfg, scores_raw, prices, pm.positions, log=L)
+            gated = _ev.gate_scores(gated, ev_decisions, _ev.EVParams.from_cfg(cfg))
+        except Exception as e:
+            L(f"EV 판단 건너뜀(점수만으로 진행): {e}")
+    ev_map = {d.ticker: d for d in ev_decisions}
+    scores = [StockScore(r["ticker"], gated.get(r["ticker"], r["score"]), 0, 0, 0, 0)
+              for r in scores_raw]
 
     avail = _pa.cash() if paper else None
     orders = pm.generate_orders(
@@ -153,6 +176,12 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
         buy_pct=float(cfg.get("buy_pct", 100)) / 100.0,
         sell_pct=float(cfg.get("sell_pct", 100)) / 100.0,
         available_override=avail)
+
+    # EV 매도는 점수 조정으로 기존 청산 경로를 탔으므로 장부·알림의 사유를 EV 로 바로잡는다
+    for o in orders.get("sell", []):
+        d = ev_map.get(o.get("ticker"))
+        if d is not None and d.action == "SELL" and str(o.get("reason", "")).startswith("score_drop"):
+            o["reason"] = f"ev_exit (보유 EV {d.ev:+.1%})"
 
     # 일일 손실 kill switch
     try:
@@ -205,7 +234,9 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             eng = "🧠 AI 인플루언서" if sn == "ai_influencer" else cfg.get("strategy_name", sn)
             lines = [f"🤖 자동매매 체결 · {mode}", f"{eng} · 국면 {regime}"]
             for b in bought:
-                lines.append(f"🔴 매수 {b['ticker']} {b['shares']}주 @ ${b['price']:.2f}")
+                d = ev_map.get(b["ticker"])
+                evs = f" · EV {d.ev:+.1%} 승률 {d.p_win:.0%}" if d and d.sigma else ""
+                lines.append(f"🔴 매수 {b['ticker']} {b['shares']}주 @ ${b['price']:.2f}{evs}")
             for s in sold:
                 lines.append(f"🔵 매도 {s['ticker']} {s['shares']}주 @ ${s['price']:.2f} "
                              f"({s.get('pnl_pct', 0):+.1%})")
@@ -243,6 +274,7 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             "top_scores": scores_raw[:10],
             "engine": "ai_influencer" if sn == "ai_influencer" else "strategy",
             "ai": (_ai_snapshot() if sn == "ai_influencer" else None),
+            "ev": (_ev_summary(ev_decisions) if ev_decisions else None),
         })
     except Exception as e:
         L(f"상태기록 건너뜀: {e}")

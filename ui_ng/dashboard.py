@@ -1818,6 +1818,8 @@ def page_backtest():
             min_in = ui.number("매수문턱", value=60, format="%g").props("outlined dense dark").style("width:100px")
             sl_in = ui.number("손절%", value=7, format="%g").props("outlined dense dark").style("width:90px")
             tp_in = ui.number("익절%", value=15, format="%g").props("outlined dense dark").style("width:90px")
+            ev_sw = ui.switch("EV 판단 적용", value=bool(load_config().get("ev_enabled", True))) \
+                .props("dense").tooltip("라이브와 같은 기대값 판단으로 매수 대기·보유 매도 — 켜면 미적용과 비교")
             run_bt = ui.button("백테스트 실행").classes("tbtn tbtn-primary")
             cmp_bt = ui.button("🏆 최고 수익 전략 찾기").classes("tbtn tbtn-danger")
 
@@ -1880,7 +1882,21 @@ def page_backtest():
                 ("최종 자산", f'${r.equity_curve.iloc[-1]:,.0f}', _col(tr)),
                 ("평균 보유", f'{r.avg_hold_days:.0f}일', None)]
         ui.html(f'<div style="font-size:.74rem;color:var(--t3);margin-bottom:8px">'
-                f'{m.get("name","")} · {m.get("start")}~{m.get("end")} · {m.get("uni_n",0)}종목 · 시작 ${m.get("cap",0):,.0f}</div>')
+                f'{m.get("name","")} · {m.get("start")}~{m.get("end")} · {m.get("uni_n",0)}종목 · 시작 ${m.get("cap",0):,.0f}'
+                f'{" · EV 판단 적용" if m.get("ev") else ""}</div>')
+        b = state.get("base")
+        if b is not None:                   # EV 적용 vs 미적용 비교
+            st = getattr(r, "ev_stats", {}) or {}
+            dr, dm, ds = tr - b.total_return, r.mdd - b.mdd, r.sharpe - b.sharpe
+            ui.html('<div class="card" style="margin-bottom:10px;padding:10px 12px">'
+                    '<div class="sh2" style="margin-bottom:4px">EV 판단 효과 <small>· 같은 데이터, EV 미적용 대비</small></div>'
+                    f'<div style="font-size:.78rem;line-height:1.7">'
+                    f'총수익률 <b style="color:{_col(dr)}">{dr*100:+.1f}%p</b> '
+                    f'<span style="color:var(--t3)">({b.total_return*100:+.1f}% → {tr*100:+.1f}%)</span> · '
+                    f'최대낙폭 <b style="color:{_col(dm)}">{dm*100:+.1f}%p</b> · '
+                    f'샤프 <b style="color:{_col(ds)}">{ds:+.2f}</b> · 거래 {len(b.trades)}→{len(r.trades)}건<br>'
+                    f'<span style="color:var(--t3)">판단 집계 — 매수 {st.get("BUY",0)} · 대기 {st.get("WAIT",0)} · '
+                    f'보유 {st.get("HOLD",0)} · 매도 {st.get("SELL",0)}</span></div></div>')
         ui.html('<div class="tgt-sum" style="grid-template-columns:repeat(4,1fr)">' + "".join(
             f'<div class="tgt-kpi"><div class="l">{k}</div>'
             f'<div class="v" style="{"color:"+c if c else ""};font-size:1.05rem">{v}</div></div>'
@@ -1931,7 +1947,7 @@ def page_backtest():
             # 프로세스에서 — 같은 프로세스의 자동매매 사이클이 오염되지 않게 한다.
             ranking = await run.io_bound(functools.partial(
                 _iso.call, "backtester:compare_strategies", cands, universe, start, end,
-                cap, ms, sl, tp))
+                cap, ms, sl, tp, ev_filter=bool(ev_sw.value)))
             for row in ranking or []:
                 row["name"] = opts.get(row["key"], row["key"])
             if not ranking:
@@ -1946,10 +1962,11 @@ def page_backtest():
         out.refresh()
 
     async def _run():
-        state.update(running=True, result=None, error=None, ranking=None)
+        state.update(running=True, result=None, error=None, ranking=None, base=None)
         out.refresh()
         try:
             universe = _resolve_universe()
+            use_ev = bool(ev_sw.value)
             fn = functools.partial(           # 별도 프로세스 — 위 _compare 주석 참고
                 _iso.call, "backtester:run", strategy=strat.value, start=start_in.value.strip(),
                 end=end_in.value.strip(), capital=float(cap_in.value or 10000),
@@ -1958,8 +1975,13 @@ def page_backtest():
                 take_profit=float(tp_in.value or 15) / 100.0)
             state["meta"] = {"name": opts.get(strat.value, strat.value),
                              "start": start_in.value.strip(), "end": end_in.value.strip(),
-                             "uni_n": len(universe), "cap": float(cap_in.value or 10000)}
-            res = await run.io_bound(fn)
+                             "uni_n": len(universe), "cap": float(cap_in.value or 10000),
+                             "ev": use_ev}
+            if use_ev:
+                state["base"] = await run.io_bound(fn)
+                res = await run.io_bound(functools.partial(fn, ev_filter=True))
+            else:
+                res = await run.io_bound(fn)
             state["result"] = res
         except Exception as e:
             state["error"] = str(e)[:200]
@@ -2720,6 +2742,9 @@ _PARAM_SPECS = [
     ("trail", "트레일링(%)", "pct"),
     ("daily_loss_limit", "일일 손실한도(%)", "pct"),
     ("daily_time", "예약 실행 시각(ET)", "text"),
+    ("ev_enabled", "EV(기대값) 판단 사용", "bool"),
+    ("ev_min", "EV 매수 기준(%)", "pct"),
+    ("ev_exit", "EV 매도 기준(%)", "pct"),
 ]
 
 
@@ -2733,6 +2758,8 @@ def _at_params():
                 val = cfg.get(key, _ctl_mod.DEFAULT_CONFIG.get(key))
                 if kind == "text":
                     inputs[key] = (ui.input(label, value=str(val or "")).props("outlined dense dark"), kind)
+                elif kind == "bool":
+                    inputs[key] = (ui.switch(label, value=bool(val)).props("dense"), kind)
                 else:
                     shown = round(float(val or 0) * 100, 1) if kind == "pct" else val
                     inputs[key] = (ui.number(label, value=shown, format="%g").props("outlined dense dark"), kind)
@@ -2756,6 +2783,8 @@ def _at_params():
                         newcfg[key] = float(v) / 100.0
                     elif kind == "int":
                         newcfg[key] = int(float(v))
+                    elif kind == "bool":
+                        newcfg[key] = bool(v)
                     else:
                         newcfg[key] = str(v or "").strip()
                 except Exception:
@@ -2785,6 +2814,8 @@ def _at_params():
     ui.html('<div style="font-size:.66rem;color:var(--t3);margin-top:8px;line-height:1.6">'
             '· 매수 문턱 이상 점수 종목을 매수, 매도 문턱 이하로 떨어지면 매도<br>'
             '· 손절은 항상 우선, 익절 도달 후엔 고점 대비 트레일링 폭만큼 되돌리면 청산<br>'
+            '· EV 판단: 매수 후보마다 손절·익절·트레일링 규칙대로 들고 있을 때의 기대수익(비용 차감)을 '
+            '시뮬레이션 — EV가 매수 기준 미만이면 <b>대기</b>, 보유 종목의 EV가 매도 기준 미만이면 <b>매도</b><br>'
             '· 실거래에선 실행 주기를 300초(5분) 이상으로 권장</div>')
 
 
@@ -2807,6 +2838,52 @@ def _start_scanner():
 
 def _goto(name):
     _hooks.get("goto_tab", lambda n: None)(name)
+
+
+_EV_KO = {"BUY": ("매수", "var(--up)"), "WAIT": ("대기", "var(--t3)"),
+          "HOLD": ("보유", "var(--t1)"), "SELL": ("매도", "var(--dn)")}
+
+
+def _ev_card_html(cfg: dict) -> str:
+    """최근 사이클의 EV(기대값) 판단표 — core.ev 가 ev_decisions.json 에 남긴 결과."""
+    head = ('<div class="card" style="margin-top:8px"><div class="sh2">EV 판단 '
+            '<small>· 손절·익절·트레일링 규칙대로 들고 있을 때의 기대수익(비용 차감)</small></div>')
+    if not cfg.get("ev_enabled", True):
+        return head + ('<div class="empty">EV 판단이 꺼져 있습니다 — 점수만으로 매수/매도합니다. '
+                       '파라미터 탭에서 켤 수 있습니다.</div></div>')
+    try:
+        from core import ev as _ev
+        data = _ev.load()
+    except Exception:
+        data = {}
+    rows = data.get("rows") or []
+    if not rows:
+        return head + '<div class="empty">아직 EV 판단 기록이 없습니다 — 다음 사이클 후 표시됩니다.</div></div>'
+    c = data.get("counts") or {}
+    ts = time.strftime("%m-%d %H:%M:%S", time.localtime(data.get("ts", 0)))
+    pr = data.get("params") or {}
+    summ = (f'<div style="font-size:.72rem;color:var(--t3);margin-bottom:6px">{ts} · '
+            f'매수 <b style="color:var(--up)">{c.get("BUY", 0)}</b> · 대기 <b>{c.get("WAIT", 0)}</b> · '
+            f'보유 <b>{c.get("HOLD", 0)}</b> · 매도 <b style="color:var(--dn)">{c.get("SELL", 0)}</b> · '
+            f'기준 매수 EV≥{pr.get("ev_min", 0)*100:+.1f}% / 매도 EV&lt;{pr.get("ev_exit", 0)*100:+.1f}%</div>')
+    cols = "grid-template-columns:64px 52px 46px 66px 50px 50px 1fr"
+    body = (f'<div class="tbl"><div class="tr h" style="display:grid;{cols}">'
+            '<div>종목</div><div>판단</div><div class="num">점수</div><div class="num">EV</div>'
+            '<div class="num">승률</div><div class="num">보유일</div><div>근거</div></div>')
+    for r in rows[:15]:
+        ko, colr = _EV_KO.get(r.get("action"), (r.get("action"), "var(--t2)"))
+        has = bool(r.get("sigma"))
+        evv = r.get("ev", 0.0)
+        body += (f'<div class="tr r" style="display:grid;{cols};font-size:.74rem">'
+                 f'<div class="tk">{r.get("ticker")}{"<small> 보유</small>" if r.get("held") else ""}</div>'
+                 f'<div style="color:{colr};font-weight:800">{ko}</div>'
+                 f'<div class="num mono">{r.get("score", 0):.0f}</div>'
+                 f'<div class="num mono" style="color:{_col(evv) if has else "var(--t3)"}">'
+                 f'{f"{evv*100:+.1f}%" if has else "—"}</div>'
+                 f'<div class="num mono">{f"{r.get("p_win", 0)*100:.0f}%" if has else "—"}</div>'
+                 f'<div class="num mono">{f"{r.get("exp_days", 0):.0f}" if has else "—"}</div>'
+                 f'<div style="color:var(--t3)">{r.get("reason", "")}</div></div>')
+    return head + summ + body + '</div></div>'
 
 
 def _at_run():
@@ -2837,6 +2914,7 @@ def _at_run():
         logs = DAEMON.last_log or ["아직 실행 기록이 없습니다."]
         ui.html('<div class="card" style="margin-top:4px"><div class="sh2">최근 사이클 로그</div>'
                 + "".join(f'<div class="auto-log">· {str(m)[:150]}</div>' for m in logs[-10:]) + '</div>')
+        ui.html(_ev_card_html(cfg))
     status()
 
     def _start():

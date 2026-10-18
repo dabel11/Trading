@@ -87,8 +87,35 @@ def cmd_status(s: dict) -> str:
         f"투자중 {_fmt_money(s.get('invested'))} · 평가손익 {arrow}{_fmt_money(abs(up))} "
         f"({s.get('upnl_pct',0):+.2%})\n"
         f"보유 {s.get('n_positions',0)}종목\n"
+        f"{_ev_line(s)}"
         f"\n마지막 사이클: {s.get('last_run','—')} ({_age_str(s.get('updated_ts',0))})"
     )
+
+
+_EV_KO = {"BUY": "매수", "WAIT": "대기", "HOLD": "보유", "SELL": "매도"}
+
+
+def _ev_line(s: dict) -> str:
+    c = ((s.get("ev") or {}).get("counts")) or {}
+    if not c:
+        return ""
+    return (f"🎯 EV 판단: 매수 {c.get('BUY',0)} · 대기 {c.get('WAIT',0)} · "
+            f"보유 {c.get('HOLD',0)} · 매도 {c.get('SELL',0)} (/ev)\n")
+
+
+def cmd_ev(s: dict) -> str:
+    """EV(기대값) 판단 — 마지막 사이클의 종목별 매수/대기/보유/매도와 근거."""
+    rows = ((s.get("ev") or {}).get("rows")) or []
+    if not rows:
+        return ("EV 판단 기록이 없습니다. 자동매매 사이클이 한 번 돌면 표시됩니다.\n"
+                "(앱 자동매매 → 파라미터에서 EV 판단을 켜고 끌 수 있습니다)")
+    lines = ["🎯 EV(기대값) 판단 · 손절·익절·트레일링 규칙 기준", _ev_line(s).strip()]
+    for r in rows[:10]:
+        act = _EV_KO.get(r.get("action"), r.get("action"))
+        ev = f"EV {r.get('ev',0):+.1%} 승률 {r.get('p_win',0):.0%}" if r.get("sigma") else "데이터 부족"
+        lines.append(f"· {r.get('ticker')}{'(보유)' if r.get('held') else ''} {act} — {ev}\n  {r.get('reason','')}")
+    lines.append(f"\n마지막 사이클: {s.get('last_run','—')}")
+    return "\n".join(lines)
 
 
 def cmd_balance(s: dict) -> str:
@@ -177,6 +204,7 @@ def cmd_help(_s: dict) -> str:
             "/ping — 정상 동작 확인\n"
             "/status — 전체 현황\n"
             "/ai — AI 인플루언서 판단 현황 (/ai AAPL = 종목 즉시 판단)\n"
+            "/ev — EV(기대값) 매수·대기·보유·매도 판단\n"
             "/balance — 잔액·손익\n"
             "/portfolio — 보유 종목\n"
             "/scores — 상위 점수 후보\n"
@@ -379,6 +407,8 @@ def handle(text: str, chat_id: str = "") -> str:
     if cmd in ("ai", "에이아이", "판단"):
         # 읽기 전용 — 제한 없음
         return cmd_ai(args, _status())
+    if cmd in ("ev", "기대값"):
+        return cmd_ev(_status())
     if cmd in _MODE_CMDS:
         if not _is_owner(chat_id):
             return "⛔ 모드 전환은 등록된 Chat ID에서만 가능합니다 (/id 로 등록)."

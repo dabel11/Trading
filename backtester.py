@@ -734,6 +734,9 @@ def run(
     risk_sizing: bool = False,     # (구) 변동성 타겟 사이징 — 현재는 라이브 엔진 사이징이 우선(무시)
     vol_target: float = 0.25,      # (구) risk_sizing 기준선 (현재 미사용)
     dynamic: bool = True,          # 라이브 기본값과 동일 — 유동형(_dynamic_orders) 배분
+    ev_filter: bool = False,       # 라이브와 같은 EV 판단(core.ev)으로 매수 대기·보유 매도
+    ev_min: float = 0.0,
+    ev_exit: float = -0.005,
 ) -> BacktestResult:
     """과거 데이터로 전략을 시뮬레이션한다.
 
@@ -828,6 +831,15 @@ def run(
         portfolio.BUY_PRICE_MIN       = 0.0
         portfolio.BUY_PRICE_MAX       = 0.0
 
+        ev_stats: dict = {}
+        if ev_filter:
+            from core import ev as _ev
+            _evp = _ev.EVParams(
+                sl=float(SL), tp=float(TP), trail=float(trailing_stop),
+                hold_strong=int(HOLD_S), hold_medium=int(HOLD_M),
+                cost_side=float(commission + slippage), ev_min=float(ev_min),
+                ev_exit=float(ev_exit), min_score=float(MIN_SC), sell_score=float(SELL_SC),
+                n_paths=1000)
         for idx, today in enumerate(date_index):
             # --- 일일 평가(mark-to-market) ---
             pv = cash
@@ -856,6 +868,18 @@ def run(
                     sc = 0.0
                 scores.append(StockScore(t, float(sc), 0, 0, 0, 0))
             scores.sort(key=lambda s: -s.total)
+
+            # EV 판단 — 라이브 run_cycle 과 같은 core.ev (당일까지의 종가만 사용, 미래 참조 없음)
+            if ev_filter:
+                _decs = _ev.decide(
+                    [(s.ticker, s.total) for s in scores], prices, pmbt.positions, _evp,
+                    lambda t: stock_data[t]["Close"].iloc[max(0, idx - 160):idx + 1].tolist(),
+                    today=today.date())
+                _g = _ev.gate_scores({s.ticker: s.total for s in scores}, _decs, _evp)
+                scores = [StockScore(s.ticker, _g[s.ticker], 0, 0, 0, 0) for s in scores]
+                scores.sort(key=lambda s: -s.total)
+                for _d in _decs:
+                    ev_stats[_d.action] = ev_stats.get(_d.action, 0) + 1
 
             regime = _live_regime(idx) if adaptive_regime else "neutral"
 
@@ -939,12 +963,14 @@ def run(
             continue
 
     equity_series = pd.Series(equity_curve, index=date_index)
-    return BacktestResult(trades=trades, equity_curve=equity_series, start_capital=capital)
+    res = BacktestResult(trades=trades, equity_curve=equity_series, start_capital=capital)
+    res.ev_stats = ev_stats          # EV 판단 집계(ev_filter=True 일 때)
+    return res
 
 
 def compare_strategies(keys: list[str], universe: list[str], start: str, end: str,
                        capital: float, min_score: float, stop_loss: float,
-                       take_profit: float) -> list[dict]:
+                       take_profit: float, ev_filter: bool = False) -> list[dict]:
     """여러 전략을 같은 데이터 번들로 백테스트해 총수익률 내림차순 지표 목록 반환.
 
     앱의 '최고 수익 전략 찾기'가 core.isolated 로 별도 프로세스에서 부른다
@@ -955,7 +981,7 @@ def compare_strategies(keys: list[str], universe: list[str], start: str, end: st
         try:
             r = run(strategy=k, start=start, end=end, capital=capital,
                     universe=universe, min_score=min_score, stop_loss=stop_loss,
-                    take_profit=take_profit, prefetched=bundle)
+                    take_profit=take_profit, prefetched=bundle, ev_filter=ev_filter)
             rows.append({"key": k, "ret": r.total_return, "cagr": r.cagr,
                          "mdd": r.mdd, "sharpe": r.sharpe, "win": r.win_rate,
                          "eq": float(r.equity_curve.iloc[-1])})
