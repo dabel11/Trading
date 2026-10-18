@@ -33,7 +33,14 @@ from typing import Callable, Optional
 
 import numpy as np
 
-EV_FILE = Path(__file__).resolve().parent.parent / "ev_decisions.json"
+EV_FILE: Optional[Path] = None   # None = 설정 파일과 같은 폴더(격리 모드면 격리 폴더)
+
+
+def _ev_file() -> Path:
+    if EV_FILE is not None:
+        return EV_FILE
+    from core import control
+    return control.CONFIG_FILE.parent / "ev_decisions.json"
 
 IR_MAX = 0.05          # 최강 신호(점수100·확신1)의 일간 정보비율 상한 (σ2% 기준 월 +2%)
 MOM_SHRINK = 0.15      # 과거 평균수익을 미래 드리프트로 쓸 때의 축소계수
@@ -276,13 +283,13 @@ def summary(decisions: list, top: int = 15) -> dict:
 def save(decisions: list, params: EVParams, path: Path | None = None):
     from safe_store import atomic_write_json
     data = {"ts": time.time(), "params": asdict(params), **summary(decisions, top=60)}
-    atomic_write_json(path or EV_FILE, data)
+    atomic_write_json(path or _ev_file(), data)
 
 
 def load(path: Path | None = None) -> dict:
     try:
         from safe_store import safe_read_json
-        return safe_read_json(path or EV_FILE, {}) or {}
+        return safe_read_json(path or _ev_file(), {}) or {}
     except Exception:
         return {}
 

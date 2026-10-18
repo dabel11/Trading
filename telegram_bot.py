@@ -95,8 +95,20 @@ def cmd_status(s: dict) -> str:
 _EV_KO = {"BUY": "매수", "WAIT": "대기", "HOLD": "보유", "SELL": "매도"}
 
 
+def _ev_data(s: dict) -> dict:
+    """EV 판단 — 상태 스냅샷에 있으면 그것, 없으면 사이클이 남긴 ev_decisions.json.
+    (앱이 12초마다 상태 파일을 새로 써서 사이클의 'ev' 키가 곧 사라지므로 파일이 원본)"""
+    if (s or {}).get("ev"):
+        return s["ev"]
+    try:
+        from core import ev as _ev
+        return _ev.load() or {}
+    except Exception:
+        return {}
+
+
 def _ev_line(s: dict) -> str:
-    c = ((s.get("ev") or {}).get("counts")) or {}
+    c = (_ev_data(s).get("counts")) or {}
     if not c:
         return ""
     return (f"🎯 EV 판단: 매수 {c.get('BUY',0)} · 대기 {c.get('WAIT',0)} · "
@@ -105,7 +117,8 @@ def _ev_line(s: dict) -> str:
 
 def cmd_ev(s: dict) -> str:
     """EV(기대값) 판단 — 마지막 사이클의 종목별 매수/대기/보유/매도와 근거."""
-    rows = ((s.get("ev") or {}).get("rows")) or []
+    data = _ev_data(s)
+    rows = data.get("rows") or []
     if not rows:
         return ("EV 판단 기록이 없습니다. 자동매매 사이클이 한 번 돌면 표시됩니다.\n"
                 "(앱 자동매매 → 파라미터에서 EV 판단을 켜고 끌 수 있습니다)")
@@ -114,8 +127,20 @@ def cmd_ev(s: dict) -> str:
         act = _EV_KO.get(r.get("action"), r.get("action"))
         ev = f"EV {r.get('ev',0):+.1%} 승률 {r.get('p_win',0):.0%}" if r.get("sigma") else "데이터 부족"
         lines.append(f"· {r.get('ticker')}{'(보유)' if r.get('held') else ''} {act} — {ev}\n  {r.get('reason','')}")
-    lines.append(f"\n마지막 사이클: {s.get('last_run','—')}")
+    when = (time.strftime("%m-%d %H:%M", time.localtime(data["ts"])) if data.get("ts")
+            else s.get("last_run", "—"))
+    lines.append(f"\n판단 시각: {when}")
     return "\n".join(lines)
+
+
+def cmd_report() -> str:
+    """오늘(장중이면 지금까지) 일일 리포트 미리보기 — 장 마감 후엔 자동 발송된다."""
+    try:
+        import monitor
+        from core import control
+        return monitor.preview_report(control.load_config())
+    except Exception as e:
+        return f"리포트를 만들 수 없습니다: {e}"
 
 
 def cmd_balance(s: dict) -> str:
@@ -205,6 +230,7 @@ def cmd_help(_s: dict) -> str:
             "/status — 전체 현황\n"
             "/ai — AI 인플루언서 판단 현황 (/ai AAPL = 종목 즉시 판단)\n"
             "/ev — EV(기대값) 매수·대기·보유·매도 판단\n"
+            "/report — 오늘 리포트 미리보기 (장 마감 후 자동 발송 · 금요일엔 주간 리포트)\n"
             "/balance — 잔액·손익\n"
             "/portfolio — 보유 종목\n"
             "/scores — 상위 점수 후보\n"
@@ -409,6 +435,8 @@ def handle(text: str, chat_id: str = "") -> str:
         return cmd_ai(args, _status())
     if cmd in ("ev", "기대값"):
         return cmd_ev(_status())
+    if cmd in ("report", "리포트"):
+        return cmd_report()
     if cmd in _MODE_CMDS:
         if not _is_owner(chat_id):
             return "⛔ 모드 전환은 등록된 Chat ID에서만 가능합니다 (/id 로 등록)."

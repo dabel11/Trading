@@ -61,7 +61,26 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     """설정(cfg = autotrader_config.json 스키마)대로 사이클 1회 실행.
 
     반환: execute_orders 결과 + {"regime", "top"}.
+    성공/실패는 monitor 에 기록된다(장중 멈춤 경보·일일 리포트의 근거).
     """
+    try:
+        result = _run_cycle(cfg, log)
+    except Exception as e:
+        _record(False, str(e))
+        raise
+    _record(True)
+    return result
+
+
+def _record(ok: bool, error: str = ""):
+    try:
+        import monitor
+        monitor.record_cycle(ok, error)
+    except Exception:
+        pass
+
+
+def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     import portfolio as _pf
     from portfolio import PortfolioManager
     from scorer import StockScore

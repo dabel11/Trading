@@ -1101,19 +1101,17 @@ def _proactive_alerts(st: dict):
         mopen = bool(mh.is_market_open())
     except Exception:
         mopen = False
-    today = date.today().isoformat()
+    try:
+        today = mh.trading_day().isoformat()   # ET — KST 자정(미국 장중)에 '개장'이 또 오지 않게
+    except Exception:
+        today = date.today().isoformat()
     if mopen and st.get("open_day") != today:
         d = collect()
         _tg_push(f"🔔 미국장 개장\n총자산 ${d['equity']:,.0f} · 평가손익 ${d['total_pnl']:+,.0f}\n"
                  f"보유 {len(d['rows'])}종목 · 자동매매 {'ON' if DAEMON.running() else 'OFF'} · {mode}")
         st["open_day"] = today
         st["sig_day"] = None
-    if (not mopen) and st.get("open_day") == today and st.get("close_day") != today:
-        d = collect()
-        movers = sorted(d["rows"], key=lambda r: -r["pnl_pct"])
-        top = " · ".join(f"{r['tk']} {r['pnl_pct']:+.1f}%" for r in movers[:3]) or "보유 없음"
-        _tg_push(f"🔕 미국장 마감\n총자산 ${d['equity']:,.0f} · 평가손익 ${d['total_pnl']:+,.0f}\n보유 상위: {top}")
-        st["close_day"] = today
+    # 장 마감 요약은 monitor 의 일일 리포트(마감 5분 후, S&P 500 대비·체결·운영 점검 포함)로 대체
     # 3) AI 매수 신호 (장중 30분마다 검사, 하루 첫 회는 TOP5 요약, 이후 신규 진입만)
     st["n"] = st.get("n", 0) + 1
     if mopen and (st.get("sig_day") != today or st["n"] % 150 == 0):
@@ -2827,6 +2825,15 @@ def _fh_rate() -> int:
         return 0
 
 
+def _start_monitor():
+    """감시·리포트(monitor.py) — 장중 멈춤·장외 체결 경보, 장 마감 일일/주간 리포트."""
+    try:
+        import monitor
+        monitor.start()
+    except Exception:
+        pass
+
+
 def _start_scanner():
     try:
         if load_config().get("ai_full_market", True):
@@ -3234,6 +3241,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         _ngapp.on_startup(ensure_telegram_running)
         _ngapp.on_startup(_resume_auto)
         _ngapp.on_startup(_start_scanner)
+        _ngapp.on_startup(_start_monitor)
     except Exception:
         pass
     ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
