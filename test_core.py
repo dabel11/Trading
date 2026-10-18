@@ -1100,6 +1100,400 @@ def test_tick_guard_fires_stop_loss_immediately():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 실거래 경로 멱등성: 주문 의도 저널 · 브로커 대조 · 사전 리스크 게이트
+# (가짜 Alpaca 만 사용 — 네트워크·실주문 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NotFound(Exception):
+    status_code = 404
+
+
+class _Crash(BaseException):
+    """프로세스가 그 자리에서 죽은 것처럼 — 실행기의 except Exception 도 못 잡는다."""
+
+
+class _FakeOrder:
+    def __init__(self, oid, coid, symbol, side, qty, limit):
+        self.id, self.client_order_id, self.symbol = oid, coid, symbol
+        self.side, self.qty, self.limit_price = side, qty, limit
+        self.status, self.filled_qty, self.filled_avg_price = "new", 0, None
+
+
+class _FakeAlpaca:
+    """상태를 가진 가짜 Alpaca TradingClient.
+
+    fills[n]: n번째로 제출된 주문에 즉시 붙는 체결 수량(주문 수량으로 잘림, 없으면 전량).
+    체결은 브로커 보유(pos)에 누적되고, 취소된 미종결 주문은 canceled(체결분 유지).
+    """
+    FINAL = ("filled", "canceled", "expired", "rejected")
+
+    def __init__(self, fills=None, price=100.0, positions=None):
+        from types import SimpleNamespace
+        self._ns = SimpleNamespace
+        self.fills = list(fills or [])
+        self.price = price
+        self.orders, self.by_coid = {}, {}
+        self.pos = dict(positions or {})
+        self.cancels, self.submitted = [], []
+        self.ignore_cancel = False         # True: 취소 요청이 확인되지 않음(pending)
+        self.crash_before_submit = False
+        self.crash_after_submit = False
+
+    def fill(self, o, q):
+        q = min(int(q), o.qty - o.filled_qty)
+        if q <= 0:
+            return
+        o.filled_qty += q
+        o.filled_avg_price = self.price
+        sign = 1 if o.side == "buy" else -1
+        self.pos[o.symbol] = self.pos.get(o.symbol, 0) + sign * q
+        o.status = "filled" if o.filled_qty >= o.qty else "partially_filled"
+
+    def submit_order(self, req):
+        if self.crash_before_submit:
+            raise _Crash()
+        coid = req.client_order_id
+        if coid in self.by_coid:
+            raise Exception("client_order_id must be unique")
+        n = len(self.orders)
+        side = str(req.side).split(".")[-1].lower()
+        o = _FakeOrder(f"o{n}", coid, req.symbol, side, int(float(req.qty)),
+                       getattr(req, "limit_price", None))
+        self.orders[o.id], self.by_coid[coid] = o, o
+        self.submitted.append((coid, o.qty, "limit" if o.limit_price else "market"))
+        self.fill(o, self.fills[n] if n < len(self.fills) else o.qty)
+        if self.crash_after_submit:
+            raise _Crash()
+        return o
+
+    def get_order_by_id(self, oid):
+        if oid not in self.orders:
+            raise _NotFound("order not found")
+        return self.orders[oid]
+
+    def get_order_by_client_id(self, coid):
+        if coid not in self.by_coid:
+            raise _NotFound("order not found")
+        return self.by_coid[coid]
+
+    def cancel_order_by_id(self, oid):
+        self.cancels.append(oid)
+        o = self.orders[oid]
+        if o.status not in self.FINAL and not self.ignore_cancel:
+            o.status = "canceled"
+
+    def get_orders(self, filter=None):
+        return [o for o in self.orders.values() if o.status not in self.FINAL]
+
+    def get_all_positions(self):
+        return [self._ns(symbol=t, qty=q, avg_entry_price=self.price,
+                         market_value=q * self.price, unrealized_pl=0.0)
+                for t, q in self.pos.items() if q]
+
+    def get_account(self):
+        return self._ns(equity=1e6, cash=1e6, buying_power=1e6, last_equity=None)
+
+    def filled_total(self, symbol):
+        return self.pos.get(symbol, 0)
+
+
+class _LiveEnv:
+    """실거래 경로 격리: 장부·저널·주문로그·설정·락 임시화, 알림 차단,
+    broker 모듈의 시계 가상화(폴링 대기 0), Broker() 생성을 가짜로 대체."""
+
+    def __init__(self, fills=None, price=100.0, positions=None):
+        self.fills, self.price, self.positions = fills, price, positions
+
+    def __enter__(self):
+        from types import SimpleNamespace
+        import broker as B
+        import notifier
+        import safe_store
+        from core import control
+        self.portfolio, self.P, self.EX = _isolate_execution()
+        d = self.portfolio.STATE_FILE.parent
+        self.B, self.notifier, self.safe_store, self.control = B, notifier, safe_store, control
+        self._saved = (B.time, B.Broker, notifier.notify_buy, notifier.notify_sell,
+                       safe_store._TRADE_LOCK_FILE, control.CONFIG_FILE)
+        clock = [1000.0]
+        B.time = SimpleNamespace(
+            time=lambda: (clock.__setitem__(0, clock[0] + 0.5) or clock[0]),
+            sleep=lambda s: None)
+        notifier.notify_buy = notifier.notify_sell = lambda *a, **k: None
+        safe_store._TRADE_LOCK_FILE = d / ".trade.lock"
+        control.CONFIG_FILE = d / "autotrader_config.json"     # 없음 → 기본 한도
+        self.fake = _FakeAlpaca(self.fills, self.price, self.positions)
+        self.bk = self.new_broker()
+        B.Broker = lambda paper=False: self.bk
+        self.alerts = []
+        return self
+
+    def new_broker(self):
+        """재기동 시뮬레이션용 — 같은 브로커 계좌(fake)에 새 Broker 래퍼.
+        진짜 Broker 클래스이되 __init__(실제 Alpaca 클라이언트 생성)은 건너뛴다."""
+        b = object.__new__(self._saved[1])
+        b.paper = False
+        b._trading = self.fake
+        b.get_prices = lambda tks: {t: self.fake.price for t in tks}
+        return b
+
+    def __exit__(self, *exc):
+        B, notifier, safe_store, control = (self.B, self.notifier,
+                                            self.safe_store, self.control)
+        (B.time, B.Broker, notifier.notify_buy, notifier.notify_sell,
+         safe_store._TRADE_LOCK_FILE, control.CONFIG_FILE) = self._saved
+        return False
+
+    def pm(self):
+        return self.portfolio.PortfolioManager(paper=False)
+
+    def ledger(self, t):
+        p = self.pm().positions.get(t)
+        return p.shares if p else 0
+
+    def journal(self):
+        from core import intents
+        return intents.load()
+
+    def buy(self, t, qty, price=100.0, cycle_id="c1", cfg=None, fresh=True, pm=None):
+        return self.EX.execute_orders(
+            {"sell": [], "buy": [{"ticker": t, "shares": qty, "score": 80,
+                                  "est_price": price, "est_cost": qty * price}]},
+            {t: price}, False, pm or self.pm(), broker=self.bk, cycle_id=cycle_id,
+            price_ts=({t: time.time()} if fresh else {}), cfg=cfg or {})
+
+    def sell(self, t, qty, price=100.0, cycle_id="c2", cfg=None):
+        return self.EX.execute_orders(
+            {"sell": [{"ticker": t, "shares": qty, "reason": "stop_loss",
+                       "est_price": price}], "buy": []},
+            {t: price}, False, self.pm(), broker=self.bk, cycle_id=cycle_id,
+            price_ts={t: time.time()}, cfg=cfg or {})
+
+    def reconcile(self, cfg=None):
+        return self.EX.reconcile_live(self.new_broker(), self.pm(), cfg or {},
+                                      alert_fn=self.alerts.append)
+
+
+def test_live_partial_fill_retries_only_remainder():
+    """부분 체결(30/50) → 취소 확인 → 재주문은 잔량 20주만. 장부 = 브로커 = 50."""
+    with _LiveEnv(fills=[30]) as env:
+        res = env.buy("NVDA", 50)
+        assert res["bought"][0]["shares"] == 50
+        assert [q for _, q, _ in env.fake.submitted] == [50, 20]
+        coids = [c for c, _, _ in env.fake.submitted]
+        assert coids[0].startswith("ait-") and coids[0].endswith("-c1-NVDA-buy")
+        assert coids[1] == coids[0] + "-r1"            # 의도에서 결정적으로 파생
+        assert env.ledger("NVDA") == env.fake.filled_total("NVDA") == 50
+        rec = next(iter(env.journal()["intents"].values()))
+        assert rec["state"] == "FILLED" and rec["booked_qty"] == 50
+
+
+def test_live_canceled_partial_fill_is_booked():
+    """부분 체결 뒤 취소(canceled)여도 체결분은 장부에 반영된다(재시도는 급변으로 포기)."""
+    with _LiveEnv(fills=[20]) as env:
+        env.bk.get_prices = lambda tks: {t: 110.0 for t in tks}   # +10% → 추격 포기
+        res = env.buy("AMD", 50)
+        assert res["bought"][0]["shares"] == 20
+        assert env.ledger("AMD") == env.fake.filled_total("AMD") == 20
+        assert len(env.fake.submitted) == 1 and env.fake.cancels
+        rec = next(iter(env.journal()["intents"].values()))
+        assert rec["state"] == "CANCELED" and rec["booked_qty"] == 20
+        # 브로커 계층: canceled+부분체결을 validate_fill 이 인정
+        from broker import validate_fill
+        v = validate_fill({"status": "canceled", "fill_price": 100.0, "filled_qty": 20},
+                          est_price=100.0, req_shares=50)
+        assert v["ok"] and v["filled_qty"] == 20
+
+
+def test_live_sell_chases_to_market_but_buy_does_not():
+    """손절 매도: 지정가 미체결 → 재가격 → 시장가로 끝까지. 매수: 급변이면 추격 안 함."""
+    with _LiveEnv(fills=[0, 0], price=92.0) as env:
+        env.pm().record_buy("TSLA", 10, 100.0, 70)
+        env.fake.pos["TSLA"] = 10
+        env.fake.price = 88.0                                  # 급락
+        res = env.sell("TSLA", 10, price=92.0)
+        assert res["sold"] and res["sold"][0]["shares"] == 10
+        assert [k for _, _, k in env.fake.submitted] == ["limit", "limit", "market"]
+        assert env.ledger("TSLA") == 0 and env.fake.filled_total("TSLA") == 0
+    with _LiveEnv(fills=[0]) as env:
+        env.bk.get_prices = lambda tks: {t: 104.0 for t in tks}   # +4%
+        res = env.buy("META", 5)
+        assert not res["bought"] and len(env.fake.submitted) == 1
+        assert env.fake.cancels and env.ledger("META") == 0
+        assert not env.EX._it.unresolved(env.journal())        # 취소 확정 → 해결됨
+
+
+def test_live_manual_timeout_cancels_order():
+    """수동 실거래 시장가가 미체결이면 주문을 취소하고 실패를 알린다(브로커에 안 남김)."""
+    with _LiveEnv(fills=[0]) as env:
+        raised = None
+        try:
+            env.EX.execute_manual("META", 3, "buy", False, est_price=100.0, pm=env.pm())
+        except RuntimeError as e:
+            raised = str(e)
+        assert raised and "취소" in raised
+        assert env.fake.cancels == ["o0"]
+        assert not env.fake.get_orders() and env.ledger("META") == 0
+        assert not env.EX._it.unresolved(env.journal())
+
+
+def test_live_unconfirmed_cancel_is_tracked_and_reconciled():
+    """취소가 확인되지 않으면 열린 주문으로 추적 → 같은 종목·방향 새 주문 차단 →
+    나중에 체결되면 다음 사이클 대조가 장부에 반영한다."""
+    with _LiveEnv(fills=[0]) as env:
+        env.fake.ignore_cancel = True
+        try:
+            env.EX.execute_manual("AAPL", 4, "buy", False, est_price=100.0, pm=env.pm())
+        except RuntimeError as e:
+            assert "추적" in str(e)
+        assert len(env.EX._it.unresolved(env.journal(), "AAPL", "buy")) == 1
+        res = env.buy("AAPL", 4, cycle_id="c9")                  # 사이클이 또 사려 함
+        assert not res["bought"] and len(env.fake.submitted) == 1   # 새 주문 없음
+        env.fake.fill(env.fake.orders["o0"], 4)                 # 뒤늦게 체결
+        rec = env.reconcile()
+        assert rec["ok"] and env.ledger("AAPL") == env.fake.filled_total("AAPL") == 4
+        assert not env.EX._it.unresolved(env.journal())
+
+
+def test_live_same_intent_is_not_resubmitted():
+    """같은 사이클의 같은 결정이 두 번 실행돼도 브로커 주문은 1건."""
+    with _LiveEnv() as env:
+        env.buy("MSFT", 5, cycle_id="c7")
+        res2 = env.buy("MSFT", 5, cycle_id="c7")
+        assert not res2["bought"] and len(env.fake.submitted) == 1
+        assert env.ledger("MSFT") == 5
+
+
+def test_live_crash_after_submit_then_reconcile_books_once():
+    """크래시 주입 ①: 브로커가 체결한 직후(응답 기록 전) 죽음 → 재기동 대조가
+    coid 로 주문을 찾아 장부에 정확히 한 번 반영."""
+    with _LiveEnv() as env:
+        env.fake.crash_after_submit = True
+        try:
+            env.buy("NVDA", 10)
+        except _Crash:
+            pass
+        env.fake.crash_after_submit = False
+        assert env.ledger("NVDA") == 0 and env.fake.filled_total("NVDA") == 10
+        res = env.buy("NVDA", 10, cycle_id="c2")                 # 재기동 후 같은 결정
+        assert not res["bought"] and len(env.fake.submitted) == 1   # 미해결 → 차단
+        rec = env.reconcile()
+        assert rec["ok"] and env.ledger("NVDA") == 10
+        rec2 = env.reconcile()                                   # 재실행해도 이중 반영 없음
+        assert rec2["ok"] and env.ledger("NVDA") == 10 and not rec2["booked"]
+
+
+def test_live_crash_after_ledger_write_not_double_booked():
+    """크래시 주입 ②: 장부 기록 직후(반영 표시 저장 전) 죽음 → 대조는 '이미 반영'으로 판정."""
+    with _LiveEnv() as env:
+        pm = env.pm()
+        orig = pm.record_buy
+
+        def crash_after_record(*a, **k):
+            orig(*a, **k)
+            raise _Crash()
+        pm.record_buy = crash_after_record
+        try:
+            env.buy("AMD", 7, pm=pm)
+        except _Crash:
+            pass
+        assert env.ledger("AMD") == 7
+        assert env.EX._it.unresolved(env.journal(), "AMD")       # 반영 표시는 못 남김
+        rec = env.reconcile()
+        assert rec["ok"] and env.ledger("AMD") == env.fake.filled_total("AMD") == 7
+        assert not env.EX._it.unresolved(env.journal())
+
+
+def test_live_crash_before_submit_resolves_as_not_sent():
+    """크래시 주입 ③: 의도 기록 후 제출 전에 죽음 → 브로커에 없음 → CANCELED, 장부 불변."""
+    with _LiveEnv() as env:
+        env.fake.crash_before_submit = True
+        try:
+            env.buy("GOOG", 3)
+        except _Crash:
+            pass
+        env.fake.crash_before_submit = False
+        rec = env.reconcile()
+        j = env.journal()
+        assert rec["ok"] and not env.EX._it.unresolved(j)
+        assert next(iter(j["intents"].values()))["state"] == "CANCELED"
+        assert env.ledger("GOOG") == 0 and not env.fake.pos.get("GOOG")
+        assert env.buy("GOOG", 3, cycle_id="c3")["bought"]         # 이제 정상 매수 가능
+
+
+def test_reconcile_mismatch_halts_alerts_once_and_resumes():
+    """장부↔브로커 불일치 → 매수 중단 + 경보(1회). 손절·청산 매도는 브로커 보유
+    한도 안에서 계속. 장부를 맞추면 자동 재개."""
+    with _LiveEnv(positions={"AAPL": 10, "TSLA": 10}) as env:
+        env.pm().record_buy("TSLA", 10, 100.0, 70)              # TSLA 는 일치
+        r1 = env.reconcile()
+        assert r1["halted"] and [m["ticker"] for m in r1["mismatches"]] == ["AAPL"]
+        env.reconcile()
+        assert len(env.alerts) == 1                              # 같은 사유는 재경보 안 함
+        res = env.buy("MSFT", 1)
+        assert res.get("halted") and not env.fake.submitted       # 중단 중 매수 0
+        raised = False
+        try:
+            env.EX.execute_manual("MSFT", 1, "buy", False, est_price=100.0, pm=env.pm())
+        except RuntimeError:
+            raised = True
+        assert raised and not env.fake.submitted                  # 수동 매수도 금지
+        res = env.sell("TSLA", 10)                               # 자동 손절은 진행
+        assert res.get("halted") and res["sold"][0]["shares"] == 10
+        assert env.fake.pos["TSLA"] == 0 and env.ledger("TSLA") == 0
+        env.pm().record_buy("AAPL", 10, 100.0, 0)                # 사용자가 장부 정정
+        r3 = env.reconcile()
+        assert r3["ok"] and not r3["halted"] and len(env.alerts) == 2
+        assert env.buy("MSFT", 1)["bought"]
+    with _LiveEnv(positions={"AAPL": 10}) as env:               # 허용 목록은 대조 제외
+        assert env.reconcile({"reconcile_ignore": ["AAPL"]})["ok"]
+
+
+def test_halt_sell_still_clamped_to_broker_holdings():
+    """중단 중 매도도 브로커 보유를 넘지 못한다 — 장부 10주/브로커 3주 → 3주만, 0주면 거부."""
+    with _LiveEnv(positions={"NVDA": 3}) as env:
+        env.pm().record_buy("NVDA", 10, 100.0, 70)
+        assert env.reconcile()["halted"]
+        res = env.sell("NVDA", 10)
+        assert res["sold"][0]["shares"] == 3 and env.fake.submitted[0][1] == 3
+        assert env.fake.pos["NVDA"] == 0                         # 숏 없음
+        assert not env.sell("NVDA", 7, cycle_id="c3")["sold"]    # 브로커 0주 → 거부
+        assert len(env.fake.submitted) == 1
+
+
+def test_corrupt_intent_journal_fails_closed():
+    """저널이 손상되면 실거래 주문을 내지 않는다(진행 중 주문을 잊은 채 매매 금지)."""
+    with _LiveEnv() as env:
+        env.EX._it.path().write_text("{broken")
+        res = env.buy("NVDA", 1)
+        assert res.get("halted") and not env.fake.submitted
+
+
+def test_pre_trade_gate_limits():
+    """사전 리스크 게이트: 주문당 금액 · 일 주문 수 · 가격 신선도 · 매도 ≤ 브로커 보유."""
+    with _LiveEnv() as env:
+        assert not env.buy("NVDA", 50, cfg={"max_order_usd": 1000})["bought"]
+        assert env.buy("NVDA", 5, cfg={"max_orders_per_day": 1})["bought"]
+        assert not env.buy("AMD", 5, cycle_id="c5",
+                           cfg={"max_orders_per_day": 1})["bought"]
+        # 묵은 가격: 브로커 재확인가가 결정가와 2% 넘게 다르면 거부, 가까우면 통과
+        env.fake.price = 110.0
+        assert not env.buy("GOOG", 1, cycle_id="c6", fresh=False)["bought"]
+        env.fake.price = 100.5
+        assert env.buy("GOOG", 1, cycle_id="c7", fresh=False)["bought"]
+        assert len(env.fake.submitted) == 2
+    with _LiveEnv() as env:
+        env.pm().record_buy("TSLA", 10, 100.0, 70)              # 장부는 10주
+        env.fake.pos["TSLA"] = 4                                 # 브로커는 4주
+        res = env.sell("TSLA", 10)
+        assert res["sold"][0]["shares"] == 4 and env.fake.submitted[0][1] == 4
+        assert env.fake.pos["TSLA"] == 0                         # 숏 없음
+        env.fake.pos.pop("TSLA")
+        assert not env.sell("TSLA", 6, cycle_id="c8")["sold"]    # 브로커 0주 → 거부
+        assert len(env.fake.submitted) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 러너 (pytest 없이도 실행)
 # ─────────────────────────────────────────────────────────────────────────────
 

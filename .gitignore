@@ -20,6 +20,8 @@ trades.json
 trades_paper.json
 # 주문 로그
 orders_log.json
+# 실거래 주문 의도 저널 (멱등성·브로커 대조)
+order_intents.json
 # 일일 손실 킬스위치 상태
 day_state.json
 # 실행 루프 상태 (daily 모드 마지막 실행 ET 날짜)
