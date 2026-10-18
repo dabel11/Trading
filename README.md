@@ -174,7 +174,11 @@ cp .env.example .env          # 키 입력 (없어도 모의투자·시세 조�
 ```
 
 ```bash
-streamlit run app.py          # 앱 (관제 UI)
+./launcher.sh                 # 앱 (NiceGUI + 네이티브 창, 전용 venv 자동 준비)
+```
+
+```bash
+python3 -m ui_ng.window       # 이미 의존성이 있는 환경에서 바로 실행 (포트 8502)
 ```
 
 ```bash
@@ -182,7 +186,7 @@ python3 autotrader.py         # 자동매매 데몬 (앱 없이 단독 실행 �
 ```
 
 ```bash
-python3 test_core.py          # 테스트 80개
+python3 -m pytest test_core.py test_influence_and_config.py -q   # 테스트 107개
 ```
 
 ```bash
@@ -190,8 +194,9 @@ python3 engine.py backtest --start 2022-01-01 --end 2024-12-31 --trades
 ```
 
 API 키가 없어도 동작합니다 — yfinance로 시세를 받고 모의 계좌로 거래합니다.
-Finnhub 키를 넣으면 WebSocket 실시간 체결 스트림이 켜지고, Alpaca 키를 넣으면 실거래가
-가능해집니다(이중 동의 필요).
+Finnhub 키를 넣으면 WebSocket 실시간 체결 스트림(50종목)이 켜지고, Alpaca 키를 넣으면
+IEX 실시간 스트림(30종목 추가)과 주문이 가능해집니다(이중 동의 필요). 키는 앱 **설정 → Alpaca**
+카드에서 넣을 수 있고, PK(페이퍼) 키는 '실거래' 모드에서도 Alpaca 페이퍼 계좌로만 주문합니다.
 
 ---
 
@@ -201,16 +206,21 @@ Finnhub 키를 넣으면 WebSocket 실시간 체결 스트림이 켜지고, Alpa
 core/            매매 핵심 — execution · cycle · scoring · control · guard
 portfolio.py     포지션 관리 · 주문 결정 (유동형 동적 배분 / 고정형)
 backtester.py    백테스트 (라이브 결정 코드 상속) · 파라미터 그리드 스윕
-strategies/      전략 25종 (모멘텀 · 평균회귀 · 섹터로테이션 · 복합 등)
+strategy_catalog.py 전략 카탈로그 (AI 인플루언서 · momentum_max · 모멘텀 · 평균회귀 등)
+influence/       AI 인플루언서 엔진 — 로스터 · 소스(Finnhub/Nasdaq) · 전체시장 스캐너(516종목)
+ai_judge.py      근거 가중 판단기 (규칙 + 선택적 LLM)
 signals/         신호 (기관 수급 · 뉴스 감성 · 섹터 · 펀더멘털)
 broker.py        Alpaca 주문 (멱등성 · 체결 검증) · toss_broker.py 국내 확장 슬롯
 realtime_feed.py WebSocket 스트림 + REST 폴백 + 틱 콜백
 risk_guard.py    일일 손실 킬스위치
 safe_store.py    원자적 JSON 저장 · 프로세스 간 거래 락
 screener.py      시장 자동 발굴 (지수 스캔 → 워치리스트 편입)
-app.py           Streamlit UI (7개 페이지)
-native_app.py    pywebview 네이티브 앱 래퍼
-test_core.py     테스트 80개
+ui_ng/           NiceGUI UI (dashboard.py) + pywebview 창 래퍼 (window.py)
+telegram_bot.py  텔레그램 명령·체결 알림 (소유자 숫자 Chat ID 자동 등록)
+alpaca_api.py    Alpaca 읽기 전용 점검 (계좌·일괄 시세·스트림 인증)
+engine.py        분석 CLI (scan · backtest)
+legacy/          구 Streamlit UI 보관 (실행 경로 아님)
+test_*.py        테스트 107개
 ```
 
 ---

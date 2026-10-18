@@ -2,9 +2,7 @@
 실시간 시장 데이터: 공포탐욕지수, 섹터 히트맵, 뉴스, 상승/하락 종목
 """
 import yfinance as yf
-import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 
 # ── 공포탐욕지수 (VIX + 모멘텀 + 폭으로 자체 계산) ──────────────────────────

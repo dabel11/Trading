@@ -20,6 +20,22 @@ def _ai_snapshot() -> Optional[dict]:
         return None
 
 
+def _market_open() -> bool:
+    """텔레그램 상태용 실제 장 상태(예전엔 True 고정 — 수동 실행·장외에도 '개장' 표시)."""
+    try:
+        import market_hours as mh
+        return bool(mh.is_market_open())
+    except Exception:
+        return False
+
+
+def _mode_label(paper: bool, broker=None) -> str:
+    """'실거래' 모드라도 PK(페이퍼) 키면 주문은 Alpaca 페이퍼 계좌로 간다(broker._paper_endpoint)."""
+    if paper:
+        return "모의"
+    return "Alpaca 페이퍼" if getattr(broker, "paper", False) else "🔴 실거래"
+
+
 def mark_to_market_equity(pm, prices: dict, paper: bool) -> float:
     """킬스위치용 시가평가 자산 = 현금 + Σ(보유수량 × 현재가).
 
@@ -185,7 +201,7 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
         bought, sold = result.get("bought") or [], result.get("sold") or []
         if bought or sold:
             import telegram_bot as tgb
-            mode = "모의" if paper else "🔴 실거래"
+            mode = _mode_label(paper, broker)
             eng = "🧠 AI 인플루언서" if sn == "ai_influencer" else cfg.get("strategy_name", sn)
             lines = [f"🤖 자동매매 체결 · {mode}", f"{eng} · 국면 {regime}"]
             for b in bought:
@@ -214,11 +230,11 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
                  for t, p in pm.positions.items()]
         tgb.write_status({
             "auto_on": bool(cfg.get("enabled", True)), "paper": paper,
-            "mode": "모의(페이퍼)" if paper else "실거래",
+            "mode": "모의(페이퍼)" if paper else _mode_label(paper, broker).replace("🔴 ", ""),
             "strategy": cfg.get("strategy_name", sn), "sn": sn,
             "horizon": cfg.get("horizon", "단기"),
             "alloc": "유동형" if dynamic else "고정형",
-            "market_open": True, "last_run": datetime.now().strftime("%H:%M:%S"),
+            "market_open": _market_open(), "last_run": datetime.now().strftime("%H:%M:%S"),
             "equity": round(cash_b + mv), "cash": round(cash_b),
             "invested": round(mv), "upnl": round(mv - cost),
             "upnl_pct": ((mv - cost) / cost if cost else 0),

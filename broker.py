@@ -8,9 +8,8 @@ Paper trading by default — just change ALPACA_BASE_URL in config.py to go live
 """
 
 import time
-import uuid
 import yfinance as yf
-from datetime import datetime, date
+from datetime import datetime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -79,11 +78,28 @@ def make_broker(paper: bool = True):
     return Broker(paper=paper)
 
 
+def _paper_endpoint(paper: bool) -> bool:
+    """실제로 호출할 Alpaca 엔드포인트가 페이퍼인지.
+
+    호출부의 Broker(paper=False)는 '앱 내부 모의장부 대신 Alpaca 로 주문'이라는 뜻이고,
+    어느 계좌로 갈지는 키가 정한다(PK=페이퍼, AK=실계좌 — save_alpaca_keys 와 같은 규칙).
+    PK 키를 실계좌 엔드포인트로 보내면 항상 401 이므로 페이퍼로 보정한다.
+    실계좌 엔드포인트는 'paper=False + 실계좌 키'일 때만 — 보정은 돈이 안 오가는 쪽으로만."""
+    if paper:
+        return True
+    k = str(ALPACA_API_KEY or "")
+    if k.startswith("PK"):
+        return True
+    if k.startswith("AK"):
+        return False
+    return "paper" in str(ALPACA_BASE_URL)
+
+
 class Broker:
     def __init__(self, paper: bool = True):
-        self.paper = paper
+        self.paper = _paper_endpoint(paper)
         self._trading = TradingClient(
-            ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=paper
+            ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=self.paper
         )
         self._data = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 

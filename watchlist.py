@@ -14,7 +14,6 @@ load()가 반환하는 활성 유니버스 stocks = manual ∪ auto ∪ held (�
 간주해 안전하게 이관한다(사용자 큐레이션이 자동 정리로 지워지지 않게).
 """
 
-import json
 import time
 from pathlib import Path
 import yfinance as yf

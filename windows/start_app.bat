@@ -18,6 +18,6 @@ echo    이 검은 창을 닫으면 앱이 종료됩니다.
 echo ============================================
 echo.
 
-".venv\Scripts\python.exe" native_app.py
+".venv\Scripts\python.exe" -m ui_ng.window
 
 popd

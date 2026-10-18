@@ -14,8 +14,8 @@ Backtester: 과거 데이터로 전략 성과를 시뮬레이션합니다.
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
-from dataclasses import dataclass, field
+from datetime import date
+from dataclasses import dataclass
 
 import portfolio
 from portfolio import PortfolioManager

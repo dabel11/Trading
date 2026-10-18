@@ -5,7 +5,7 @@
 ### 방법 1: 응용 프로그램에서 실행 (이미 설치됨)
 - **Launchpad** 또는 **응용 프로그램 폴더** → `AI 트레이딩` 클릭
 - 처음 실행 시 패키지 자동 설치 (1~2분), 이후엔 즉시 실행
-- 자동으로 기본 브라우저에 대시보드가 열립니다
+- 네이티브 창(pywebview)으로 대시보드가 열립니다 (내부 서버 포트 8502)
 
 ### 방법 2: DMG로 배포 (다른 Mac에 설치)
 1. `AI트레이딩.dmg` 더블클릭
@@ -23,11 +23,11 @@
   - 없으면 https://python.org 에서 설치
 
 ## 종료
-- 브라우저 탭을 닫아도 서버는 백그라운드에서 유지됩니다
-- 완전 종료: 터미널에서 `pkill -f "streamlit run"`
+- 창을 닫으면 내부 서버도 함께 종료됩니다
+- 응답이 없을 때 강제 종료: 터미널에서 `pkill -f ui_ng.window; pkill -f ui_ng.dashboard`
 
 ## 로그 위치
-- `~/Library/Logs/AITrading.log`
+- `~/Library/Logs/AITrading.log` (런처) · `ui_ng/_server.log` (서버) — 5MB 넘으면 기동 시 `.1` 로 회전
 
 ## 구조
 ```

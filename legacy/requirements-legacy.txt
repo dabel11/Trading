@@ -1,0 +1,6 @@
+# legacy/ (구 Streamlit UI) 전용 — 현재 앱에는 불필요
+streamlit>=1.58.0
+streamlit-autorefresh>=1.0.1
+plotly>=6.7.0
+ta>=0.11.0                # RSI·MACD·볼린저밴드 (app.py 차트)
+openpyxl>=3.1             # 거래내역 Excel 내보내기 (app.py)

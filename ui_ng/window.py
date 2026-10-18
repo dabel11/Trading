@@ -38,11 +38,21 @@ def _set_app_name(name: str = "AI 트레이딩"):
         pass
 
 
+def _rotated(path: Path, max_bytes: int = 5 * 1024 * 1024) -> Path:
+    """기동 시 로그가 max_bytes 를 넘으면 .1 로 밀어내고(1세대 보관) 새로 시작."""
+    try:
+        if path.exists() and path.stat().st_size > max_bytes:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+    return path
+
+
 def _start_server():
     """NiceGUI 대시보드 서버(web, 포트 8502)를 백그라운드로 기동."""
     if _port_open(PORT):
         return None
-    log = open(ROOT / "ui_ng" / "_server.log", "a")
+    log = open(_rotated(ROOT / "ui_ng" / "_server.log"), "a")
     return subprocess.Popen(
         [sys.executable, "-m", "ui_ng.dashboard"],
         cwd=str(ROOT),

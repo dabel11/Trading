@@ -8,7 +8,6 @@
 """
 import yfinance as yf
 import pandas as pd
-from functools import lru_cache
 from pathlib import Path
 import json, time, threading
 

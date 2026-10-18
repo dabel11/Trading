@@ -9,6 +9,10 @@ cd "$APP_DIR" || exit 1
 
 LOG="$HOME/Library/Logs/AITrading.log"
 mkdir -p "$(dirname "$LOG")"
+# 5MB 초과 시 1세대만 보관하고 새로 시작 (회전 없이 수 MB 씩 계속 쌓이던 문제)
+if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+  mv -f "$LOG" "$LOG.1"
+fi
 echo "=== $(date) 시작 ===" >> "$LOG"
 
 # ── 베이스 Python 선택 (백엔드 의존성 pandas 등 보유한 것 우선) ──

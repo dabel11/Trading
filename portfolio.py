@@ -10,8 +10,7 @@ Capital rotation logic:
   - Freed capital immediately re-deploys into next best opportunity
 """
 
-import json
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 

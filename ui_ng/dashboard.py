@@ -111,14 +111,17 @@ _HIST_LOCK = threading.Lock()
 _HIST_STARTED = {"on": False}
 
 
-def prefetch_history(syms):
-    """여러 심볼의 당일 5분봉 종가를 1회 배치로 받아 캐시."""
+def prefetch_history(syms) -> int:
+    """여러 심볼의 당일 5분봉 종가를 1회 배치로 받아 캐시. 반환: 받아온 심볼 수."""
     try:
-        import yfinance as yf, warnings
+        import logging, yfinance as yf, warnings
         warnings.filterwarnings("ignore")
+        # 429·장외 시 yfinance 가 심볼마다 'possibly delisted' 를 stderr 로 찍어
+        # 60초마다 로그가 수십 줄씩 쌓인다(_server.log 11MB의 대부분) — 소음 차단.
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
         syms = [s for s in dict.fromkeys(syms) if s]
         if not syms:
-            return
+            return 0
         raw = yf.download(" ".join(syms), period="1d", interval="5m",
                           progress=False, group_by="ticker", threads=True)
         got = {}
@@ -133,8 +136,9 @@ def prefetch_history(syms):
         if got:
             with _HIST_LOCK:
                 _HIST.update(got)
+        return len(got)
     except Exception:
-        pass
+        return 0
 
 
 def get_hist(sym):
@@ -143,13 +147,15 @@ def get_hist(sym):
 
 
 def _hist_loop(extra):
+    fails = 0
     while True:
         try:
             syms = [s for s, _ in INDEX_CARDS] + list(extra())
-            prefetch_history(syms)
+            fails = 0 if prefetch_history(syms) else fails + 1
         except Exception:
-            pass
-        time.sleep(60)
+            fails += 1
+        # 연속 실패(429·주말) 시 60→120→…→최대 15분 백오프 — 차단을 연장시키지 않게
+        time.sleep(min(900, 60 * (2 ** min(fails, 4))))
 
 
 def ensure_hist_running(extra):
@@ -1303,138 +1309,6 @@ def _area_option(vals, up):
                         "colorStops": [{"offset": 0, "color": col + "40"},
                                        {"offset": 1, "color": col + "00"}]}}}],
     }
-
-
-def render_detail(d, state):
-    sel = state.get("sel")
-    with ui.element("div").classes("dpanel"):
-        if not sel:
-            ui.html('<div class="empty">종목을 선택하세요.</div>')
-            return
-        dd = rtf.get_price(sel) or {}
-        px = dd.get("price", 0)
-        pct = dd.get("change_pct", 0) * 100
-        chg = dd.get("change", 0)
-        c = _col(pct)
-        row = next((r for r in d["rows"] if r["tk"] == sel), None)
-        ini, lc = _logo(sel)
-        sub = SECTOR_KO.get(row["sector"], "") if row else "지수"
-        ui.html(f'<div class="dhead"><span class="tlogo" style="background:{lc}">{ini}</span>'
-                f'<div><div style="font-weight:800;font-size:.95rem">{sel}</div>'
-                f'<div class="tsub">{sub}</div></div></div>'
-                f'<div class="dprice mono">{_idx_fmt(px)}</div>'
-                f'<div class="dchg" style="color:{c}">{"+" if chg>=0 else ""}{chg:+.2f} '
-                f'({"+" if pct>=0 else ""}{pct:.2f}%)</div>')
-        vals = get_hist(sel)
-        if vals:
-            ui.echart(_area_option(vals, pct >= 0)).classes("dchart")
-        else:
-            ui.html('<div class="dchart" style="display:flex;align-items:center;'
-                    'justify-content:center;color:var(--t3);font-size:.8rem">차트 불러오는 중…</div>')
-        if row:
-            stats = [("평단", f'${_fmt(row["ep"])}'), ("평가액", f'${_fmt(row["mv"])}'),
-                     ("손익", f'{"+" if row["pnl"]>=0 else ""}${_fmt(row["pnl"])}'),
-                     ("손익%", f'{"+" if row["pnl_pct"]>=0 else ""}{row["pnl_pct"]:.2f}%'),
-                     ("수량", f'{row["sh"]:g}주'), ("스코어", f'{row["score"]:g}')]
-            ui.html('<div class="dstats">' + "".join(
-                f'<div class="dstat"><span class="k">{k}</span><span class="v">{v}</span></div>'
-                for k, v in stats) + '</div>')
-        # AI 판단 미니 (최신 사이클 캐시 — 네트워크 없음)
-        try:
-            from influence import engine as _eng
-            v = _eng.LAST.get("verdicts", {}).get(sel)
-            if v is not None:
-                ui.html(
-                    f'<div class="dai"><div class="dai-top">'
-                    f'<span class="dai-ttl">🧠 AI 판단</span>'
-                    f'<span style="display:flex;gap:8px;align-items:center">'
-                    f'<span class="vscore">{v.score:.0f}/100</span>{_vpill(v.action)}</span>'
-                    f'</div><div class="dai-rat">{v.rationale}</div></div>')
-        except Exception:
-            pass
-
-
-def render_watchlist(d, n=10):
-    wl = []
-    for r in d["rows"]:
-        dd = rtf.get_price(r["tk"]) or {}
-        wl.append((r["tk"], dd.get("change_pct", 0) * 100))
-    for sym, lbl in INDEX_CARDS:
-        dd = rtf.get_price(sym)
-        if dd:
-            wl.append((lbl, dd.get("change_pct", 0) * 100))
-    seen, uniq = set(), []
-    for nm, pc in sorted(wl, key=lambda x: -abs(x[1])):
-        if nm in seen:
-            continue
-        seen.add(nm)
-        uniq.append((nm, pc))
-    with ui.element("div").classes("mini"):
-        rows = ['<div class="mini-h">실시간 · 변동 TOP</div>']
-        for i, (nm, pc) in enumerate(uniq[:n], 1):
-            c = _col(pc)
-            ini, lc = _logo(nm)
-            rows.append(
-                f'<div class="wl-row"><span class="wr">{i}</span>'
-                f'<span class="tlogo" style="background:{lc};width:22px;height:22px;flex:0 0 22px;font-size:.55rem">{ini}</span>'
-                f'<b style="font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{nm}</b>'
-                f'<span class="tnum mono" style="color:{c};font-size:.74rem">{"+" if pc>=0 else ""}{pc:.2f}%</span></div>')
-        ui.html("".join(rows))
-
-
-def render_account_mini(d):
-    pnl_pct = (d["total_pnl"] / d["cost"] * 100) if d["cost"] else 0.0
-    with ui.element("div").classes("mini"):
-        ui.html(
-            '<div class="mini-h">내 투자</div>'
-            f'<div class="mini-kpi"><span class="k">총 평가자산</span><span class="v mono">${_fmt(d["equity"])}</span></div>'
-            f'<div class="mini-kpi"><span class="k">가용 현금</span><span class="v mono">${_fmt(d["cash"])}</span></div>'
-            f'<div class="mini-kpi"><span class="k">평가손익</span>'
-            f'<span class="v mono" style="color:{_col(d["total_pnl"])}">'
-            f'{"+" if d["total_pnl"]>=0 else ""}${_fmt(d["total_pnl"])} ({pnl_pct:+.2f}%)</span></div>')
-
-
-def render_toss_table(d, state, select_cb):
-    with ui.element("div").classes("ttbl"):
-        ui.html('<div class="ttrow h"><div class="trank">#</div><div>종목</div>'
-                '<div class="tnum">현재가</div><div class="tnum">등락률</div>'
-                '<div>AI 스코어 비율</div><div>섹터</div><div class="tnum">보유</div></div>')
-        if not d["rows"]:
-            ui.html('<div class="empty">보유 종목이 없습니다 · 우측 레일 💵 주문으로 매수하세요.</div>')
-            return
-        for i, r in enumerate(d["rows"], 1):
-            dd = rtf.get_price(r["tk"]) or {}
-            pct = dd.get("change_pct", 0) * 100
-            cc = _col(pct)
-            ini, lc = _logo(r["tk"])
-            buy = max(0, min(100, int(r["score"])))
-            sell = 100 - buy
-            sel_cls = " sel" if state.get("sel") == r["tk"] else ""
-            el = ui.html(
-                f'<div class="ttrow r{sel_cls}"><div class="trank">{i}</div>'
-                f'<div class="tname"><span class="tlogo" style="background:{lc}">{ini}</span><b>{r["tk"]}</b></div>'
-                f'<div class="tnum mono">${_fmt(r["cur"])}</div>'
-                f'<div class="tnum" style="color:{cc}">{"+" if pct>=0 else ""}{pct:.2f}%</div>'
-                f'<div class="ratio"><span class="rnum"><span style="color:var(--up)">{buy}</span>'
-                f'<span style="color:var(--dn)">{sell}</span></span>'
-                f'<span class="rbar"><i style="width:{buy}%;background:var(--up)"></i>'
-                f'<i style="width:{sell}%;background:var(--dn)"></i></span></div>'
-                f'<div><span class="ind-tag">{SECTOR_KO.get(r["sector"], r["sector"] or "기타")}</span></div>'
-                f'<div class="tnum tsub">{r["held"]}d · {r["sh"]:g}주</div></div>')
-            el.on("click", lambda e, tk=r["tk"]: select_cb(tk))
-
-
-def render_right(d, state):
-    mode = state.get("rmode", "상세")
-    if mode == "상세":
-        render_detail(d, state)
-        render_account_mini(d)
-    elif mode == "내투자":
-        render_account_mini(d)
-        render_sector_alloc(d)
-    else:  # 실시간 / 관심
-        render_watchlist(d, 12)
-        render_account_mini(d)
 
 
 def render_bottom_bar():
