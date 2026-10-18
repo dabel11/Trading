@@ -471,6 +471,41 @@ def _is_owner(chat_id) -> bool:
     return _is_numeric_chat(_allowed_chat) and str(chat_id) == _allowed_chat
 
 
+_BOT_NAME: dict = {}
+
+
+def bot_username(token: str = "") -> str:
+    """봇 @username (getMe, 캐시). 실패 시 ''."""
+    try:
+        if not token:
+            import notifier
+            token = ((notifier.load_config().get("telegram") or {}).get("bot_token") or "").strip()
+        if not token:
+            return ""
+        if token in _BOT_NAME:
+            return _BOT_NAME[token]
+        r = requests.get(_API.format(token=token, method="getMe"), timeout=8).json()
+        name = (r.get("result") or {}).get("username", "") if r.get("ok") else ""
+        if name:
+            _BOT_NAME[token] = name
+        return name
+    except Exception:
+        return ""
+
+
+def owner_status() -> dict:
+    """알림 등록 상태 — UI 표시용."""
+    try:
+        import notifier
+        tg = notifier.load_config().get("telegram") or {}
+    except Exception:
+        tg = {}
+    owner = _owner_chat()
+    return {"enabled": bool(tg.get("enabled")), "has_token": bool(tg.get("bot_token")),
+            "registered": bool(owner), "chat_id": owner, "raw": str(tg.get("chat_id", "")),
+            "polling": bool(_started)}
+
+
 def push(text: str) -> bool:
     """소유자에게 능동 알림 전송(매매 체결·모드 변경 등). 설정 OK면 True."""
     try:
@@ -488,57 +523,79 @@ def push(text: str) -> bool:
         return False
 
 
+def _reg_msg(chat_id: str) -> str:
+    return ("✅ 알림 등록 완료!\n"
+            f"이 채팅(ID {chat_id})으로 알림을 보냅니다:\n"
+            "· 매매 체결(매수·매도)\n· AI 신규 매수 신호\n"
+            "· 자동매매 시작/정지 · 장 개장/마감 요약\n\n"
+            "명령어: /help · 현황: /status")
+
+
+def _msg_chat(u: dict) -> tuple:
+    msg = u.get("message") or u.get("edited_message") or {}
+    return (str((msg.get("chat") or {}).get("id", "")),
+            (msg.get("text") or "").strip())
+
+
+def _process_update(token: str, u: dict):
+    """업데이트 1건 처리. 소유자 미등록이면 '어떤 메시지든' 보낸 채팅을 소유자로 등록."""
+    chat_id, text = _msg_chat(u)
+    if not chat_id:
+        return
+    owner = _owner_chat()
+    if not owner:
+        if _adopt_chat(chat_id):
+            _send(token, chat_id, _reg_msg(chat_id))
+            owner = chat_id
+            # /start(딥링크 포함)·일반 메시지는 등록 안내로 충분 — 그 외 명령은 이어서 처리
+            first = text[1:].split()[0].split("@")[0].lower() if text.startswith("/") and len(text) > 1 else ""
+            if first in ("", "start", "id", "chatid", "myid", "아이디"):
+                return
+        else:
+            return
+    if chat_id != owner:
+        return                              # 소유자 외 무시(프라이버시)
+    if not text.startswith("/") or len(text) < 2:
+        _send(token, chat_id, "명령어 목록은 /help · 현황은 /status")
+        return
+    _send(token, chat_id, handle(text, chat_id))
+
+
 def poll_loop(token: str, allowed_chat_id: str = ""):
-    """롱폴링으로 명령 수신·응답. allowed_chat_id 가 있으면 그 채팅에만 응답(보안)."""
+    """롱폴링으로 명령 수신·응답. 소유자(숫자 Chat ID)에게만 응답.
+
+    · 소유자 미등록이면 첫 메시지(명령·일반 텍스트 무관)를 보낸 채팅을 자동 등록.
+    · 재시작 시 밀린 메시지: 오래된 '명령'은 실행하지 않지만(안전), 소유자 미등록이면
+      가장 최근 발신자를 등록해 재시작 중 보낸 /start 가 유실되지 않게 한다.
+    · 업데이트 단위 예외 격리 — 한 메시지의 오류가 폴링 스레드를 죽이지 않는다.
+    """
     token = (token or "").strip()
-    allowed = str(allowed_chat_id or "").strip()
     if not token:
         return
     offset = None
-    # 시작 시점 이전의 밀린 메시지는 건너뛴다(getUpdates offset 초기화)
     try:
         _init = _get_updates(token, None)
         if _init:
             offset = _init[-1]["update_id"] + 1
+            if not _owner_chat():
+                for u in reversed(_init):
+                    cid, _ = _msg_chat(u)
+                    if cid and _adopt_chat(cid):
+                        _send(token, cid, _reg_msg(cid))
+                        break
     except Exception:
         pass
     while not _stop.is_set():
-        for u in _get_updates(token, offset):
-            offset = u["update_id"] + 1
-            msg = u.get("message") or u.get("edited_message") or {}
-            text = (msg.get("text") or "").strip()
-            chat_id = str((msg.get("chat") or {}).get("id", ""))
-            if not text.startswith("/"):
-                continue
-            cmdname = text[1:].split()[0].split("@")[0].lower()
-            owner = _owner_chat()
-            # 부트스트랩: 소유자 미등록이면 /start·/id 로 들어온 숫자 chat_id 를 자동 등록
-            if not owner and cmdname in ("start", "id", "chatid", "myid", "아이디"):
-                if _adopt_chat(chat_id):
-                    owner = chat_id
-                    try:
-                        _send(token, chat_id,
-                              "✅ 이 채팅을 알림 받을 소유자로 등록했습니다.\n"
-                              f"Chat ID: {chat_id}\n이제 매매·모드 명령과 알림이 활성화됩니다. /help")
-                    except Exception:
-                        pass
-                    continue
-            # 소유자 등록 후에는 소유자에게만 응답(프라이버시)
-            if owner:
-                if chat_id != owner:
-                    continue
-            else:
-                # 아직 미등록 & 부트스트랩 명령 아님 → 안내만
+        try:
+            for u in _get_updates(token, offset):
+                offset = u["update_id"] + 1
                 try:
-                    _send(token, chat_id, "먼저 /id 또는 /start 를 보내 이 채팅을 등록하세요.")
+                    _process_update(token, u)
                 except Exception:
                     pass
-                continue
-            try:
-                _send(token, chat_id, handle(text, chat_id))
-            except Exception:
-                pass
-        _stop.wait(1.5)
+        except Exception:
+            pass
+        _stop.wait(1.0)
 
 
 def start(token: str, allowed_chat_id: str = "") -> bool:

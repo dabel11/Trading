@@ -801,15 +801,24 @@ class _PoCDaemon:
             pass
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
+        try:
+            c = load_config()
+            _tg_push(f"▶ 자동매매 시작\n전략 {c.get('strategy_name', c.get('strategy', '-'))} · "
+                     f"{'모의' if c.get('paper', True) else '🔴 실거래'} · {c.get('interval', 300)}초 주기")
+        except Exception:
+            pass
         return True
 
     def stop(self):
+        was = self.running()
         self._stop.set()
         try:
             _ctl_mod.set_enabled(False)
             _ctl_mod.cleanup_pid()
         except Exception:
             pass
+        if was:
+            _tg_push("■ 자동매매 정지")
 
     def run_once(self):
         threading.Thread(target=self._cycle, daemon=True).start()
@@ -882,14 +891,84 @@ def _write_bot_status():
         pass
 
 
+def _tg_push(text: str) -> bool:
+    try:
+        import telegram_bot as tb
+        return tb.push(text)
+    except Exception:
+        return False
+
+
+def _proactive_alerts(st: dict):
+    """소유자가 등록돼 있으면 능동 알림: 연결·장 개장/마감 요약·AI 신규 매수신호."""
+    import telegram_bot as tb
+    if not tb._owner_chat():
+        return
+    cfg = load_config()
+    paper = bool(cfg.get("paper", True))
+    mode = "모의" if paper else "🔴 실거래"
+    # 1) 연결 알림 (프로세스당 1회 / 등록 직후 1회)
+    if not st.get("boot"):
+        d = collect()
+        if _tg_push(f"🟢 AI 트레이딩 연결됨\n모드 {mode} · 전략 {cfg.get('strategy_name', cfg.get('strategy', '-'))}\n"
+                    f"총자산 ${d['equity']:,.0f} · 현금 ${d['cash']:,.0f} · 보유 {len(d['rows'])}종목\n"
+                    f"자동매매 {'ON' if DAEMON.running() else 'OFF'}"):
+            st["boot"] = True
+    # 2) 장 개장 / 마감 요약 (하루 1회씩)
+    try:
+        import market_hours as mh
+        mopen = bool(mh.is_market_open())
+    except Exception:
+        mopen = False
+    today = date.today().isoformat()
+    if mopen and st.get("open_day") != today:
+        d = collect()
+        _tg_push(f"🔔 미국장 개장\n총자산 ${d['equity']:,.0f} · 평가손익 ${d['total_pnl']:+,.0f}\n"
+                 f"보유 {len(d['rows'])}종목 · 자동매매 {'ON' if DAEMON.running() else 'OFF'} · {mode}")
+        st["open_day"] = today
+        st["sig_day"] = None
+    if (not mopen) and st.get("open_day") == today and st.get("close_day") != today:
+        d = collect()
+        movers = sorted(d["rows"], key=lambda r: -r["pnl_pct"])
+        top = " · ".join(f"{r['tk']} {r['pnl_pct']:+.1f}%" for r in movers[:3]) or "보유 없음"
+        _tg_push(f"🔕 미국장 마감\n총자산 ${d['equity']:,.0f} · 평가손익 ${d['total_pnl']:+,.0f}\n보유 상위: {top}")
+        st["close_day"] = today
+    # 3) AI 매수 신호 (장중 30분마다 검사, 하루 첫 회는 TOP5 요약, 이후 신규 진입만)
+    st["n"] = st.get("n", 0) + 1
+    if mopen and (st.get("sig_day") != today or st["n"] % 150 == 0):
+        try:
+            import watchlist as _wl
+            from influence import engine as _eng
+            th = int(cfg.get("min_score", 60))
+            _, verds = _eng.score_universe(list(_wl.load()), buy_th=th,
+                                           sell_th=int(cfg.get("sell_score", 35)))
+            buys = {t: v for t, v in verds.items() if v.score >= th}
+            if st.get("sig_day") != today:
+                top = sorted(buys.values(), key=lambda v: -v.score)[:5]
+                if top:
+                    _tg_push("🧠 오늘의 AI 매수 후보 TOP5\n" + "\n".join(
+                        f"🔴 {v.ticker} {v.score:.0f}점 · {v.rationale[:40]}" for v in top))
+                st["sig_day"] = today
+            else:
+                new = [buys[t] for t in buys if t not in st.get("last_buys", set())]
+                if new:
+                    _tg_push("🧠 AI 신규 매수 신호\n" + "\n".join(
+                        f"🔴 {v.ticker} {v.score:.0f}점 · {v.rationale[:40]}"
+                        for v in sorted(new, key=lambda v: -v.score)[:5]))
+            st["last_buys"] = set(buys)
+        except Exception:
+            pass
+
+
 def ensure_telegram_running():
-    """텔레그램 봇 기동(설정 시) + 상태 기록 루프. notifier 설정에서 토큰/채팅을 읽는다.
-    start()는 멱등 — 설정을 켜면 다음 루프에서 기동된다."""
+    """텔레그램 봇 기동 + 상태 기록 + 능동 알림 루프. 앱 시작 시(on_startup) 바로 구동.
+    start()는 멱등 — 설정을 켜면 다음 루프(12초)에서 기동된다."""
     if _TG_STARTED["on"]:
         return
     _TG_STARTED["on"] = True
 
     def _run():
+        st: dict = {}
         while True:
             try:
                 import telegram_bot as tb, notifier
@@ -899,6 +978,10 @@ def ensure_telegram_running():
             except Exception:
                 pass
             _write_bot_status()
+            try:
+                _proactive_alerts(st)
+            except Exception:
+                pass
             time.sleep(12)
     threading.Thread(target=_run, daemon=True).start()
 
@@ -2352,25 +2435,76 @@ def page_settings():
 
     # ── 텔레그램 봇 ──
     import notifier as _ntf
+    import telegram_bot as _tgb
     tg = (_ntf.load_config().get("telegram", {}) or {})
     with ui.element("div").classes("card").style("margin-bottom:12px"):
-        ui.html('<div class="sh2">텔레그램 봇 <small>· 원격 매매·모드전환·현황 알림</small></div>')
+        ui.html('<div class="sh2">텔레그램 알림 <small>· 매매 체결·AI 신호·장 요약·원격 매매</small></div>')
+
+        @ui.refreshable
+        def tg_status():
+            stt = _tgb.owner_status()
+            bot = _tgb.bot_username() if stt["has_token"] else ""
+            link = f"https://t.me/{bot}?start=reg" if bot else ""
+            if not stt["has_token"]:
+                ui.html('<div class="dai" style="border-color:rgba(240,69,79,.4);background:rgba(240,69,79,.08)">'
+                        '<div class="dai-ttl" style="color:#FF8A91">⚠️ 봇 토큰 없음</div>'
+                        '<div class="dai-rat">@BotFather 에서 봇을 만들고 토큰을 아래에 입력·저장하세요.</div></div>')
+            elif stt["registered"]:
+                ui.html(f'<div class="dai" style="border-color:rgba(48,209,88,.4);background:rgba(48,209,88,.08)">'
+                        f'<div class="dai-ttl" style="color:#4ADE80">✅ 알림 등록됨 · @{bot or "봇"}</div>'
+                        f'<div class="dai-rat">Chat ID {stt["chat_id"]} 로 체결·AI 신호·자동매매·장 개장/마감 알림을 보냅니다.'
+                        f'{"" if stt["polling"] else " (봇 기동 대기 중…)"}</div></div>')
+            else:
+                ui.html(f'<div class="dai" style="border-color:rgba(255,159,10,.45);background:rgba(255,159,10,.08)">'
+                        f'<div class="dai-ttl" style="color:#FFB340">⏳ 알림 미등록 — 한 번만 하면 됩니다</div>'
+                        f'<div class="dai-rat">텔레그램에서 <b>@{bot or "봇"}</b> 을 열고 <b>시작(Start)</b>을 누르거나 '
+                        f'<b>아무 메시지</b>나 보내세요. 그 채팅이 자동 등록되고 즉시 확인 메시지가 옵니다.'
+                        f'{"<br>바로가기: <b>" + link + "</b>" if link else ""}<br>'
+                        f'<span style="color:var(--t3)">(텔레그램 정책상 사용자가 먼저 말을 걸어야 봇이 보낼 수 있습니다)</span></div></div>')
+        tg_status()
+
         tg_en = ui.switch("봇 활성화", value=bool(tg.get("enabled"))).props("dense")
         tg_tok = ui.input("봇 토큰 (BotFather)", value=tg.get("bot_token", "")).props("outlined dense dark").classes("w-full")
-        tg_chat = ui.input("Chat ID (허용 채팅)", value=str(tg.get("chat_id", ""))).props("outlined dense dark").classes("w-full")
+        tg_chat = ui.input("Chat ID (자동 등록 — 비워둬도 됨)", value=str(tg.get("chat_id", ""))).props("outlined dense dark").classes("w-full")
 
         def _save_tg():
             nc = _ntf.load_config()
             nc.setdefault("telegram", {})
             nc["telegram"]["enabled"] = bool(tg_en.value)
             nc["telegram"]["bot_token"] = (tg_tok.value or "").strip()
-            nc["telegram"]["chat_id"] = (tg_chat.value or "").strip()
+            entered = (tg_chat.value or "").strip()
+            cur = _tgb._owner_chat()
+            if entered and not entered.lstrip("-").isdigit():
+                # 사용자명(@...)은 전송 불가 — 이미 숫자 등록돼 있으면 보존
+                if cur:
+                    entered = cur
+                ui.notify("Chat ID 는 숫자여야 합니다 — 봇에게 메시지를 보내면 자동 등록됩니다.",
+                          position="top", type="warning")
+            elif not entered and cur:
+                entered = cur
+            nc["telegram"]["chat_id"] = entered
             _ntf.save_config(nc)
             ui.notify("텔레그램 설정 저장됨 — 봇이 최대 12초 내 연결됩니다.", position="top", type="positive")
-        ui.button("텔레그램 저장", on_click=_save_tg).classes("tbtn tbtn-primary").style("margin-top:8px")
+            tg_status.refresh()
+
+        def _test_tg():
+            stt = _tgb.owner_status()
+            if not stt["has_token"]:
+                ui.notify("먼저 봇 토큰을 저장하세요.", position="top", type="warning"); return
+            if not stt["registered"]:
+                ui.notify("아직 미등록 — 텔레그램에서 봇에게 아무 메시지나 보내 주세요.",
+                          position="top", type="warning"); return
+            ok = _tgb.push("🔔 테스트 알림 — AI 트레이딩 앱에서 보냈습니다. 정상 연결됐어요!")
+            ui.notify("테스트 알림 전송 완료 — 텔레그램을 확인하세요." if ok else "전송 실패 — 토큰/네트워크 확인",
+                      position="top", type=("positive" if ok else "negative"))
+
+        with ui.row().style("margin-top:8px;gap:8px"):
+            ui.button("텔레그램 저장", on_click=_save_tg).classes("tbtn tbtn-primary")
+            ui.button("🔔 테스트 알림 보내기", on_click=_test_tg).classes("tbtn")
+            ui.button("↻ 상태 새로고침", on_click=tg_status.refresh).classes("tbtn")
         ui.html('<div style="font-size:.68rem;color:var(--t3);margin-top:9px;line-height:1.7">'
-                '· @BotFather 로 봇 생성 → 토큰 입력, 봇과 대화 시작 후 Chat ID 입력<br>'
-                '· 명령: <b>/help /mode /모의 /실거래 /buy AAPL 500 /sell AAPL /confirm</b></div>')
+                '· 알림: 매매 체결 · AI 신규 매수신호(장중 30분) · 자동매매 시작/정지 · 장 개장/마감 요약<br>'
+                '· 명령: <b>/help /status /ai /mode /모의 /실거래 /buy AAPL 500 /sell AAPL /confirm</b></div>')
 
     ui.html('<div class="sec-h" style="margin-top:4px">자동매매 파라미터</div>')
     # (key, label, value, kind)  kind: pct | int | text
@@ -2577,6 +2711,12 @@ if __name__ in {"__main__", "__mp_main__"}:
     try:
         from nicegui import core as _ngcore
         _ngcore.sio.eio.max_http_buffer_size = 32 * 1024 * 1024
+    except Exception:
+        pass
+    # 텔레그램 봇·알림은 페이지 로드와 무관하게 서버 시작 즉시 구동
+    try:
+        from nicegui import app as _ngapp
+        _ngapp.on_startup(ensure_telegram_running)
     except Exception:
         pass
     ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
