@@ -21,6 +21,8 @@ def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
     scores: [{"ticker", "score"}] 내림차순 · prices: {ticker: 현재가}
     regime: "bull"|"bear"|"neutral" (SPY vs 200일선 ±2%)
     """
+    if strategy == "ai_influencer":
+        return _score_ai(tickers, log=log)
     import backtester as bt
     key = tuple(sorted(tickers))
     now = time.time()
@@ -72,5 +74,37 @@ def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
                 s = 0.0
             scores.append({"ticker": t, "score": round(float(s), 1)})
 
+    scores.sort(key=lambda x: -x["score"])
+    return scores, prices, regime
+
+
+def _score_ai(tickers: list, log=None):
+    """AI 인플루언서 채점 — 2년치 Yahoo 번들(429 위험) 없이 동작.
+
+    가격: 실시간 피드 → Nasdaq 공개 시세. 국면: SPY vs 200일선(Nasdaq 일봉).
+    대상이 수십 종목으로 늘어도(전체 시장 스캔 상위 편입) 레이트리밋에 막히지 않는다.
+    """
+    import stock_browser as sb
+    from influence import engine as _eng
+    tickers = list(dict.fromkeys(t.upper() for t in tickers if t))
+    prices: dict = {}
+    try:
+        import realtime_feed as rtf
+        for t in tickers:
+            d = rtf.get_price(t)
+            if d and d.get("price"):
+                prices[t] = float(d["price"])
+    except Exception:
+        pass
+    missing = [t for t in tickers if t not in prices]
+    if missing:
+        try:
+            prices.update(sb.quote_prices(missing))
+        except Exception:
+            pass
+    regime = sb.market_regime()
+    valid = [t for t in tickers if prices.get(t, 0) > 0]
+    smap, _v = _eng.score_universe(valid, regime=regime, log=log)
+    scores = [{"ticker": t, "score": round(float(smap.get(t, 50.0)), 1)} for t in valid]
     scores.sort(key=lambda x: -x["score"])
     return scores, prices, regime

@@ -45,16 +45,19 @@ def score_universe(tickers: list, held: set | None = None, regime: str = "neutra
     #    (남은 종목은 빈 증거로 진행 → 최소 '중립' 판단은 보장).
     evidence_map: dict = {t: [] for t in tickers}
     deadline = 30.0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        futs = {pool.submit(providers.gather, t): t for t in tickers}
-        try:
-            for f in concurrent.futures.as_completed(futs, timeout=deadline):
-                try:
-                    evidence_map[futs[f]] = f.result() or []
-                except Exception:
-                    evidence_map[futs[f]] = []
-        except concurrent.futures.TimeoutError:
-            L(f"일부 소스 응답 지연 — {deadline:.0f}s 초과분은 건너뜀")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    futs = {pool.submit(providers.gather, t): t for t in tickers}
+    try:
+        for f in concurrent.futures.as_completed(futs, timeout=deadline):
+            try:
+                evidence_map[futs[f]] = f.result() or []
+            except Exception:
+                evidence_map[futs[f]] = []
+    except concurrent.futures.TimeoutError:
+        L(f"일부 소스 응답 지연 — {deadline:.0f}s 초과분은 건너뜀(백그라운드로 계속 수집)")
+    finally:
+        # 마감을 실제로 지킨다: 남은 작업은 기다리지 않음(진행 중인 건 캐시를 채우며 끝남)
+        pool.shutdown(wait=False, cancel_futures=True)
 
     # 2) AI 판단 (LLM 1콜 배치 or 규칙)
     items = [(t, evidence_map.get(t, []), _ctx(t, held, regime)) for t in tickers]
@@ -69,6 +72,11 @@ def score_universe(tickers: list, held: set | None = None, regime: str = "neutra
       f"매수의견 {n_buy} / 매도의견 {n_sell}")
 
     LAST.update(ts=now, verdicts=verdicts, by=by, regime=regime)
+    try:
+        from influence import scanner as _sc
+        _sc.merge(verdicts)
+    except Exception:
+        pass
     return ({t: verdicts[t].score for t in tickers if t in verdicts}, verdicts)
 
 
@@ -78,6 +86,13 @@ def verdict_for(ticker: str, buy_th: float = 60.0, sell_th: float = 35.0) -> ai_
     hit = LAST["verdicts"].get(ticker)
     if hit and time.time() - LAST["ts"] < _TTL:
         return hit
+    try:
+        from influence import scanner as _sc
+        fv = _sc.FULL.get(ticker)
+        if fv is not None and time.time() - fv.ts < 3600:
+            return fv
+    except Exception:
+        pass
     _, v = score_universe([ticker], buy_th=buy_th, sell_th=sell_th)
     return v.get(ticker) or ai_judge.Verdict(
         ticker, "HOLD", 50.0, 0.0, "데이터 없음", "rule", [])

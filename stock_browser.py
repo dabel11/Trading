@@ -656,6 +656,49 @@ def _nasdaq_quote(ticker: str) -> dict:
     return {}
 
 
+_QP_CACHE: dict = {}     # TK -> (ts, price)
+
+
+def quote_prices(tickers: list, ttl: float = 60.0, workers: int = 8) -> dict:
+    """여러 종목 현재가 {TK: price} — Nasdaq 공개 시세 병렬(레이트리밋 없음) + 캐시."""
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor
+    out, need = {}, []
+    now = _t.time()
+    for t in dict.fromkeys(x.upper() for x in tickers if x):
+        hit = _QP_CACHE.get(t)
+        if hit and now - hit[0] < ttl:
+            out[t] = hit[1]
+        else:
+            need.append(t)
+
+    def one(t):
+        q = _nasdaq_quote(t)
+        return t, float(q.get("price") or 0)
+    if need:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for t, px in ex.map(one, need):
+                if px > 0:
+                    out[t] = px
+                    _QP_CACHE[t] = (_t.time(), px)
+    return out
+
+
+def market_regime() -> str:
+    """SPY vs 200일선 ±2% → bull/bear/neutral (Nasdaq 일봉, Yahoo 무관)."""
+    try:
+        c = _nasdaq_daily("SPY", 12)
+        if len(c) >= 200:
+            px = c[-1]; ma = sum(c[-200:]) / 200.0
+            if px < ma * 0.98:
+                return "bear"
+            if px > ma * 1.02:
+                return "bull"
+    except Exception:
+        pass
+    return "neutral"
+
+
 def get_quote(ticker: str) -> dict:
     try:
         t    = yf.Ticker(ticker)

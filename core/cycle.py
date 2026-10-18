@@ -75,6 +75,19 @@ def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
             L(f"발굴 건너뜀: {e}")
 
     universe = wl.load()
+    # AI 전략: 전체 시장 스캔(S&P500+나스닥100) 상위 매수 종목을 대상에 편입
+    if sn == "ai_influencer" and cfg.get("ai_full_market", True):
+        try:
+            from influence import scanner as _sc
+            k = int(cfg.get("ai_top_k", 30))
+            extra = _sc.top_buys(k, float(cfg.get("min_score", 60)))
+            add = [t for t in extra if t not in universe]
+            if add:
+                universe = list(universe) + add
+                L(f"전체 시장 스캔 상위 {len(add)}종목 편입 → 대상 {len(universe)}종목")
+        except Exception:
+            pass
+    universe = list(dict.fromkeys(list(universe) + list(pm.positions.keys())))
     scores_raw, prices, regime = scoring.score(sn, universe, log=L)
 
     # 실시간 가격 오버레이 — 채점 번들(일봉, 3분 캐시)의 종가 대신 실시간

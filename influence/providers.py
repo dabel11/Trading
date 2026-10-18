@@ -32,6 +32,42 @@ def _finnhub():
     return _fh_client
 
 
+# ── Finnhub 전역 속도 제한 (무료 60회/분) ─────────────────────────────────
+# 전체 시장 스캔(저우선)이 한도를 독점하지 않도록, 저우선 스레드는 분당 40회까지만
+# 쓰고 나머지 여유는 자동매매 사이클·UI(고우선)에 남긴다.
+import threading as _th
+from collections import deque as _dq
+_FH_CALLS = _dq()
+_FH_LOCK = _th.Lock()
+_TL = _th.local()
+_FH_HI, _FH_LO = 57, 40
+
+
+def set_low_priority(on: bool = True):
+    """현재 스레드의 Finnhub 호출을 저우선으로 표시(전체 스캔 스레드용)."""
+    _TL.lo = bool(on)
+
+
+def _fh_wait():
+    cap = _FH_LO if getattr(_TL, "lo", False) else _FH_HI
+    while True:
+        with _FH_LOCK:
+            now = time.time()
+            while _FH_CALLS and now - _FH_CALLS[0] > 60.0:
+                _FH_CALLS.popleft()
+            if len(_FH_CALLS) < cap:
+                _FH_CALLS.append(now)
+                return
+            wait = 60.0 - (now - _FH_CALLS[0]) + 0.05
+        time.sleep(min(max(wait, 0.2), 2.0))
+
+
+def fh_usage() -> int:
+    with _FH_LOCK:
+        now = time.time()
+        return sum(1 for t in _FH_CALLS if now - t <= 60.0)
+
+
 def _finnhub_ready() -> bool:
     try:
         from config import FINNHUB_API_KEY as fk
@@ -61,8 +97,8 @@ def analyst(ticker: str) -> Evidence | None:
 
     def _fetch():
         try:
+            _fh_wait()
             data = _finnhub().recommendation_trends(ticker)
-            time.sleep(0.04)
             return data or []
         except Exception:
             return []
@@ -99,9 +135,9 @@ def insider(ticker: str) -> Evidence | None:
         try:
             end = datetime.now()
             start = end - timedelta(days=120)
+            _fh_wait()
             d = _finnhub().stock_insider_sentiment(
                 ticker, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-            time.sleep(0.04)
             return (d or {}).get("data") or []
         except Exception:
             return []
@@ -134,9 +170,9 @@ def news(ticker: str) -> Evidence | None:
             from signals.sentiment import _lexicon_score
             end = datetime.now()
             start = end - timedelta(days=7)
+            _fh_wait()
             arr = _finnhub().company_news(
                 ticker, _from=start.strftime("%Y-%m-%d"), to=end.strftime("%Y-%m-%d"))
-            time.sleep(0.04)
             if not arr:
                 return None
             heads = [f"{n.get('headline', '')} {n.get('summary', '')}" for n in arr[:40]]
@@ -235,6 +271,18 @@ def crowd(ticker: str, price_hint: float | None = None) -> Evidence | None:
     meta = ROSTER["crowd"]
 
     def _fetch():
+        # Nasdaq 일봉(레이트리밋 없음)으로 5·20일 모멘텀 → 0~100. 실패 시 yfinance 폴백.
+        try:
+            import stock_browser as _sb
+            c = _sb.chart_closes(ticker, "6mo", "1d", 40)
+            if c and len(c) >= 21:
+                cur = c[-1]
+                r5 = cur / c[-6] - 1 if c[-6] else 0.0
+                r20 = cur / c[-21] - 1 if c[-21] else 0.0
+                mom = r5 * 0.6 + r20 * 0.4
+                return round(min(100.0, max(0.0, 50 + mom * 250)), 1)
+        except Exception:
+            pass
         try:
             from signals.sentiment import _price_proxy
             return _price_proxy(ticker)   # 0~100

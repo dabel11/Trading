@@ -647,6 +647,10 @@ AI_STYLE = """
 .at-tabs .q-tab{ min-height:38px; padding:0 14px; font-weight:700; font-size:.82rem; }
 .at-tabs .q-tab--active{ color:var(--t1); }
 .at-panels, .at-panels .q-tab-panel{ background:transparent!important; }
+/* 탭 패널이 카드 높이에 맞춰 줄어들며 내용을 잘라 스크롤이 안 되던 문제 —
+   패널은 내용 높이 그대로 두고 바깥 카드(overflow:auto)가 스크롤하게 한다 */
+.at-panels{ flex:0 0 auto!important; height:auto!important; overflow:visible!important; }
+.at-panels .q-panel, .at-panels .q-panel-parent{ overflow:visible!important; height:auto!important; }
 /* 클릭 위치 미니 팝업 */
 .pop-anchor{ position:relative; }
 .mini-menu .q-menu, .mini-menu{ background:transparent!important; box-shadow:none!important; }
@@ -2114,8 +2118,53 @@ def page_ai():
     buy_th = int(cfg.get("min_score", 60))
     sell_th = int(cfg.get("sell_score", 35))
 
+    from influence import scanner as _sc
+    top_k = int(cfg.get("ai_top_k", 30))
+
+    # ── 🌐 전체 시장 AI 스캔 (S&P 500 + 나스닥 100) ──
+    ui.html('<div class="sh2" style="margin-top:14px">🌐 전체 시장 AI 스캔 '
+            '<small>· S&amp;P 500 + 나스닥 100 전 종목 · 백그라운드</small></div>')
+
+    @ui.refreshable
+    def full_box():
+        sm = _sc.summary(buy_th, sell_th)
+        tot, done = sm.get("total", 0), sm.get("done", 0)
+        pct = (done / tot * 100) if tot else 0
+        if sm.get("running"):
+            state_s = f'스캔 중 {done}/{tot}종목 ({pct:.0f}%) · Finnhub {_fh_rate()}회/분'
+        elif sm.get("finished"):
+            state_s = f'완료 · {_age(sm["finished"])} · 판단 {sm["judged"]}종목'
+        else:
+            state_s = "곧 시작합니다(앱 시작 후 백그라운드)"
+        ui.html(f'<div style="font-size:.72rem;color:var(--t2);margin:2px 0 6px">{state_s}</div>'
+                f'<div class="cbar" style="height:8px;margin-bottom:10px"><i style="width:{pct if sm.get("running") else (100 if sm.get("finished") else 0):.0f}%"></i></div>')
+        ui.html('<div class="tgt-sum">'
+                f'<div class="tgt-kpi"><div class="l">🔴 매수</div><div class="v" style="color:var(--up)">{sm["buy"]}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">⚪ 관망</div><div class="v">{sm["hold"]}</div></div>'
+                f'<div class="tgt-kpi"><div class="l">🔵 매도/회피</div><div class="v" style="color:var(--dn)">{sm["sell"]}</div></div></div>')
+        rk = _sc.ranked(40)
+        if not rk:
+            ui.html('<div class="empty">아직 판단된 종목이 없습니다 — 스캔이 진행되면 여기에 채워집니다.</div>')
+            return
+        ui.html(f'<div class="tgt-line">상위 {len(rk)}종목 (점수순) · 자동매매는 이 중 매수문턱 {buy_th}점 이상 '
+                f'상위 {top_k}종목을 대상에 편입합니다.</div>')
+        with ui.element("div").classes("tbl"):
+            ui.html('<div class="tr h" style="display:grid;grid-template-columns:34px 70px 70px 1fr;gap:6px">'
+                    '<div></div><div>종목</div><div class="num">점수</div><div>근거</div></div>')
+            for i, v in enumerate(rk, 1):
+                ui.html(f'<div class="tr r" style="display:grid;grid-template-columns:34px 70px 70px 1fr;gap:6px;font-size:.74rem">'
+                        f'<div style="color:var(--t3)">{i}</div><div class="tk">{v.ticker}</div>'
+                        f'<div class="num mono">{v.score:.0f} {_vpill(v.action)}</div>'
+                        f'<div style="color:var(--t3);overflow:hidden;white-space:nowrap;text-overflow:ellipsis">{v.rationale[:70]}</div></div>')
+    full_box()
+    with ui.row().style("gap:8px;margin:8px 0 4px"):
+        ui.button("↻ 지금 전체 재스캔", on_click=lambda: (_sc.start(), _sc.rescan_now(),
+                  ui.notify("전체 시장 재스캔을 시작합니다(백그라운드, 수 분~30분).", position="top"))).classes("tbtn")
+        ui.button("새로고침", on_click=full_box.refresh).classes("tbtn")
+    ui.timer(5.0, full_box.refresh)
+
     def _tickers():
-        """자동매매가 실제로 스캔하는 유니버스(watchlist) + 보유종목."""
+        """자동매매가 실제로 판단하는 대상: 워치리스트 + 전체 스캔 상위 매수 + 보유종목."""
         try:
             import watchlist as wl
             uni_list = list(wl.load() or [])
@@ -2125,12 +2174,19 @@ def page_ai():
             held = [r["tk"] for r in collect()["rows"]]
         except Exception:
             held = []
-        out = list(dict.fromkeys(uni_list + held))
+        extra = _sc.top_buys(top_k, buy_th) if cfg.get("ai_full_market", True) else []
+        out = list(dict.fromkeys(uni_list + extra + held))
         return out or ["AAPL", "MSFT", "NVDA"]
 
-    uni_n = len(_tickers())
-    ui.html(f'<div class="sh2" style="margin-top:14px">🎯 자동매매 타겟 스캔 '
-            f'<small>· 유니버스 {uni_n}종목 · 매수문턱 {buy_th}</small></div>')
+    _tk_all = _tickers()
+    uni_n = len(_tk_all)
+    try:
+        import watchlist as _wlm
+        _wl_n = len(_wlm.load() or [])
+    except Exception:
+        _wl_n = 0
+    ui.html(f'<div class="sh2" style="margin-top:14px">🎯 자동매매 대상 '
+            f'<small>· {uni_n}종목 = 워치리스트 {_wl_n} + 전체 스캔 상위 + 보유 · 매수문턱 {buy_th}</small></div>')
 
     busy = {"on": False}
 
@@ -2715,6 +2771,23 @@ def _at_params():
             '· 실거래에선 실행 주기를 300초(5분) 이상으로 권장</div>')
 
 
+def _fh_rate() -> int:
+    try:
+        from influence import providers as _pv
+        return _pv.fh_usage()
+    except Exception:
+        return 0
+
+
+def _start_scanner():
+    try:
+        if load_config().get("ai_full_market", True):
+            from influence import scanner as _sc
+            _sc.start(float(load_config().get("ai_scan_hours", 3)))
+    except Exception:
+        pass
+
+
 def _goto(name):
     _hooks.get("goto_tab", lambda n: None)(name)
 
@@ -3039,6 +3112,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         from nicegui import app as _ngapp
         _ngapp.on_startup(ensure_telegram_running)
         _ngapp.on_startup(_resume_auto)
+        _ngapp.on_startup(_start_scanner)
     except Exception:
         pass
     ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
