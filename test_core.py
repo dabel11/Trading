@@ -749,8 +749,10 @@ def test_dynamic_alloc_respects_seed_cap():
 
 def _backdate(pm, ticker, days=1):
     """포지션 진입일을 과거로 — 최소 보유일(MIN_HOLD_DAYS) 가드 통과용."""
-    from datetime import date as _d, timedelta as _td
-    pm.positions[ticker].entry_date = (_d.today() - _td(days=days)).isoformat()
+    # 로컬(KST) 날짜가 아니라 ET 거래일 기준 — KST 자정~ET 자정 사이엔 날짜가 하루 어긋난다
+    import portfolio
+    from datetime import timedelta as _td
+    pm.positions[ticker].entry_date = (portfolio._today() - _td(days=days)).isoformat()
     pm._save_state()
 
 
