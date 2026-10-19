@@ -807,6 +807,9 @@ def test_rotate_requires_score_margin():
     portfolio = _isolate_portfolio()
     pm = portfolio.PortfolioManager()
     pm.record_buy("OLD", shares=50, price=100, score=70)
+    # 당일 매수는 회전 대상이 아니므로(MIN_ROTATE_DAYS) 며칠 전 매수로 둔다
+    from datetime import timedelta as _td
+    pm.positions["OLD"].entry_date = (portfolio._today() - _td(days=3)).isoformat()
     # OLD 55(문턱 60 미달 → 목표 이탈) vs NEW 62 → 차이 7 < 마진 10 → 회전 안 함
     o = pm.generate_orders([_score("NEW", 62), _score("OLD", 55)],
                            {"OLD": 100, "NEW": 50},

@@ -42,6 +42,17 @@ TRAIL_GIVEBACK_PCT = 0.08
 # ROTATE_MARGIN : 슬롯이 꽉 찼을 때, 신규 후보가 최약 보유보다 이 점수 이상 높아야 교체
 REBAL_BAND = 0.25
 ROTATE_MARGIN = 10.0
+# MIN_ROTATE_DAYS : 이 일수 미만 보유는 회전(목표 이탈)으로 팔지 않는다. 손절·트레일링·점수 급락·
+#   보유만료 같은 위험 청산은 그대로. 재시작 직후 전체시장 스캔이 진행되며 순위가 바뀌어
+#   5분 전에 산 종목을 갈아타던 낭비를 막는다(2026-10-19 AAPL·GOOGL→GOOG 등, 감사 #18 회전율).
+MIN_ROTATE_DAYS = 1
+# 같은 발행사의 다른 주식 종류 — 한 종목만 보유(GOOGL 팔고 GOOG 사는 식의 무의미한 교체 방지)
+SAME_ISSUER = {"GOOG": "GOOGL", "BRK.A": "BRK.B", "FOX": "FOXA", "NWS": "NWSA",
+               "UA": "UAA", "LEN.B": "LEN", "HEI.A": "HEI", "BF.A": "BF.B"}
+
+
+def _issuer(ticker: str) -> str:
+    return SAME_ISSUER.get(ticker, ticker)
 
 # 매수 가격대 제한 — 사용자가 전략 선택에서 설정 (0 = 무제한).
 # 예: 하한 $20(동전주 배제), 상한 $500(고가주 배제 → 적은 시드로 분산 확보)
@@ -469,15 +480,19 @@ class PortfolioManager:
             if _sec:
                 _sec_cnt[_sec] = _sec_cnt.get(_sec, 0) + 1
         cands = []
+        _iss = {_issuer(t) for t in held_now}       # 같은 발행사 중복 진입 방지
         for s in _pre:
             if len(cands) >= MAX_POSITIONS:
                 break
             if s.ticker in held_now:
                 cands.append(s); continue
+            if _issuer(s.ticker) in _iss:
+                continue          # 같은 회사의 다른 주식 종류를 이미 보유/선택
             _sec = _sector_of(s.ticker)
             if _sec and _sec_cnt.get(_sec, 0) >= MAX_PER_SECTOR:
                 continue          # 섹터 포화 → 다음 점수 후보로
             cands.append(s)
+            _iss.add(_issuer(s.ticker))
             if _sec:
                 _sec_cnt[_sec] = _sec_cnt.get(_sec, 0) + 1
         base = MIN_SCORE_TO_BUY - 10.0            # 문턱 부근은 작게, 강한 신호는 크게
@@ -499,6 +514,8 @@ class PortfolioManager:
             _held_sc = score_map[t].total if t in score_map else 0.0
             if _best_new is None or _best_new - _held_sc < ROTATE_MARGIN:
                 continue        # 교체 이득 불충분 → 회전하지 않음
+            if p.days_held() < MIN_ROTATE_DAYS:
+                continue        # 당일 매수 → 회전 안 함(위험 청산은 1단계에서 이미 처리)
             price = current_prices.get(t, p.entry_price)
             peak_gain = ((p.peak_price - p.entry_price) / p.entry_price
                          if p.entry_price else 0.0)
