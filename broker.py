@@ -9,6 +9,9 @@ Paper trading by default — just change ALPACA_BASE_URL in config.py to go live
   - 취소 뒤에는 최종 상태(filled_qty)를 다시 읽어 체결분을 놓치지 않는다
   - 재시도는 '요청 − 누적 체결'만, 앞 주문의 종료가 확인된 뒤에만 낸다(과체결 방지)
   - 비대칭 실행: 매수는 추격 금지, 매도(청산)는 재가격 → 시장가로 끝까지 낸다
+  - 보호 주문: 매수 체결 뒤 브로커 서버에 GTC stop(또는 trailing_stop) 매도를 걸어 둔다
+    (place_protective_stop). 앱 매도 전에는 cancel_confirm 으로 먼저 내린다.
+  - 비상 정지: cancel_all_orders + close_all_positions(cancel_orders=True)
 """
 
 import time
@@ -269,6 +272,67 @@ class Broker:
             pass                       # 이미 체결/종료된 주문은 취소가 거부된다
         return self._poll_fill(order_id, timeout=timeout)
 
+    def cancel_confirm(self, order_id: str, timeout: float = 3.0) -> dict:
+        """주문 1건 취소 + 최종 상태 확인. {"status", "filled_qty", "fill_price"}.
+        status 가 최종 상태(canceled/filled/…)가 아니면 취소가 아직 확인되지 않은 것."""
+        fp, fq, st = self._cancel_confirm(order_id, timeout=timeout)
+        return {"status": st, "filled_qty": fq, "fill_price": fp}
+
+    def place_protective_stop(self, ticker: str, shares: int, *, client_order_id: str,
+                              stop_price: float | None = None,
+                              trail_percent: float | None = None) -> dict:
+        """브로커 측 보호 매도 — GTC stop(stop_price) 또는 trailing_stop(trail_percent).
+        앱·맥·인터넷이 죽어도 브로커 서버가 손절한다. 체결을 기다리지 않는다(평소엔 열려 있음).
+        같은 coid 가 이미 있으면 그 주문을 돌려준다(duplicate=True). 그 밖의 오류는 예외."""
+        from alpaca.trading.requests import StopOrderRequest, TrailingStopOrderRequest
+        common = dict(symbol=ticker, qty=int(shares), side=OrderSide.SELL,
+                      time_in_force=TimeInForce.GTC, client_order_id=client_order_id)
+        if trail_percent:
+            req = TrailingStopOrderRequest(trail_percent=round(float(trail_percent), 2),
+                                           **common)
+        else:
+            req = StopOrderRequest(stop_price=round(float(stop_price), 2), **common)
+        try:
+            o = self._trading.submit_order(req)
+        except Exception as e:
+            if not _is_duplicate(e):
+                raise
+            got = self.get_order_status(client_order_id=client_order_id)
+            if not got:
+                raise
+            return {**got, "duplicate": True}
+        return {"id": str(o.id), "coid": client_order_id, "status": _status_of(o) or "new",
+                "filled_qty": int(float(getattr(o, "filled_qty", 0) or 0)),
+                "fill_price": float(getattr(o, "filled_avg_price", 0) or 0),
+                "duplicate": False}
+
+    def cancel_all_orders(self) -> list[dict]:
+        """열린 주문 전부 취소 요청(비상 정지). [{"id", "status"(HTTP)}]. 실패는 예외."""
+        out = []
+        for r in self._trading.cancel_orders() or []:
+            out.append({"id": str(getattr(r, "id", "") or ""),
+                        "status": getattr(r, "status", None)})
+        return out
+
+    def close_all_positions(self) -> list[dict]:
+        """전 종목 시장가 청산(열린 주문 먼저 취소 — cancel_orders=True, 비상 정지).
+        [{"symbol", "order_id", "coid", "qty", "status"(주문), "http", "error"}]. 실패는 예외."""
+        out = []
+        for r in self._trading.close_all_positions(cancel_orders=True) or []:
+            body = getattr(r, "body", None)
+            http = getattr(r, "status", None)
+            ok = isinstance(http, int) and 200 <= http < 300
+            out.append({
+                "symbol": str(getattr(r, "symbol", "") or "").upper(),
+                "order_id": str(getattr(r, "order_id", "") or getattr(body, "id", "") or ""),
+                "coid": str(getattr(body, "client_order_id", "") or ""),
+                "qty": float(getattr(body, "qty", 0) or 0),
+                "status": _status_of(body) if ok and body is not None else "rejected",
+                "http": http,
+                "error": "" if ok else str(getattr(body, "message", "") or body or "")[:200],
+            })
+        return out
+
     def place_buy(self, ticker: str, shares: int,
                   client_order_id: str | None = None) -> dict:
         return self._submit(ticker, shares, OrderSide.BUY, "buy",
@@ -493,6 +557,10 @@ class Broker:
                 "qty": float(getattr(o, "qty", 0) or 0),
                 "filled_qty": float(getattr(o, "filled_qty", 0) or 0),
                 "status": _status_of(o),
+                "type": str(getattr(o, "order_type", None) or getattr(o, "type", "")
+                            or "").split(".")[-1].lower(),
+                "stop_price": float(getattr(o, "stop_price", 0) or 0),
+                "trail_percent": float(getattr(o, "trail_percent", 0) or 0),
             })
         return out
 

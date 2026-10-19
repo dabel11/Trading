@@ -11,6 +11,8 @@
   /buy T 500  T 종목을 $500어치 매수 (/buy T 3주 = 3주) → /confirm 으로 확정
   /sell T     T 전량 매도 (/sell T 2 = 2주만)          → /confirm 으로 확정
   /confirm    대기 중인 주문 확정 실행  · /cancel 취소
+  /resume     매매 중단(대조 불일치·장부 손상·비상 정지) 사유 확인 → /confirm 으로 해제
+  /panic      비상 정지: 열린 주문 전부 취소 + 전 종목 청산 + 자동매매 정지 → /confirm
   /help       명령어 목록
 
 상태 조회는 bot_status.json(앱·데몬이 기록)만 읽고, 매매는 장부 모듈을 직접
@@ -243,6 +245,9 @@ def cmd_help(_s: dict) -> str:
             "/buy AAPL 3주 — 3주 매수\n"
             "/sell AAPL — 전량 매도 (/sell AAPL 2 = 2주)\n"
             "/confirm — 주문 확정 · /cancel — 취소\n"
+            "─ 안전 ─\n"
+            "/resume — 매매 중단 사유 확인·해제 (/confirm 으로 확정)\n"
+            "/panic — 비상 정지: 주문 취소+전량 청산+자동매매 정지 (/confirm)\n"
             "/help — 도움말")
 
 
@@ -384,12 +389,69 @@ def cmd_sell(args: list, chat_id: str) -> str:
             f"90초 내 /confirm 으로 확정 · /cancel 취소")
 
 
+def cmd_resume(chat_id: str) -> str:
+    """/resume — 매매 중단 사유를 보여 주고 /confirm 대기(2단계)."""
+    from core import emergency
+    st = emergency.status()
+    if not st["halted"]:
+        _pending.pop(chat_id, None)
+        return "✅ 매매 중단 상태가 아닙니다."
+    if st.get("journal_error"):
+        return ("🛑 주문 저널 손상으로 실거래 전면 중단\n" + st["reason"]
+                + "\n/resume 으로는 풀 수 없습니다 — 백업에서 order_intents.json 을 되살리세요.")
+    extra = "".join(f"\n· 함께 감지: {v.get('reason')}" for v in st["also"].values())
+    hint = {"ledger": "\n먼저 backups/ 의 백업으로 장부를 되살린 뒤 해제하세요.",
+            "reconcile": "\n장부가 브로커와 다르면 다음 사이클에 다시 멈춥니다.",
+            "panic": "\n해제해도 자동매매는 꺼진 채로 남습니다(앱에서 다시 시작)."
+            }.get(st["by"], "")
+    _pending[chat_id] = {"action": "resume", "ts": time.time()}
+    return (f"🛑 매매 중단 중 — {st['label']}\n{st['reason']}"
+            + (f"\n시작: {st['since']}" if st["since"] else "") + extra + hint
+            + "\n\n90초 내 /confirm 으로 해제 · /cancel 취소")
+
+
+def cmd_panic(chat_id: str) -> str:
+    """/panic — 비상 정지 미리보기 후 /confirm 대기(2단계)."""
+    paper = _cfg_paper()
+    try:
+        from portfolio import PortfolioManager
+        pos = PortfolioManager(paper=paper).positions
+    except Exception:
+        pos = {}
+    names = ", ".join(sorted(pos)) or "없음"
+    _pending[chat_id] = {"action": "panic", "paper": paper, "ts": time.time()}
+    what = ("브로커의 열린 주문을 전부 취소하고 전 종목을 시장가로 청산합니다(실제 계좌)."
+            if not paper else "모의 장부의 전 종목을 현재가로 청산합니다.")
+    return (f"🚨 비상 정지 미리보기 ({'모의' if paper else '⚠️ 실거래'})\n"
+            f"{what}\n자동매매를 끄고"
+            + ("" if paper else " 매수를 중단(해제는 /resume)") + "합니다.\n"
+            f"보유 {len(pos)}종목: {names}\n\n"
+            "90초 내 /confirm 으로 실행 · /cancel 취소")
+
+
+def _confirm_action(p: dict) -> str:
+    from core import emergency
+    if p["action"] == "resume":
+        return emergency.resume(by="telegram")["message"]
+    if bool(p.get("paper")) != _cfg_paper():
+        return "⛔ 미리보기 뒤 매매 모드가 바뀌었습니다 — /panic 부터 다시 하세요."
+    try:
+        r = emergency.panic(paper=p.get("paper"), source="telegram",
+                            alert_fn=lambda m: None)
+    except Exception as e:
+        return (f"❌ 비상 정지 실패: {e}\n"
+                "자동매매 정지는 기록됐습니다. 브로커 앱/웹에서 직접 청산하세요.")
+    return r["message"]
+
+
 def cmd_confirm(chat_id: str) -> str:
     p = _pending.pop(chat_id, None)
     if not p:
         return "대기 중인 주문이 없습니다 (/buy 또는 /sell 먼저)"
     if time.time() - p["ts"] > _PENDING_TTL:
         return "주문이 만료됐습니다(90초 초과) — 다시 시도하세요"
+    if p.get("action"):
+        return _confirm_action(p)
     tk, side, paper = p["ticker"], p["side"], p["paper"]
     qty = int(p["shares"])
     price = _quote(tk) or p["est_price"]
@@ -422,6 +484,8 @@ _HANDLERS = {
 }
 
 _TRADE_CMDS = {"buy", "sell", "confirm", "cancel"}
+_SAFETY_CMDS = {"resume": "resume", "재개": "resume", "해제": "resume",
+                "panic": "panic", "비상": "panic", "비상정지": "panic"}
 _MODE_CMDS = {"mode", "paper", "live", "모의", "실거래"}
 _allowed_chat = ""   # start()에서 설정 — 매매 명령은 이 채팅에서만
 
@@ -450,6 +514,12 @@ def handle(text: str, chat_id: str = "") -> str:
         if cmd in ("live", "실거래"):
             return cmd_mode(["live"] + args)          # /실거래 1234 = 확인 코드
         return cmd_mode(args)
+    if cmd in _SAFETY_CMDS:
+        if not _is_owner(chat_id):
+            return "⛔ 매매 중단 해제·비상 정지는 등록된 Chat ID에서만 가능합니다 (/id 로 등록)"
+        if _SAFETY_CMDS[cmd] == "resume":
+            return cmd_resume(chat_id)
+        return cmd_panic(chat_id)
     if cmd in _TRADE_CMDS:
         # 매매는 등록된 Chat ID에서만 (오픈 채팅 매매 차단)
         if not _is_owner(chat_id):
