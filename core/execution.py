@@ -14,6 +14,11 @@
   - 사이클 시작 대조(reconcile_live): 브로커가 진실 — 미해결 의도를 브로커 상태로
     확정·반영하고, 허용치를 넘는 장부↔브로커 불일치면 매수 중단 + 경보
     (손절·청산 매도는 브로커 보유 한도 안에서 계속).
+  - 브로커 측 보호 주문(무인 운영 안전): 매수가 체결되면 그 종목 보유 전량에 GTC stop
+    (설정 broker_stop = stop | trailing | off, 손절률 stop_loss)을 브로커 서버에 건다.
+    앱 측 매도는 그 stop 을 먼저 취소하고 취소가 확인된 뒤에만 낸다(묶인 수량 때문에
+    거부되거나 stop 과 이중 매도되지 않게). 매도 뒤 남은 보유에는 다시 건다. 대조는
+    보유 종목마다 보호 주문이 있는지 보고 없거나 수량·가격이 어긋나면 다시 건다.
 """
 import threading
 import time
@@ -104,6 +109,8 @@ RISK_DEFAULTS = {
     "max_requote": 0.02,         # 자동 매수: 재확인 가격이 결정 가격과 이만큼 다르면 거부
     "reconcile_tol_shares": 0,   # 대조 허용 오차(주)
     "reconcile_ignore": [],      # 대조에서 뺄 종목(앱 밖에서 직접 관리하는 보유)
+    "broker_stop": "stop",       # 브로커 측 보호 주문: stop(고정 손절가) | trailing | off
+    "stop_loss": 0.07,           # 보호 stop 손절률(설정의 손절 값과 같은 키)
 }
 
 
@@ -148,6 +155,9 @@ def pre_trade_check(side: str, ticker: str, qty: int, est_price: float, *,
       매도는 거부하지 않고 새 호가로 지정가를 다시 잡는다(위험을 줄이는 주문).
     - 매수: 주문당 최대 금액 · 일 최대 주문 수
     - 매도: 브로커 보유 − 열린 매도 주문으로 수량을 자른다(숏 방지). 조회 실패면 거부.
+      이 앱의 보호 stop 은 '열린 매도'에서 빼고 protect_qty 로 따로 돌려준다 — 호출부가
+      매도 직전에 취소(_drop_protect)하므로 그 수량은 매도 가능분이다. 취소가 확인되지
+      않으면 호출부가 매도를 보류한다(stop 과 이중 매도 방지).
     """
     est = float(est_price or 0)
     qty = int(qty)
@@ -187,13 +197,21 @@ def pre_trade_check(side: str, ticker: str, qty: int, est_price: float, *,
         n = _it.count_today(journal)
         if n >= int(limits["max_orders_per_day"]):
             return no(f"일 최대 주문 수 도달({n}/{int(limits['max_orders_per_day'])})")
-    else:
+    protect_qty = 0.0
+    if side != "buy":
+        own = _it.protect_coids(journal)
         try:
             held = float((broker.get_positions(strict=True).get(ticker) or {})
                          .get("shares") or 0)
-            open_sell = sum(max(0.0, o["qty"] - o["filled_qty"])
-                            for o in broker.get_open_orders()
-                            if o["symbol"] == ticker.upper() and o["side"] == "sell")
+            open_sell = 0.0
+            for o in broker.get_open_orders():
+                if o["symbol"] != ticker.upper() or o["side"] != "sell":
+                    continue
+                rest = max(0.0, o["qty"] - o["filled_qty"])
+                if o.get("coid") in own:
+                    protect_qty += rest
+                else:
+                    open_sell += rest
         except Exception as e:
             return no(f"브로커 보유 조회 실패 — 매도 보류(숏 방지): {e}")
         avail = int(held - open_sell + 1e-9)
@@ -201,7 +219,8 @@ def pre_trade_check(side: str, ticker: str, qty: int, est_price: float, *,
             return no(f"브로커 매도 가능 수량 없음(보유 {held:g} · 열린 매도 "
                       f"{open_sell:g}) — 숏 방지")
         qty = min(qty, avail)
-    return {"ok": True, "reason": "", "qty": qty, "est_price": est}
+    return {"ok": True, "reason": "", "qty": qty, "est_price": est,
+            "protect_qty": protect_qty}
 
 
 def _num(q: float):
@@ -251,6 +270,304 @@ def _book(rec: dict, pm) -> tuple:
                        reason=rec.get("reason") or "manual", shares=_num(q))
     _it.mark_booked(rec, q, px)
     return _num(q), px
+
+
+# ── 브로커 측 보호 주문 ──────────────────────────────────────────────────
+
+def _protect_mode(lim: dict) -> Optional[tuple]:
+    """(종류 "stop"|"trailing", 손절률) 또는 None(끔)."""
+    mode = str(lim.get("broker_stop") or "off").strip().lower()
+    try:
+        sl = float(lim.get("stop_loss") or 0)
+    except (TypeError, ValueError):
+        sl = 0.0
+    if mode not in ("stop", "trailing") or not 0 < sl < 1:
+        return None
+    return mode, sl
+
+
+def _open_child_qty(rec: dict) -> float:
+    return sum(max(0.0, float(c.get("qty") or 0) - float(c.get("filled_qty") or 0))
+               for c in rec["orders"]
+               if str(c.get("status") or "").lower() not in _it.CHILD_FINAL)
+
+
+def _drop_protect(broker, j: dict, ticker: str, pm, L) -> tuple:
+    """앱 매도 직전 — 이 종목의 보호 stop 을 취소하고 최종 상태를 확인한다.
+
+    취소 직전에 stop 이 (일부) 체결됐으면 그 체결을 바로 장부에 반영한다(브로커 손절).
+    반환 (취소 확인됨, [(수량, 가격, 손익률)…]). 확인되지 않으면 호출부는 매도를
+    내지 않는다 — 살아 있는 stop 과 앱 매도가 둘 다 체결되면 이중 매도(숏)다.
+    조회 오류는 예외로 올린다(호출부가 매도 보류)."""
+    ok, fills = True, []
+    for rec in _it.unresolved(j, ticker, protect=True):
+        for c in rec["orders"]:
+            if str(c.get("status") or "").lower() in _it.CHILD_FINAL:
+                continue
+            oid = c.get("id")
+            if not oid:
+                got = broker.get_order_status(client_order_id=c.get("coid"))
+                if got is None:
+                    c["status"] = "not_found"
+                    continue
+                oid = got["id"]
+                c.update(id=oid, status=got["status"])
+            r = broker.cancel_confirm(oid)
+            c.update(status=r["status"],
+                     filled_qty=max(int(r["filled_qty"] or 0), int(c.get("filled_qty") or 0)),
+                     fill_price=r["fill_price"] or c.get("fill_price") or 0.0)
+        _it.refresh(rec, final=True)
+        if _it.has_open_child(rec):
+            ok = False
+        ent = pm.positions.get(ticker)
+        q, px = _book(rec, pm)
+        if q:
+            pnl = ((px - ent.entry_price) / ent.entry_price
+                   if ent and ent.entry_price else None)
+            log_order(ticker, "sell", q, px, source="broker_stop", pnl_pct=pnl,
+                      reason=rec.get("reason") or "stop_loss")
+            L(f"브로커 보호 stop 체결 반영: {ticker} {q}주 @ ${px:.2f}")
+            fills.append((q, px, pnl))
+    _it.save(j)
+    return ok, fills
+
+
+def _ensure_protect(broker, j: dict, ticker: str, pm, lim: dict, L, *,
+                    anchor: Optional[str] = None, bpos: Optional[dict] = None,
+                    bopen: Optional[list] = None) -> dict:
+    """이 종목 보유에 맞는 보호 stop 이 브로커에 걸려 있게 한다.
+
+    목표 수량 = min(장부 보유, 브로커 보유 − 이 앱 보호 stop 외 열린 매도) — 장부가
+    브로커보다 많아도(대조 불일치) 브로커에 있는 만큼만, 매도가 진행 중이면 그만큼 빼고.
+    이미 맞는 stop 이 있으면 그대로, 수량·가격이 어긋나면 취소 확인 후 다시 건다.
+    목표가 0 이면 남은 stop(고아)을 내린다.
+    반환 {"action": ok|placed|replaced|canceled|skip|error, "note"}. 조회 오류는 예외."""
+    T = ticker.upper()
+    pmode = _protect_mode(lim)
+    if pmode is None:
+        return {"action": "skip", "note": "보호 주문 꺼짐"}
+    mode, sl = pmode
+    if bpos is None:
+        bpos = broker.get_positions(strict=True)
+    if bopen is None:
+        bopen = broker.get_open_orders()
+    own_coids = _it.protect_coids(j)
+    bp = bpos.get(T) or {}
+    held = float(bp.get("shares") or 0)
+    px = float(bp.get("market_value") or 0) / held if held else 0.0
+    other_sell = sum(max(0.0, o["qty"] - o["filled_qty"]) for o in bopen
+                     if o["symbol"] == T and o["side"] == "sell"
+                     and o.get("coid") not in own_coids)
+    pos = pm.positions.get(T)
+    led = float(pos.shares) if pos else 0.0
+    want = int(min(led, held - other_sell) + 1e-9)
+    own = [r for r in _it.unresolved(j, T, protect=True) if _it.has_open_child(r)]
+
+    if want < 1:
+        if not own:
+            return {"action": "ok", "note": ""}
+        ok, _ = _drop_protect(broker, j, T, pm, L)
+        return {"action": "canceled" if ok else "error",
+                "note": "보유 없음 — 보호 stop 내림" if ok else "보호 stop 취소 미확정"}
+
+    stop_px = round(float(pos.entry_price) * (1 - sl), 2) if mode == "stop" else None
+    trail = round(sl * 100, 2) if mode == "trailing" else None
+    if mode == "stop" and not (stop_px and stop_px > 0):
+        return {"action": "error", "note": "평단가를 몰라 손절가 계산 불가"}
+    if own:
+        cur = own[-1]["orders"][-1]
+        same = (len(own) == 1 and abs(_open_child_qty(own[0]) - want) < 1e-9
+                and (abs(float(cur.get("stop_price") or 0) - stop_px) < 0.01
+                     if stop_px else abs(float(cur.get("trail_percent") or 0) - trail) < 1e-6))
+        if same:
+            return {"action": "ok", "note": ""}
+        ok, fills = _drop_protect(broker, j, T, pm, L)
+        if not ok:
+            return {"action": "error", "note": "기존 보호 stop 취소 미확정 — 재설정 보류"}
+        if fills:                      # 그 사이 stop 이 체결됨 — 다음 대조에서 다시 맞춘다
+            return {"action": "skip", "note": "기존 보호 stop 체결 — 다음 대조에서 재설정"}
+    if stop_px and px and px <= stop_px:
+        return {"action": "skip",
+                "note": f"현재가 ${px:.2f} ≤ 손절선 ${stop_px:.2f} — 앱 손절에 맡김"}
+
+    if anchor is None:
+        anchor = f"{_mh.trading_day().strftime('%Y%m%d')}-{_it.default_cycle_id('reconcile')}-{T}"
+    iid = _it.protect_intent_id(j, anchor)
+    rec = _it.open_intent(j, iid, ticker=T, side="sell", qty=want,
+                          est_price=stop_px or px, source="broker_stop",
+                          reason="stop_loss (브로커 보호 stop)", kind=_it.PROTECT)
+    child = {"coid": _it.coid_base(iid), "id": None, "qty": want,
+             "kind": "stop" if stop_px else "trailing_stop",
+             "stop_price": stop_px, "trail_percent": trail,
+             "status": "pending_submit", "filled_qty": 0, "fill_price": 0.0}
+    _it.upsert_child(rec, child)
+    _it.save(j)                                   # write-ahead — 제출보다 먼저 디스크에
+    try:
+        r = broker.place_protective_stop(T, want, client_order_id=child["coid"],
+                                         stop_price=stop_px, trail_percent=trail)
+    except Exception as e:
+        from broker import _definite_reject
+        child.update(status="rejected" if _definite_reject(e) else "unknown",
+                     error=str(e)[:200])
+        _it.upsert_child(rec, child)
+        _it.refresh(rec, final=True)              # unknown 은 열린 채 → 대조가 coid 로 확정
+        _it.save(j)
+        return {"action": "error", "note": f"보호 stop 제출 실패: {str(e)[:80]}"}
+    child.update(id=r.get("id"), status=r.get("status") or "new",
+                 filled_qty=r.get("filled_qty") or 0, fill_price=r.get("fill_price") or 0.0)
+    _it.upsert_child(rec, child)
+    _it.refresh(rec, final=True)
+    _it.save(j)
+    what = f"${stop_px:.2f} stop" if stop_px else f"trailing {trail:g}%"
+    return {"action": "replaced" if own else "placed",
+            "note": f"보호 {what} {want}주 (coid {child['coid']})"}
+
+
+def _reprotect(broker, j: dict, ticker: str, pm, lim: dict, L,
+               anchor: Optional[str] = None):
+    """매수 체결·매도 시도 뒤 — 보호 stop 을 보유에 맞춘다. 실패는 로그만 남기고
+    다음 사이클 대조(reconcile_live)가 다시 시도·경보한다."""
+    if _protect_mode(lim) is None:
+        return
+    try:
+        pm._load_state()
+        p = pm.positions.get(ticker)
+        if (p is None or float(p.shares) < 1) and not _it.unresolved(j, ticker, protect=True):
+            return
+        r = _ensure_protect(broker, j, ticker, pm, lim, L, anchor=anchor)
+    except Exception as e:
+        L(f"{ticker}: 보호 stop 설정 실패 — 다음 대조에서 재시도 ({e})")
+        return
+    if r["action"] != "ok" and r["note"]:
+        L(f"{ticker}: {r['note']}")
+
+
+def _live_sell(broker, j: dict, lim: dict, pm, o: dict, qty: int, pos, cyc: str,
+               src: str, price_ts, L, out: dict) -> Optional[tuple]:
+    """자동 실거래 매도 1건: 보호 stop 취소 확인 → 사전 게이트 → 주문 → 장부 반영 →
+    남은 보유에 보호 stop 재설정. 반환 (반영 수량, 가격, 손익률) 또는 None(건너뜀)."""
+    from broker import validate_fill
+    t = o["ticker"]
+    try:
+        try:
+            dropped, sfills = _drop_protect(broker, j, t, pm, L)
+        except Exception as e:
+            L(f"매도 보류 {t}: 보호 stop 확인 실패 — {e}")
+            out["skipped"].append(t)
+            return None
+        for q, px, pnl in sfills:
+            out["sold"].append({"ticker": t, "shares": q, "price": px,
+                                "pnl_pct": pnl, "reason": "broker_stop"})
+        if not dropped:
+            L(f"매도 보류 {t}: 보호 stop 취소 미확정 — stop 과 이중 매도 방지(다음 사이클 재시도)")
+            out["skipped"].append(t)
+            return None
+        if sfills:
+            pm._load_state()
+            pos = pm.positions.get(t)
+            if pos is None or int(pos.shares) < 1:
+                L(f"{t}: 브로커 보호 stop 으로 이미 청산됨 — 앱 매도 생략")
+                return None
+            qty = min(qty, int(pos.shares))
+        g = pre_trade_check("sell", t, qty, o["est_price"], broker=broker, journal=j,
+                            limits=lim, price_ts=price_ts)
+        if not g["ok"]:
+            L(f"매도 보류 {t}: {g['reason']}")
+            out["skipped"].append(t)
+            return None
+        res, rec = _live_order(broker, j, ticker=t, side="sell", qty=g["qty"],
+                               est_price=g["est_price"], cycle_id=cyc, source=src,
+                               reason=o["reason"])
+        if res is None:
+            L(f"매도 중복 차단(같은 의도 이미 실행): {t}")
+            out["skipped"].append(t)
+            return None
+        if res.get("note"):
+            L(f"{t}: {res['note']}")
+        v = validate_fill(res, est_price=g["est_price"], req_shares=g["qty"])
+        pnl_px = res.get("fill_price") or g["est_price"]
+        pnl = (pnl_px - pos.entry_price) / pos.entry_price if pos.entry_price else 0.0
+        q, fp = _book(rec, pm)
+        _it.save(j)
+        if _it.is_unresolved(rec):
+            out["pending"].append(t)
+            L(f"{t}: 열린 매도 주문 추적 중 — 다음 대조에서 확정")
+        if q <= 0:
+            L(f"매도 보류 {t}: {v['warning'] or '체결 없음'}")
+            out["skipped"].append(t)
+            return None
+        if v["warning"]:
+            L(f"{t}: {v['warning']}")
+        return q, fp, pnl
+    finally:
+        _reprotect(broker, j, t, pm, lim, L)
+
+
+def _clear_protect_for_buy(broker, j: dict, t: str, pm, L, out: Optional[dict]) -> bool:
+    """추가 매수 전 — 열린 보호 stop 을 내린다. Alpaca 는 반대 방향 열린 주문이 있으면
+    매수를 wash trade 로 거부할 수 있고, 어차피 매수 뒤 보유 전량으로 다시 건다.
+    내릴 수 없거나(취소 미확정) 그 사이 stop 이 체결됐으면(방금 손절) False — 매수 보류."""
+    if not _it.unresolved(j, t, protect=True):
+        return True
+    try:
+        dropped, sfills = _drop_protect(broker, j, t, pm, L)
+    except Exception as e:
+        L(f"매수 보류 {t}: 보호 stop 확인 실패 — {e}")
+        return False
+    for q, px, pnl in sfills:
+        if out is not None:
+            out["sold"].append({"ticker": t, "shares": q, "price": px,
+                                "pnl_pct": pnl, "reason": "broker_stop"})
+    if not dropped:
+        L(f"매수 보류 {t}: 보호 stop 취소 미확정")
+        return False
+    if sfills:
+        L(f"매수 보류 {t}: 방금 브로커 보호 stop 으로 손절됨")
+        return False
+    return True
+
+
+def _live_buy(broker, j: dict, lim: dict, pm, o: dict, qty: int, cyc: str,
+              src: str, price_ts, L, out: dict) -> Optional[tuple]:
+    """자동 실거래 매수 1건: 사전 게이트 → (보유 중이면 보호 stop 내림) → 주문 →
+    장부 반영 → 보유 전량에 보호 stop. 반환 (반영 수량, 평균가) 또는 None(건너뜀)."""
+    from broker import validate_fill
+    t = o["ticker"]
+    g = pre_trade_check("buy", t, qty, o["est_price"], broker=broker, journal=j,
+                        limits=lim, price_ts=price_ts)
+    if not g["ok"]:
+        L(f"매수 보류 {t}: {g['reason']}")
+        out["skipped"].append(t)
+        return None
+    iid = _it.make_intent_id(cyc, t, "buy")
+    try:
+        if not _clear_protect_for_buy(broker, j, t, pm, L, out):
+            out["skipped"].append(t)
+            return None
+        res, rec = _live_order(broker, j, ticker=t, side="buy", qty=qty,
+                               est_price=o["est_price"], cycle_id=cyc, source=src,
+                               score=o.get("score", 0))
+        if res is None:
+            L(f"매수 중복 차단(같은 의도 이미 실행): {t}")
+            out["skipped"].append(t)
+            return None
+        if res.get("note"):
+            L(f"{t}: {res['note']}")
+        v = validate_fill(res, est_price=o["est_price"], req_shares=qty)
+        q, price = _book(rec, pm)
+        _it.save(j)
+        if _it.is_unresolved(rec):
+            out["pending"].append(t)
+            L(f"{t}: 미확정 매수 주문 — 다음 대조에서 확정")
+        if q <= 0:
+            L(f"매수 보류 {t}: {v['warning'] or '체결 없음'}")
+            out["skipped"].append(t)
+            return None
+        if v["warning"]:
+            L(f"{t}: {v['warning']}")
+        return q, price
+    finally:
+        _reprotect(broker, j, t, pm, lim, L, anchor=iid)
 
 
 def _load_journal(L) -> Optional[dict]:
@@ -330,35 +647,10 @@ def execute_orders(orders: dict, prices: dict, paper: bool, pm,
             if qty < 1:
                 out["skipped"].append(o["ticker"]); continue
             if not paper:
-                from broker import validate_fill
-                g = pre_trade_check("sell", o["ticker"], qty, o["est_price"],
-                                    broker=broker, journal=j, limits=lim,
-                                    price_ts=price_ts)
-                if not g["ok"]:
-                    L(f"매도 보류 {o['ticker']}: {g['reason']}")
-                    out["skipped"].append(o["ticker"]); continue
-                res, rec = _live_order(broker, j, ticker=o["ticker"], side="sell",
-                                       qty=g["qty"], est_price=g["est_price"],
-                                       cycle_id=cyc, source=src, reason=o["reason"])
-                if res is None:
-                    L(f"매도 중복 차단(같은 의도 이미 실행): {o['ticker']}")
-                    out["skipped"].append(o["ticker"]); continue
-                if res.get("note"):
-                    L(f"{o['ticker']}: {res['note']}")
-                v = validate_fill(res, est_price=g["est_price"], req_shares=g["qty"])
-                pnl_px = res.get("fill_price") or fp
-                pnl = ((pnl_px - pos.entry_price) / pos.entry_price
-                       if pos.entry_price else 0.0)
-                qty, fp = _book(rec, pm)
-                _it.save(j)
-                if _it.is_unresolved(rec):
-                    out["pending"].append(o["ticker"])
-                    L(f"{o['ticker']}: 열린 매도 주문 추적 중 — 다음 대조에서 확정")
-                if qty <= 0:
-                    L(f"매도 보류 {o['ticker']}: {v['warning'] or '체결 없음'}")
-                    out["skipped"].append(o["ticker"]); continue
-                if v["warning"]:
-                    L(f"{o['ticker']}: {v['warning']}")
+                r = _live_sell(broker, j, lim, pm, o, qty, pos, cyc, src, price_ts, L, out)
+                if r is None:
+                    continue
+                qty, fp, pnl = r
             else:
                 pnl = ((fp - pos.entry_price) / pos.entry_price
                        if pos and pos.entry_price else 0.0)
@@ -398,33 +690,10 @@ def execute_orders(orders: dict, prices: dict, paper: bool, pm,
                 L(f"매수 보류(자금부족) {o['ticker']} 필요 ${need:,.0f}/가용 ${avail:,.0f}")
                 out["skipped"].append(o["ticker"]); continue
             if not paper:
-                from broker import validate_fill
-                g = pre_trade_check("buy", o["ticker"], qty, o["est_price"],
-                                    broker=broker, journal=j, limits=lim,
-                                    price_ts=price_ts)
-                if not g["ok"]:
-                    L(f"매수 보류 {o['ticker']}: {g['reason']}")
-                    out["skipped"].append(o["ticker"]); continue
-                res, rec = _live_order(broker, j, ticker=o["ticker"], side="buy",
-                                       qty=qty, est_price=o["est_price"],
-                                       cycle_id=cyc, source=src,
-                                       score=o.get("score", 0))
-                if res is None:
-                    L(f"매수 중복 차단(같은 의도 이미 실행): {o['ticker']}")
-                    out["skipped"].append(o["ticker"]); continue
-                if res.get("note"):
-                    L(f"{o['ticker']}: {res['note']}")
-                v = validate_fill(res, est_price=o["est_price"], req_shares=qty)
-                qty, price = _book(rec, pm)
-                _it.save(j)
-                if _it.is_unresolved(rec):
-                    out["pending"].append(o["ticker"])
-                    L(f"{o['ticker']}: 미확정 매수 주문 — 다음 대조에서 확정")
-                if qty <= 0:
-                    L(f"매수 보류 {o['ticker']}: {v['warning'] or '체결 없음'}")
-                    out["skipped"].append(o["ticker"]); continue
-                if v["warning"]:
-                    L(f"{o['ticker']}: {v['warning']}")
+                r = _live_buy(broker, j, lim, pm, o, qty, cyc, src, price_ts, L, out)
+                if r is None:
+                    continue
+                qty, price = r
                 if bp is not None:
                     bp -= qty * price
             else:
@@ -447,43 +716,70 @@ def execute_orders(orders: dict, prices: dict, paper: bool, pm,
 def _manual_live(ticker: str, qty: int, side: str, est_price: float, pm,
                  src: str, reason: str, entry_price: float = 0.0) -> dict:
     """수동 실거래 1건 — 시장가, 타임아웃이면 취소 후 최종 체결을 다시 읽어 반영.
-    취소가 확인되지 않으면 의도를 미해결로 남겨 다음 대조가 확정한다."""
+    취소가 확인되지 않으면 의도를 미해결로 남겨 다음 대조가 확정한다.
+    매도는 보호 stop 을 먼저 취소(확인)하고, 끝나면 남은 보유에 다시 건다."""
     from broker import Broker, validate_fill
     try:
         j = _it.load()
     except _it.JournalError as e:
         raise RuntimeError(f"{e} — 실거래 주문 중단")
     broker = Broker(paper=False)
-    g = pre_trade_check(side, ticker, qty, est_price, broker=broker, journal=j,
-                        limits=risk_limits(None), manual=True)
-    if not g["ok"]:
-        raise RuntimeError(g["reason"])
-    res, rec = _live_order(broker, j, ticker=ticker, side=side, qty=g["qty"],
-                           est_price=g["est_price"],
-                           cycle_id=_it.default_cycle_id(src), source=src,
-                           reason=reason, market=True)
-    if res is None:
-        raise RuntimeError("중복 주문이 차단되었습니다")
-    v = validate_fill(res, est_price=est_price, req_shares=g["qty"])
-    q, fp = _book(rec, pm)
-    _it.save(j)
-    tracked = _it.is_unresolved(rec)
-    if q <= 0:
+    lim = risk_limits(None)
+    cyc = _it.default_cycle_id(src)
+    try:
+        if side == "sell":
+            try:
+                dropped, sfills = _drop_protect(broker, j, ticker, pm, lambda m: None)
+            except Exception as e:
+                raise RuntimeError(f"보호 stop 확인 실패 — 매도 보류: {e}")
+            if not dropped:
+                raise RuntimeError("보호 stop 취소가 확인되지 않아 매도를 보류했습니다"
+                                   "(stop 과 이중 매도 방지) — 잠시 후 다시 시도하세요")
+            if sfills:
+                pm._load_state()
+                p = pm.positions.get(ticker)
+                if p is None or int(p.shares) < 1:
+                    q, px, pnl = sfills[-1]
+                    return {"price": px, "shares": sum(f[0] for f in sfills),
+                            "pnl_pct": pnl or 0.0,
+                            "warning": "브로커 보호 stop 이 먼저 체결돼 이미 청산됐습니다"}
+                qty = min(qty, int(p.shares))
+        g = pre_trade_check(side, ticker, qty, est_price, broker=broker, journal=j,
+                            limits=lim, manual=True)
+        if not g["ok"]:
+            raise RuntimeError(g["reason"])
+        if side == "buy" and not _clear_protect_for_buy(broker, j, ticker, pm,
+                                                        lambda m: None, None):
+            raise RuntimeError("보유 종목의 보호 stop 을 정리하지 못해(취소 미확정 또는 방금 손절) "
+                               "추가 매수를 보류했습니다")
+        res, rec = _live_order(broker, j, ticker=ticker, side=side, qty=g["qty"],
+                               est_price=g["est_price"],
+                               cycle_id=cyc, source=src, reason=reason, market=True)
+        if res is None:
+            raise RuntimeError("중복 주문이 차단되었습니다")
+        v = validate_fill(res, est_price=est_price, req_shares=g["qty"])
+        q, fp = _book(rec, pm)
+        _it.save(j)
+        tracked = _it.is_unresolved(rec)
+        if q <= 0:
+            if tracked:
+                raise RuntimeError("체결 미확인 — 주문 취소가 확인되지 않아 추적 중입니다"
+                                   "(다음 사이클 브로커 대조에서 확정)")
+            raise RuntimeError(f"미체결 — 주문 취소됨 (상태: {res.get('status')})")
+        warn = v.get("warning") or ""
         if tracked:
-            raise RuntimeError("체결 미확인 — 주문 취소가 확인되지 않아 추적 중입니다"
-                               "(다음 사이클 브로커 대조에서 확정)")
-        raise RuntimeError(f"미체결 — 주문 취소됨 (상태: {res.get('status')})")
-    warn = v.get("warning") or ""
-    if tracked:
-        warn = (warn + " · " if warn else "") + "잔량 주문 추적 중(다음 대조에서 확정)"
-    out = {"price": fp, "shares": q, "warning": warn}
-    if side == "sell":
-        out["pnl_pct"] = (fp - entry_price) / entry_price if entry_price else 0.0
-        log_order(ticker, "sell", q, fp, source=src, pnl_pct=out["pnl_pct"],
-                  reason=reason)
-    else:
-        log_order(ticker, "buy", q, fp, source=src)
-    return out
+            warn = (warn + " · " if warn else "") + "잔량 주문 추적 중(다음 대조에서 확정)"
+        out = {"price": fp, "shares": q, "warning": warn}
+        if side == "sell":
+            out["pnl_pct"] = (fp - entry_price) / entry_price if entry_price else 0.0
+            log_order(ticker, "sell", q, fp, source=src, pnl_pct=out["pnl_pct"],
+                      reason=reason)
+        else:
+            log_order(ticker, "buy", q, fp, source=src)
+        return out
+    finally:
+        _reprotect(broker, j, ticker, pm, lim, lambda m: None,
+                   anchor=_it.make_intent_id(cyc, ticker, side) if side == "buy" else None)
 
 
 @_locked
@@ -556,12 +852,16 @@ def reconcile_live(broker, pm, cfg: Optional[dict] = None, *,
     2) 장부에 아직 반영 안 된 체결은 브로커 보유로 판정해 반영한다:
          장부 + 미반영 == 브로커 → 반영 / 장부 == 브로커 → 이미 반영된 것(크래시가
          장부 기록 뒤였음) / 둘 다 아니면 불일치
-    3) 전 종목 장부 ↔ 브로커 보유 비교. 열린 주문이 있는 종목은 다음 대조로 미룬다.
+       (브로커 보호 stop 이 앱이 꺼진 사이 체결된 것도 여기서 매도로 반영된다)
+    3) 전 종목 장부 ↔ 브로커 보유 비교. 열린 주문이 있는 종목은 다음 대조로 미룬다
+       (이 앱의 보호 stop 은 늘 열려 있으므로 '열린 주문'에서 뺀다).
     4) 허용치(reconcile_tol_shares) 넘는 불일치 → 매매 중단(저널 halt: 매수 금지,
        손절·청산 매도는 브로커 보유 한도 안에서 계속) + 경보(사유가 바뀔 때만).
-       다음 대조에서 일치하면 자동 해제.
+       다음 대조에서 일치하면 자동 해제(장부 손상·비상 정지 중단은 사용자 해제로만).
+    5) 보유 종목마다 보호 stop 확인 — 없거나(재기동·제출 실패·만료) 수량·가격이
+       어긋나면 다시 건다. 보유가 없어진 종목의 stop 은 내린다. 실패는 경보(사유 바뀔 때만).
     반환 {"ok", "halted", "mismatches", "blocked"(이번 사이클 제외할 종목),
-          "resolved", "booked"}. 브로커 조회 자체가 실패하면 RuntimeError
+          "resolved", "booked", "protect"}. 브로커 조회 자체가 실패하면 RuntimeError
     (러너의 연속 실패 백오프·경보가 처리).
     """
     L = log or (lambda m: None)
@@ -572,10 +872,10 @@ def reconcile_live(broker, pm, cfg: Optional[dict] = None, *,
     j = _it.load()                      # 손상이면 JournalError → 사이클 실패
     pm._load_state()
     out = {"ok": True, "halted": False, "mismatches": [], "blocked": [],
-           "resolved": [], "booked": []}
+           "resolved": [], "booked": [], "protect": []}
 
     try:
-        for rec in _it.unresolved(j):
+        for rec in _it.unresolved(j, protect=None):
             for c in rec["orders"]:
                 if str(c.get("status") or "").lower() in _it.CHILD_FINAL:
                     continue
@@ -591,22 +891,34 @@ def reconcile_live(broker, pm, cfg: Optional[dict] = None, *,
             _it.refresh(rec, final=True)
             if rec["state"] != before:
                 out["resolved"].append(f"{rec['intent_id']} {before}→{rec['state']}")
-        bpos = {t.upper(): float(v.get("shares") or 0)
-                for t, v in broker.get_positions(strict=True).items()}
+        bfull = {t.upper(): v for t, v in broker.get_positions(strict=True).items()}
+        bpos = {t: float(v.get("shares") or 0) for t, v in bfull.items()}
         bopen = broker.get_open_orders()
     except Exception as e:
         _it.save(j)
         raise RuntimeError(f"브로커 대조 실패(조회 오류): {e}") from e
+    _adopt_orphan_protects(j, bopen, L)
+    own_prot = _it.protect_coids(j)
 
     def led(t):
         p = pm.positions.get(t)
         return float(p.shares) if p else 0.0
 
     open_t = {r["ticker"] for r in _it.unresolved(j) if _it.has_open_child(r)}
-    open_t |= {o["symbol"] for o in bopen}
+    open_t |= {o["symbol"] for o in bopen if o.get("coid") not in own_prot}
+    # 보호 stop 이 상태 조회(1단계) 뒤에 체결되기 시작했으면 보유 조회와 어긋날 수 있다 —
+    # 열린 주문 목록(가장 나중에 읽음)에서 사라졌거나 체결이 붙은 종목은 다음 대조로 미룬다.
+    bo = {o.get("coid"): o for o in bopen}
+    for r in _it.unresolved(j, protect=True):
+        for c in r["orders"]:
+            if str(c.get("status") or "").lower() in _it.CHILD_FINAL:
+                continue
+            ob = bo.get(c.get("coid"))
+            if ob is None or float(ob["filled_qty"]) > float(c.get("filled_qty") or 0):
+                open_t.add(r["ticker"])
 
     by_t: dict = {}
-    for r in _it.unresolved(j):
+    for r in _it.unresolved(j, protect=None):
         if _it.unbooked(r)[0] > 0:
             by_t.setdefault(r["ticker"], []).append(r)
     for t, recs in by_t.items():
@@ -641,6 +953,29 @@ def reconcile_live(broker, pm, cfg: Optional[dict] = None, *,
     out["blocked"] = sorted(open_t)
     _it.prune(j)
 
+    # 5) 보호 stop 점검 — 대조 불일치 중에도 건다(위험을 줄이는 주문, 수량은 브로커 한도)
+    if _protect_mode(lim) is not None:
+        fails = []
+        tks = set(pm.positions) | {r["ticker"] for r in _it.unresolved(j, protect=True)}
+        for t in sorted(tks):
+            if t in ignore:
+                continue
+            try:
+                r = _ensure_protect(broker, j, t, pm, lim, L, bpos=bfull, bopen=bopen)
+            except Exception as e:
+                r = {"action": "error", "note": f"조회·제출 오류: {str(e)[:80]}"}
+            if r["action"] != "ok":
+                out["protect"].append(f"{t} {r['action']}: {r['note']}")
+                L(f"대조: {t} 보호 stop {r['action']} — {r['note']}")
+            if r["action"] == "error":
+                fails.append(f"{t} {r['note']}")
+        sig = ";".join(fails)
+        if sig != (j.get("protect_alert") or ""):
+            j["protect_alert"] = sig
+            if fails:
+                alert("⚠️ 브로커 보호 stop 설정 실패 — 앱이 꺼지면 손절이 작동하지 않습니다\n"
+                      + "\n".join(fails) + "\n다음 사이클 대조에서 다시 시도합니다.")
+
     if out["mismatches"]:
         mm = out["mismatches"]
         sig = ";".join(f"{m['ticker']}:{m['ledger']:g}/{m['broker']:g}" for m in mm)
@@ -653,12 +988,39 @@ def reconcile_live(broker, pm, cfg: Optional[dict] = None, *,
                   "장부를 브로커와 맞추면 다음 사이클 대조에서 자동 재개됩니다.")
         L(f"대조 불일치 → 매수 중단(매도는 진행): {reason}")
     else:
-        h = _it.halted(j)
-        if h and h.get("by") == "reconcile":
-            _it.clear_halt(j)
+        if _it.clear_auto_halt(j):
             alert("✅ 브로커 대조 일치 — 자동매매 재개")
             L("대조 일치 — 매매 중단 해제")
-        elif h:
+        h = _it.halted(j)
+        if h:
             out["halted"] = True
+            L(f"매매 중단 유지({_it.HALT_LABELS.get(h.get('by'), h.get('by'))}) — "
+              "사용자 해제(/resume · 설정 화면) 필요")
     _it.save(j)
     return out
+
+
+def _adopt_orphan_protects(j: dict, bopen: list, L):
+    """브로커에 열려 있는 이 앱의 보호 stop(coid 'ait-…-stop…') 중 저널에 없는 것을
+    저널에 되살린다 — 저널이 지워져도 stop 이 '모르는 열린 매도'로 남아 매도를 막거나
+    종목을 영영 대조에서 빼지 않게."""
+    import re
+    known = {c.get("coid") for r in j["intents"].values() for c in r["orders"]}
+    for o in bopen:
+        coid = o.get("coid") or ""
+        if (coid in known or o.get("side") != "sell"
+                or not re.match(r"^ait-.+-stop\d*$", coid)):
+            continue
+        iid = coid[len("ait-"):]
+        rec = _it.open_intent(j, iid, ticker=o["symbol"], side="sell",
+                              qty=int(o["qty"]), est_price=o.get("stop_price") or 0,
+                              source="broker_stop", reason="stop_loss (브로커 보호 stop)",
+                              kind=_it.PROTECT)
+        _it.upsert_child(rec, {"coid": coid, "id": o["id"], "qty": o["qty"],
+                               "kind": o.get("type") or "stop",
+                               "stop_price": o.get("stop_price") or None,
+                               "trail_percent": o.get("trail_percent") or None,
+                               "status": o["status"], "filled_qty": o["filled_qty"],
+                               "fill_price": 0.0})
+        _it.refresh(rec, final=True)
+        L(f"대조: 저널에 없던 보호 stop 복원 {o['symbol']} {coid}")

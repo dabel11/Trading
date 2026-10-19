@@ -2534,6 +2534,96 @@ def page_stocks():
     ui.timer(3.0, _sec_auto)
 
 
+def _safety_card():
+    """매매 중단 사유·해제 + 비상 정지(앱·텔레그램 /resume /panic 공통 — core.emergency)."""
+    import html as _h
+    from core import emergency as _em
+    with ui.element("div").classes("card").style("margin-bottom:12px"):
+        ui.html('<div class="sh2">매매 중단 · 비상 정지 <small>· 무인 운영 안전장치</small></div>')
+
+        @ui.refreshable
+        def box():
+            st = _em.status()
+            c = load_config()
+            bs = str(c.get("broker_stop", "stop")).lower()
+            sl = float(c.get("stop_loss", 0.07) or 0)
+            prot = {"stop": f"고정 stop −{sl:.0%}", "trailing": f"trailing −{sl:.0%}"}.get(
+                bs, "꺼짐")
+            if not st["halted"]:
+                ui.html('<div class="dai" style="border-color:rgba(48,209,88,.4);background:rgba(48,209,88,.08)">'
+                        '<div class="dai-ttl" style="color:#4ADE80">✅ 매매 정상 — 중단 없음</div>'
+                        '<div class="dai-rat">브로커 대조 불일치·장부 손상·비상 정지가 생기면 사유가 여기 표시되고 '
+                        '실거래 매수가 멈춥니다(손절·청산 매도는 브로커 보유 한도 안에서 계속).<br>'
+                        f'브로커 측 보호 주문(실거래): <b>{prot}</b> — 매수 체결 시 서버에 걸어 둠</div></div>')
+                return
+            also = "".join(f'<br>· 함께 감지: {_h.escape(str(v.get("reason", "")))}'
+                           for v in (st.get("also") or {}).values())
+            hint = {"ledger": "<br>먼저 backups/ 의 백업으로 장부를 되살린 뒤 해제하세요.",
+                    "reconcile": "<br>장부가 브로커와 다르면 다음 사이클 대조에서 다시 멈춥니다.",
+                    "panic": "<br>해제해도 자동매매는 꺼진 채로 남습니다.",
+                    "journal": "<br>주문 저널(order_intents.json)을 백업에서 되살려야 합니다 — 여기서 해제 불가."
+                    }.get(st["by"], "")
+            ui.html('<div class="dai" style="border-color:rgba(240,69,79,.45);background:rgba(240,69,79,.08)">'
+                    f'<div class="dai-ttl" style="color:#FF8A91">🛑 매매 중단 중 · {_h.escape(st["label"])}</div>'
+                    f'<div class="dai-rat">{_h.escape(st["reason"])}'
+                    + (f'<br>시작: {_h.escape(st["since"])}' if st["since"] else "")
+                    + also + hint + '</div></div>')
+            if st.get("journal_error"):
+                return
+
+            def _resume():
+                r = _em.resume(by="app")
+                ui.notify(r["message"], position="top", multi_line=True,
+                          type=("positive" if r["ok"] else "negative"))
+                box.refresh()
+            ui.button("▶ 매매 재개(중단 해제)", on_click=lambda: confirm(
+                "매매 중단 해제", f"사유: {_h.escape(st['reason'])}" + hint,
+                _resume, ok_label="해제")).classes("tbtn tbtn-primary").style("margin-top:8px")
+        box()
+
+        def _panic_dialog():
+            paper = _is_paper()
+            what = ("모의 장부의 전 종목을 현재가로 청산하고 자동매매를 끕니다." if paper else
+                    "<b>브로커의 열린 주문을 전부 취소하고 전 종목을 시장가로 청산</b>합니다(실제 계좌). "
+                    "자동매매를 끄고 매수를 중단합니다 — 해제는 '매매 재개' 또는 텔레그램 /resume.")
+            with ui.dialog() as d, ui.card().style(
+                    "background:var(--bg2);border:1px solid var(--line2);border-radius:10px;"
+                    "max-width:460px;color:var(--t1);gap:6px"):
+                ui.html('<div style="font-size:.95rem;font-weight:800;margin-bottom:2px">🚨 비상 정지</div>'
+                        f'<div style="font-size:.8rem;color:var(--t2);line-height:1.6">{what}</div>'
+                        f'<div style="font-size:.7rem;color:var(--t3);margin-top:8px">· {STATE_LABEL}</div>')
+                with ui.row().classes("w-full justify-end").style("gap:8px;margin-top:8px"):
+                    ui.button("취소", on_click=d.close).classes("tbtn")
+
+                    async def _go():
+                        d.close()
+                        import functools
+                        try:
+                            DAEMON.stop()
+                        except Exception:
+                            pass
+                        ui.notify("비상 정지 실행 중…", position="top")
+                        try:
+                            r = await run.io_bound(functools.partial(
+                                _em.panic, paper=paper, source="app", alert_fn=_tg_push))
+                        except Exception as ex:
+                            ui.notify(f"비상 정지 실패: {ex} — 브로커 앱/웹에서 직접 청산하세요.",
+                                      type="negative", position="top", multi_line=True)
+                            return
+                        ui.notify(r["message"], position="top", multi_line=True, timeout=15000,
+                                  type=("warning" if r["ok"] else "negative"))
+                        box.refresh()
+                        _screen["refresh"]()
+                    ui.button("비상 정지 실행", on_click=_go).classes("tbtn tbtn-danger")
+            d.open()
+
+        with ui.row().style("margin-top:8px;gap:8px"):
+            ui.button("🚨 비상 정지", on_click=_panic_dialog).classes("tbtn tbtn-danger")
+            ui.button("↻ 상태 새로고침", on_click=box.refresh).classes("tbtn")
+        ui.html('<div style="font-size:.66rem;color:var(--t3);margin-top:8px;line-height:1.6">'
+                '· 텔레그램: <b>/resume</b> 중단 사유 확인·해제 · <b>/panic</b> 비상 정지 (둘 다 /confirm 2단계)</div>')
+
+
 def page_settings():
     cfg = load_config()
     ui.html('<div class="sec-h">설정</div>')
@@ -2610,6 +2700,9 @@ def page_settings():
                 b = ui.button("🟢 모의투자로 전환", on_click=_to_paper).classes("tbtn tbtn-primary")
             if pre["blockers"]:
                 b.props("disable")
+
+    # ── 매매 중단 · 비상 정지 ──
+    _safety_card()
 
     # ── Alpaca (실시간 시세 스트림·과거 데이터·실거래 주문) ──
     import config as _cfgm

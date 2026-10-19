@@ -185,3 +185,18 @@ P0 수정 완료(미커밋). 프로브 결과 **14개 중 9개 ok**. 남은 5개
 
 남은 항목: #3 #4 #5 #6(실거래 체결·멱등성 → P1 intent 저널·대조), #13(장부 fail-open → P2 SQLite).
 주의: 첫 실행 때 `day_state.json`이 KST 날짜에서 ET 날짜로 바뀌면서 킬스위치 기준 자산이 1회 다시 잡힌다.
+
+### P1 진행 (2026-10-19)
+
+프로브 **14개 중 0개 BUG**. 테스트: test_core · test_ev · test_influence_and_config · test_p1_mode_ledger · test_portfolio_churn · test_monitor 전부 통과.
+
+| 수정 | 변경 | 해결 |
+|---|---|---|
+| 의도 저널 · 대조 · 리스크 게이트 | `core/intents.py`, `broker.execute_order`, `pre_trade_check`, `reconcile_live` (커밋 `20cf3f2`) | #3 #4 #5 #6 #15 #17 #18 #19 |
+| 실거래 전환 2단계 확인 · 장부 손상 fail-closed | `core/mode.py`, `core/ledger_guard.py` — 손상이면 저널 halt(by="ledger") (커밋 `ce4a966`) | #21 #13 |
+| 회전율 안전장치 | 당일 매수 회전 금지 + 같은 발행사 중복 진입 방지 (커밋 `c98a6be`) | #18 |
+| 브로커 측 보호 주문 | 실거래 매수 체결 → 보유 전량에 GTC stop(평단 × (1 − `stop_loss`), 설정 `broker_stop` = stop · trailing · off). coid `ait-<매수 의도>-stop`, 저널 kind="protect". 앱 매도(자동·틱 가드·수동·텔레그램)와 추가 매수는 stop 을 **먼저 취소하고 확인된 뒤에만** 낸다 — 미확정이면 보류(stop 과 이중 매도·wash trade 방지). 취소 직전 stop 이 체결됐으면 그 체결을 장부에 반영하고 앱 매도는 생략. 매도·매수 뒤 남은 보유에 다시 건다. `reconcile_live`: stop 체결 반영, 보유마다 stop 확인·복구(재기동·제출 실패·만료·저널 유실 시 브로커 stop 되살림), 실패는 경보 1회. `pre_trade_check`의 열린 매도에서 자기 stop 은 `protect_qty`로 따로 | 무인 운영 |
+| 매매 중단 해제 | `core/emergency.py` `status()`·`resume()` — 텔레그램 `/resume`(사유 표시 → `/confirm`), 앱 설정 '매매 중단 · 비상 정지' 카드. 장부 손상·비상 정지 중단은 대조가 일치해도 자동으로 풀리지 않는다(대조 불일치는 `also`에 덧붙음) | 무인 운영 |
+| 비상 버튼 | `emergency.panic()` — 실거래: 자동매매 정지 + halt(by="panic") 먼저 기록 → `cancel_orders()` + `close_all_positions(cancel_orders=True)` → 청산 주문을 저널(kind="panic")에 기록 → 대조로 장부 반영(장 마감이면 개장 체결 후 다음 대조). 모의: 모의 장부 전량 현재가 청산 + 자동매매 정지. 텔레그램 `/panic` → `/confirm`, 앱 버튼(확인 대화상자) | 킬스위치 ⑤ |
+
+남은 항목: TradingStream execution_id 중복 제거, 락 범위 축소(#16), SQLite 단일 장부(P2), Alpaca Paper 단계 무인 운영(단계 1) — 보호 stop 은 실제 Alpaca Paper 에서 한 번 확인 필요(가짜 브로커로만 검증).
