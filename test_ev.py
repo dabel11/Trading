@@ -121,8 +121,11 @@ def test_params_from_cfg_and_save_load(tmp_path):
     assert sum(got["counts"].values()) == 1
 
 
-def test_telegram_ev_command_renders_summary():
+def test_telegram_ev_command_renders_summary(tmp_path, monkeypatch):
     import telegram_bot as tg
+    from core import control
+    monkeypatch.setattr(control, "CONFIG_FILE", tmp_path / "autotrader_config.json")  # 실제 ev 파일 격리
+    monkeypatch.setattr(ev, "EV_FILE", None)
     cl = _series(seed=10)
     p = ev.EVParams()
     s = {"ev": ev.summary([ev.evaluate("AAA", 85, cl, cl[-1], p, 0.8),

@@ -20,6 +20,9 @@ from pathlib import Path
 
 from nicegui import ui, run
 
+import yf_compat
+yf_compat.install()     # yfinance tz 캐시 파일 누수 차단 + 파일 한도 상향 (장중 EMFILE 마비 방지)
+
 # ── 기존 백엔드 (그대로 재사용, 전부 읽기) ───────────────────────────────────
 import paper_account as pa
 import realtime_feed as rtf

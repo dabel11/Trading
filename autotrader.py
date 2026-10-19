@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 from core import control
+import yf_compat
+yf_compat.install()     # yfinance tz 캐시 파일 누수 차단 + 파일 한도 상향
 
 DIR = Path(__file__).resolve().parent
 LOG_FILE = DIR / "autotrader.log"

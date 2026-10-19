@@ -52,6 +52,12 @@ def _start_server():
     """NiceGUI 대시보드 서버(web, 포트 8502)를 백그라운드로 기동."""
     if _port_open(PORT):
         return None
+    try:                                  # 서버(자식)가 물려받도록 먼저 한도 상향 —
+        sys.path.insert(0, str(ROOT))     # launchd 로 뜬 앱의 기본 파일 한도는 256
+        import yf_compat
+        yf_compat.raise_fd_limit()
+    except Exception:
+        pass
     log = open(_rotated(ROOT / "ui_ng" / "_server.log"), "a")
     return subprocess.Popen(
         [sys.executable, "-m", "ui_ng.dashboard"],
