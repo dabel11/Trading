@@ -323,8 +323,13 @@ pm = fresh_paper()
 pm.record_buy("AAPL", 5, 100.0, 70)
 (TMP / "state_paper.json").write_text("{not json")
 after = portfolio.PortfolioManager(paper=True).positions
-report("corrupt ledger fails open (positions={})", after == {},
-       f"손상 후 로드 positions={after} · .corrupt 백업만 남고 매매는 계속")
+# 로드가 빈 보유를 돌려주는 것 자체는 그대로다 — 결함은 '그 상태로 매매가 계속되는가'.
+from core import ledger_guard as LG, intents as IT
+lg = LG.check(True)
+report("corrupt ledger fails open (positions={})", after == {} and not lg["block_all"],
+       f"손상 후 로드 positions={after} · 장부 검사 중단={lg['halted']} "
+       f"자동주문 보류={lg['block_all']} · {(IT.halted(IT.load()) or {}).get('by')}")
+IT.clear_halt()                                     # 이후 프로브에 영향 없게
 
 # ── 14. 실행 루프 장 마감 게이트 (루프·'지금 1회 실행' 공용) ─────────────
 control.PID_FILE = TMP / "autotrader.pid"          # 실가동 앱 PID 파일 보호

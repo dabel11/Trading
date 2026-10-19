@@ -2538,42 +2538,78 @@ def page_settings():
     cfg = load_config()
     ui.html('<div class="sec-h">설정</div>')
 
-    # ── 매매 모드 (앱·텔레그램 공통) ──
+    # ── 매매 모드 (앱·텔레그램 공통) — 전환 전제조건·2단계 확인은 core.mode (감사 #21) ──
+    from core import mode as _mode
     paper = _is_paper()
+    target, real_money = _mode.target_label()
+    pre = _mode.check(not paper, verify_broker=False)      # 화면용 빠른 점검(네트워크 없음)
 
-    def _switch_mode(to_paper):
-        c = load_config()
-        c["paper"] = bool(to_paper)
-        _ctl_mod.save_config(c)
-        ui.notify(f'{"🟢 모의투자" if to_paper else "🔴 실거래"} 모드로 전환했습니다.',
-                  position="top", type=("positive" if to_paper else "warning"))
+    def _blockers_dialog(title, r):
+        confirm(title, "<br>".join("⛔ " + b for b in r["blockers"]) or "알 수 없는 이유",
+                lambda: None, ok_label="확인")
+
+    def _to_paper():
+        r = _mode.switch_to_paper()
+        if not r["ok"]:
+            _blockers_dialog("모의 전환 불가", r)
+            return
+        ui.notify("🟢 모의투자 모드로 전환했습니다.", position="top", type="positive")
         _screen["refresh"]()
 
+    async def _to_live():
+        r = await run.io_bound(_mode.request_live, "app")  # Alpaca 계좌 연결 확인 포함
+        if not r["ok"]:
+            _blockers_dialog("실거래 전환 전제조건 미충족", r)
+            return
+        with ui.dialog() as d, ui.card().style(
+                "background:var(--bg2);border:1px solid var(--line2);border-radius:10px;"
+                "max-width:480px;color:var(--t1);gap:6px"):
+            money = ('<b style="color:#FF8A91">⚠️ 실제 돈으로 주문됩니다.</b>' if r["real_money"]
+                     else "가상 돈(Alpaca 페이퍼 계좌)으로 실제 주문 경로를 검증합니다.")
+            ui.html('<div style="font-size:.95rem;font-weight:800">🔴 실거래 전환 — 2단계 확인</div>'
+                    '<div style="font-size:.8rem;color:var(--t2);line-height:1.7">'
+                    + "<br>".join(r["notes"]) + f"<br>{money}<br>"
+                    f'계속하려면 확인 코드 <b class="mono" style="font-size:1rem;color:var(--t1)">{r["code"]}</b>'
+                    f' 를 입력하세요 ({r["ttl"] // 60}분 유효).</div>')
+            code_in = ui.input("확인 코드").props("outlined dense dark autofocus").style("width:140px")
+
+            def _go():
+                res = _mode.confirm_live(code_in.value or "", who="app")
+                if not res.get("switched"):
+                    ui.notify("전환 안 됨 — " + " / ".join(res["blockers"]), type="negative",
+                              position="top", multi_line=True)
+                    return
+                d.close()
+                ui.notify(f"🔴 실거래 모드로 전환했습니다 — {res['target']}", type="warning", position="top")
+                _screen["refresh"]()
+
+            def _cancel():
+                _mode.cancel("app")
+                d.close()
+            with ui.row().classes("w-full justify-end").style("gap:8px;margin-top:6px"):
+                ui.button("취소", on_click=_cancel).classes("tbtn")
+                ui.button("실거래 전환", on_click=_go).classes("tbtn tbtn-danger")
+        d.open()
+
     with ui.element("div").classes("card").style("margin-bottom:12px"):
+        cur = "🟢 모의투자(앱 내부 장부)" if paper else f"🔴 실거래 — {target}"
         ui.html('<div class="sh2">매매 모드 <small>· 앱·텔레그램·자동매매 공통</small></div>'
-                f'<div style="font-size:.9rem;font-weight:800;margin:6px 0 10px;'
-                f'color:{"var(--green)" if paper else "var(--up)"}">'
-                f'현재: {"🟢 모의투자(페이퍼)" if paper else "🔴 실거래 — 실제 자금"}</div>')
-        try:
-            import config as _cfgmod
-            _alp = _cfgmod.alpaca_ready()
-        except Exception:
-            _alp = False
-        if not _alp:
-            ui.html('<div style="font-size:.68rem;color:#FF8A91;margin:2px 0 8px">'
-                    '⚠️ Alpaca API 키가 설정되지 않아 실거래 주문은 실패합니다 — '
-                    '.env 에 ALPACA_API_KEY/SECRET 입력 필요.</div>')
+                f'<div style="font-size:.9rem;font-weight:800;margin:6px 0 6px;'
+                f'color:{"var(--green)" if paper else "var(--up)"}">현재: {cur}</div>')
+        if paper:
+            ui.html('<div style="font-size:.7rem;color:var(--t3);line-height:1.6;margin-bottom:6px">'
+                    f'실거래로 전환하면 주문이 가는 곳: <b>{target}</b><br>'
+                    '전환 조건: 자동매매 정지 · 모의 보유 0 · Alpaca 키·계좌 연결 → 확인 코드 입력</div>')
+        if pre["blockers"]:
+            ui.html('<div style="font-size:.7rem;color:#FF8A91;line-height:1.6;margin-bottom:8px">'
+                    + "<br>".join("⛔ " + b for b in pre["blockers"]) + '</div>')
         with ui.row().classes("gap-2"):
             if paper:
-                _warn = ("" if _alp else
-                         "<br><b style='color:#FF8A91'>⚠️ 현재 Alpaca 키가 없어 실제 주문은 실패합니다.</b>")
-                ui.button("🔴 실거래로 전환", on_click=lambda: confirm(
-                    "실거래 전환",
-                    "이후 매매가 <b>실제 계좌·실제 자금</b>으로 체결됩니다. (Alpaca API 키 필요)" + _warn,
-                    lambda: _switch_mode(False), ok_label="실거래 전환", danger=True)
-                ).classes("tbtn tbtn-danger")
+                b = ui.button("🔴 실거래로 전환", on_click=_to_live).classes("tbtn tbtn-danger")
             else:
-                ui.button("🟢 모의투자로 전환", on_click=lambda: _switch_mode(True)).classes("tbtn tbtn-primary")
+                b = ui.button("🟢 모의투자로 전환", on_click=_to_paper).classes("tbtn tbtn-primary")
+            if pre["blockers"]:
+                b.props("disable")
 
     # ── Alpaca (실시간 시세 스트림·과거 데이터·실거래 주문) ──
     import config as _cfgm

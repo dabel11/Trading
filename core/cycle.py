@@ -104,6 +104,23 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     _pf.BUY_PRICE_MAX        = float(cfg.get("buy_price_max", 0) or 0)
 
     pm = PortfolioManager(paper=paper)
+    # 장부 손상 fail-closed (감사 #13) — 손상 흔적이 있으면 매매 중단(by="ledger").
+    # 모의는 자동 주문 전부 보류, 실거래는 아래 대조·execute_orders 가 매수만 막는다.
+    if paper:
+        try:
+            _pa.cash()     # 손상 파일이면 이 읽기에서 .corrupt 로 옮겨진다 → 아래 검사가 잡는다
+        except Exception:
+            pass
+    try:
+        from core import ledger_guard
+        from core.runner import alert as _alert
+        lg = ledger_guard.check(bool(paper), log=L, alert=_alert)
+    except Exception as e:
+        L(f"장부 검사 실패 — {'자동 주문 보류' if paper else '대조 단계로 진행'}: {e}")
+        lg = {"halted": True, "block_all": bool(paper), "reason": str(e)}
+    if lg.get("block_all"):
+        return {"bought": [], "sold": [], "skipped": [], "halted": True,
+                "halt_reason": lg.get("reason", ""), "regime": None, "top": [], "prices": {}}
     broker = None
     blocked: set = set()
     halted = None

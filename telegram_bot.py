@@ -279,14 +279,7 @@ def _cfg_paper() -> bool:
 
 
 def _set_paper(paper: bool):
-    """모드 전환 — config 저장 + 상태 파일 즉시 반영."""
-    try:
-        from core.control import load_config, save_config
-        cfg = load_config()
-        cfg["paper"] = bool(paper)
-        save_config(cfg)
-    except Exception:
-        pass
+    """상태 파일에 모드 즉시 반영(설정 저장은 core.mode 가 전제조건 확인 뒤에 한다)."""
     try:
         s = _status()
         s["paper"] = bool(paper)
@@ -297,27 +290,39 @@ def _set_paper(paper: bool):
 
 
 def cmd_mode(args: list) -> str:
-    """/mode (조회) · /mode paper (모의) · /mode live (실거래)."""
+    """/mode (조회) · /mode paper (모의) · /mode live → 확인 코드 → /mode live 1234 (감사 #21).
+
+    전제조건(자동매매 정지·보유 0·미해결 주문 0·Alpaca 연결)은 core.mode 가 앱과 같은 규칙으로 본다."""
+    from core import mode as _mode
     cur = _cfg_paper()
+    target, _real = _mode.target_label()
     if not args:
-        return (f"현재 모드: {'🟢 모의투자(페이퍼)' if cur else '🔴 실거래'}\n"
-                "전환: /mode paper (모의) · /mode live (실거래)\n"
+        return (f"현재 모드: {'🟢 모의투자(페이퍼)' if cur else '🔴 실거래 — ' + target}\n"
+                "전환: /mode paper (모의) · /mode live (실거래, 2단계 확인)\n"
                 "단축: /모의 · /실거래")
     a = args[0].lower().strip()
     if a in ("paper", "모의", "sim", "demo"):
+        r = _mode.switch_to_paper()
+        if not r["ok"]:
+            return "⛔ 모의 전환 불가\n" + "\n".join("· " + b for b in r["blockers"])
         _set_paper(True)
         return "🟢 모의투자(페이퍼) 모드로 전환했습니다.\n이후 모든 매매는 가상 현금으로 체결됩니다."
     if a in ("live", "실거래", "real"):
-        _set_paper(False)
-        warn = ""
-        try:
-            import config as _c
-            if not _c.alpaca_ready():
-                warn = "\n⚠️ Alpaca API 키가 없어 실제 주문은 실패합니다 (.env 설정 필요)."
-        except Exception:
-            pass
-        return ("🔴 실거래 모드로 전환했습니다.\n이후 매매는 **실제 계좌·실제 자금**으로 체결됩니다 — 신중히!"
-                + warn)
+        if len(args) >= 2:                                   # 2단계 — 확인 코드
+            r = _mode.confirm_live(args[1], who="telegram")
+            if not r.get("switched"):
+                return "⛔ 실거래 전환 안 됨\n" + "\n".join("· " + b for b in r["blockers"])
+            _set_paper(False)
+            return (f"🔴 실거래 모드로 전환했습니다 — {r['target']}\n"
+                    + "".join(n + "\n" for n in r["notes"][1:])
+                    + "자동매매는 정지 상태입니다. 준비되면 앱에서 시작하세요.")
+        r = _mode.request_live(who="telegram")              # 1단계 — 전제조건 + 코드 발급
+        if not r["ok"]:
+            return "⛔ 실거래 전환 전제조건 미충족\n" + "\n".join("· " + b for b in r["blockers"])
+        money = ("⚠️ 실제 돈으로 주문됩니다." if r["real_money"]
+                 else "가상 돈(Alpaca 페이퍼 계좌)으로 주문됩니다.")
+        return ("🔴 실거래 전환 확인\n" + "\n".join(r["notes"]) + f"\n{money}\n\n"
+                f"확인하려면 {r['ttl'] // 60}분 안에 입력: /mode live {r['code']}")
     return "사용법: /mode paper (모의) · /mode live (실거래)"
 
 
@@ -443,7 +448,7 @@ def handle(text: str, chat_id: str = "") -> str:
         if cmd in ("paper", "모의"):
             return cmd_mode(["paper"])
         if cmd in ("live", "실거래"):
-            return cmd_mode(["live"])
+            return cmd_mode(["live"] + args)          # /실거래 1234 = 확인 코드
         return cmd_mode(args)
     if cmd in _TRADE_CMDS:
         # 매매는 등록된 Chat ID에서만 (오픈 채팅 매매 차단)
