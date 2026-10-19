@@ -57,6 +57,20 @@ def mark_to_market_equity(pm, prices: dict, paper: bool) -> float:
     return cash + mv
 
 
+_LOT_NOTE = {"last": None}
+
+
+def _note_lot_plan(lp: Optional[dict], max_positions: int, L) -> None:
+    """소액 자본 단위 정책이 종목 수를 줄였으면 로그 — 종목 수·상한이 바뀔 때만 1줄."""
+    if not lp:
+        return
+    key = (lp["slots"], round(lp["cap"], 4)) if lp["slots"] < max_positions else None
+    if key != _LOT_NOTE["last"] and key is not None:
+        L(f"소액 자본 정책 · 자본 ${lp['equity']:,.0f} → 최대 {lp['slots']}종목 · "
+          f"종목당 최대 {lp['cap']:.0%} · 신규 매수 최소 ${lp['min_lot']:,.0f}")
+    _LOT_NOTE["last"] = key
+
+
 def run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     """설정(cfg = autotrader_config.json 스키마)대로 사이클 1회 실행.
 
@@ -224,6 +238,13 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
               for r in scores_raw]
 
     avail = _pa.cash() if paper else None
+    if broker is not None:
+        # 실거래: 장부 가용자금(CAPITAL_TOTAL − 투자원가)과 실제 계좌 현금 중 작은 쪽으로 계획 —
+        # 계좌가 설정 자본보다 작으면 소액 자본 단위 정책이 실제 금액 기준으로 작동한다
+        try:
+            avail = min(pm.available_capital(), float(broker.get_account()["cash"]))
+        except Exception as e:
+            L(f"계좌 현금 조회 실패 — 장부 가용자금 기준으로 계획: {e}")
     orders = pm.generate_orders(
         scores, prices, dynamic=dynamic,
         buy_mode=cfg.get("buy_mode", "전량"),
@@ -231,6 +252,7 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
         buy_pct=float(cfg.get("buy_pct", 100)) / 100.0,
         sell_pct=float(cfg.get("sell_pct", 100)) / 100.0,
         available_override=avail)
+    _note_lot_plan(getattr(pm, "last_lot_plan", None), _pf.MAX_POSITIONS, L)
 
     # EV 매도는 점수 조정으로 기존 청산 경로를 탔으므로 장부·알림의 사유를 EV 로 바로잡는다
     for o in orders.get("sell", []):

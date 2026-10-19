@@ -72,6 +72,17 @@ MIN_REENTRY_MOVE_PCT = 0.01
 # 점수 상위가 한 섹터(예: 테크)에 몰려 포트폴리오가 사실상 단일 베팅이 되는 것 방지.
 MAX_PER_SECTOR = 3
 
+# 소액 자본 단위 정책 (기본 정책 — 별도 모드 아님, lot_plan 참고)
+# 자본이 적은데 MAX_POSITIONS 개로 나누면 종목당 1~2주짜리 자투리가 되고, 정수 주식
+# 반올림 탓에 목표와 실제 비중이 크게 어긋나며(목표 $400 에 $250 1주 = 62%) 비싼 종목은 0주다.
+# MIN_POSITION_VALUE : 한 종목에 최소 이만큼은 싣는다 → 슬롯 수 = 자본 ÷ 이 값 (1~MAX_POSITIONS)
+# MIN_LOT_FILL       : 신규 매수는 정수 주식으로 최소 단위의 이 비율 이상을 살 수 있을 때만
+# LOT_TRIM_SLACK     : 트림 기준 상한은 자본을 (1+이 값)으로 나눠 계산 — 자본이 슬롯 문턱
+#                      ($1,000 등)을 오르내릴 때 '반 팔고 → 되사는' 왕복 방지
+MIN_POSITION_VALUE = 500.0
+MIN_LOT_FILL = 0.5
+LOT_TRIM_SLACK = 0.5
+
 
 # 백테스트가 '오늘'을 시뮬레이션 날짜로 갈아끼울 수 있게 하는 인디렉션.
 # 평소엔 실제 오늘(ET 거래일)을 그대로 쓰고, 백테스터만 set_clock()으로
@@ -110,6 +121,28 @@ def _price_in_band(price: float) -> bool:
     if BUY_PRICE_MAX and price > BUY_PRICE_MAX:
         return False
     return True
+
+
+def lot_plan(equity: float) -> tuple[int, float, float]:
+    """소액 자본 단위 정책 → (최대 종목 수, 종목당 상한 비율, 신규 매수 최소 금액).
+
+    자본이 충분하면 설정 그대로이고, 적을수록 종목 수를 줄이고 한 종목에 더 싣는다.
+    (기본값 MIN_POSITION_VALUE $500 · MAX_POSITIONS 5 · MAX_POSITION_PCT 25%)
+      $2,500 이상 → 5종목 · 25%  · 최소 $250   ← 설정 그대로
+      $1,500      → 3종목 · 33%  · 최소 $250
+      $1,000      → 2종목 · 50%  · 최소 $250
+      $800        → 1종목 · 100% · 최소 $250
+      $400        → 1종목 · 100% · 최소 $200
+    """
+    eq = max(float(equity), 0.0)
+    n = max(1, min(int(MAX_POSITIONS), int(eq // MIN_POSITION_VALUE)))
+    cap = max(float(MAX_POSITION_PCT), 1.0 / n)
+    return n, cap, MIN_LOT_FILL * min(MIN_POSITION_VALUE, eq)
+
+
+def _lot_value(amount: float, price: float) -> float:
+    """amount 로 살 수 있는 정수 주식의 금액."""
+    return int(amount / price) * price if price > 0 else 0.0
 
 
 class Position:
@@ -358,8 +391,17 @@ class PortfolioManager:
 
         # --- entries ---
         open_after_sells = {t for t in self.positions if t not in fully_sold}
-        slots_free = MAX_POSITIONS - len(open_after_sells)
-        full_target = CAPITAL_TOTAL * MAX_POSITION_PCT   # 한 종목 목표 비중 (전액)
+        # 소액 자본 단위 정책 — 시가 기준 자본으로 슬롯 수·종목당 상한·신규 최소 금액
+        _sold_qty = {o["ticker"]: o["shares"] for o in sells}
+        equity = projected_available + sum(
+            (self.positions[t].shares - _sold_qty.get(t, 0))
+            * current_prices.get(t, self.positions[t].entry_price)
+            for t in open_after_sells)
+        n_slots, cap, min_lot = lot_plan(equity)
+        self.last_lot_plan = {"equity": equity, "slots": n_slots,
+                              "cap": cap, "min_lot": min_lot}
+        slots_free = n_slots - len(open_after_sells)
+        full_target = min(CAPITAL_TOTAL, equity) * cap   # 한 종목 목표 비중 (전액)
         _cooldown_fixed = self._recently_stopped()       # 손절 쿨다운(신규 진입 차단)
         _exit_px = self._recent_exit_prices()            # 재진입 가격 히스테리시스
 
@@ -389,6 +431,7 @@ class PortfolioManager:
                 if self._reentry_blocked(price, _exit_px.get(s.ticker)):
                     continue  # 판 가격 그대로 → 되사지 않음 (가격이 움직이면 허용)
                 target = full_target * _bp if buy_mode == "분할" else full_target
+                target = max(target, min_lot)   # 신규는 최소 단위 이상으로 연다(분할 첫 매수도)
 
             size = min(projected_available, target)
             shares = int(size / price)
@@ -397,6 +440,8 @@ class PortfolioManager:
             cost = shares * price
             if cost > projected_available:
                 continue
+            if not held and cost < min_lot:
+                continue  # 1주가 너무 비싸거나 현금이 모자라 자투리로만 살 수 있음 → 건너뜀
             buys.append({
                 "ticker": s.ticker,
                 "shares": shares,
@@ -421,7 +466,8 @@ class PortfolioManager:
         절차:
           1) 위험 청산(손절/트레일링/점수붕괴/보유만료) 먼저 — 항상 전량, 자본 확보
           2) 점수 ≥ 매수문턱 상위 후보로 목표 포트폴리오 구성
-             - 확신(=점수)에 비례해 비중 배분, 종목당 MAX_POSITION_PCT 상한
+             - 확신(=점수)에 비례해 비중 배분, 종목 수·종목당 상한은 lot_plan
+               (자본이 적으면 적은 종목에 크게, 적당한 단위로 못 사는 종목은 제외)
           3) 목표에서 빠진 보유는 회전 청산(단, 트레일링이 관리 중인 승자는 유지)
           4) 보유 ↔ 목표 차이가 리밸런스 밴드를 넘을 때만 그 차액만큼 매수/매도
           5) 시드가 하드 캡 — 가용 현금 한도 내에서만 매수(점수 높은 순 우선)
@@ -457,8 +503,12 @@ class PortfolioManager:
         total_equity = cash + held_value          # 운용 총자본(시드)
         if total_equity <= 0:
             return {"sell": sells, "buy": buys}
+        # 소액 자본 단위 정책 — 자본이 적으면 종목 수를 줄이고 종목당 상한을 늘린다
+        n_slots, cap, min_lot = lot_plan(total_equity)
+        self.last_lot_plan = {"equity": total_equity, "slots": n_slots,
+                              "cap": cap, "min_lot": min_lot}
 
-        # ── 2) 목표 포트폴리오 (확신=점수 비례, 상한 MAX_POSITION_PCT) ──────
+        # ── 2) 목표 포트폴리오 (확신=점수 비례, 상한 cap = lot_plan) ──────────
         # 신규 후보는 매수 가격대(상·하한) + 손절 쿨다운 필터 적용.
         # 이미 보유 중인 종목은 필터와 무관하게 목표에 남긴다(강제 청산 방지).
         _cooldown = self._recently_stopped()
@@ -482,12 +532,14 @@ class PortfolioManager:
         cands = []
         _iss = {_issuer(t) for t in held_now}       # 같은 발행사 중복 진입 방지
         for s in _pre:
-            if len(cands) >= MAX_POSITIONS:
+            if len(cands) >= n_slots:
                 break
             if s.ticker in held_now:
                 cands.append(s); continue
             if _issuer(s.ticker) in _iss:
                 continue          # 같은 회사의 다른 주식 종류를 이미 보유/선택
+            if _lot_value(cap * total_equity, current_prices[s.ticker]) < min_lot:
+                continue          # 1주가 너무 비싸 종목당 상한 안에서 적당한 단위로 못 삼 → 다음 후보
             _sec = _sector_of(s.ticker)
             if _sec and _sec_cnt.get(_sec, 0) >= MAX_PER_SECTOR:
                 continue          # 섹터 포화 → 다음 점수 후보로
@@ -496,10 +548,24 @@ class PortfolioManager:
             if _sec:
                 _sec_cnt[_sec] = _sec_cnt.get(_sec, 0) + 1
         base = MIN_SCORE_TO_BUY - 10.0            # 문턱 부근은 작게, 강한 신호는 크게
-        raw = {s.ticker: max(1.0, s.total - base) for s in cands}
-        tot_raw = sum(raw.values()) or 1.0
-        target_val = {t: min(r / tot_raw, MAX_POSITION_PCT) * total_equity
-                      for t, r in raw.items()}
+
+        def _weights(cs):
+            raw = {s.ticker: max(1.0, s.total - base) for s in cs}
+            tot_raw = sum(raw.values()) or 1.0
+            return {t: r / tot_raw for t, r in raw.items()}
+
+        weight = _weights(cands)
+        target_val = {t: min(w, cap) * total_equity for t, w in weight.items()}
+        # 점수 비례 몫이 최소 단위에 못 미치는 신규 후보는 약한 것부터 빼고 다시 나눈다
+        # — 자투리 포지션 여러 개 대신 적은 종목에 제대로 싣는다
+        while True:
+            thin = [s for s in cands if s.ticker not in held_now
+                    and _lot_value(target_val[s.ticker], current_prices[s.ticker]) < min_lot]
+            if not thin:
+                break
+            cands.remove(min(thin, key=lambda s: s.total))
+            weight = _weights(cands)
+            target_val = {t: min(w, cap) * total_equity for t, w in weight.items()}
 
         # ── 3) 목표 이탈 보유 → 회전 청산 (트레일링 관리 승자는 예외) ────────
         # 회전은 교체 이득이 분명할 때만: 신규 후보의 점수가 보유 점수보다
@@ -528,14 +594,17 @@ class PortfolioManager:
             rotated.add(t)
 
         # ── 4) 트림(과비중) 먼저 → 현금 확보 ───────────────────────────────
+        # 트림 상한은 한 단계 넉넉히(LOT_TRIM_SLACK) — 자본이 충분하면 cap 과 같다
+        trim_cap = lot_plan(total_equity / (1.0 + LOT_TRIM_SLACK))[1]
         for t in target_val:
             p = held_now.get(t)
             if p is None or t in rotated:
                 continue
             price = current_prices.get(t, p.entry_price)
             cur_val = p.shares * price
-            gap = target_val[t] - cur_val
-            if gap < -REBAL_BAND * target_val[t]:          # 과비중
+            trim_to = min(weight[t], trim_cap) * total_equity
+            gap = trim_to - cur_val
+            if gap < -REBAL_BAND * trim_to:                # 과비중
                 qty = min(int(round((-gap) / price)), int(p.shares))
                 if qty >= 1:
                     sells.append({"ticker": t, "shares": qty,
@@ -544,8 +613,8 @@ class PortfolioManager:
 
         # ── 5) 매수/추가(저비중) — 점수 높은 순, 가용 현금 한도 내 ──────────
         # 하드캡: 회전 매도로 비워지지 않은 보유 종목 수 + 신규 매수가
-        # MAX_POSITIONS 를 넘지 않게 한다. 보유는 유지(히스테리시스)하되
-        # 신규 진입은 남은 슬롯까지만 — 유동형이 한도를 초과하지 않도록.
+        # n_slots(소액이면 MAX_POSITIONS 보다 적음)를 넘지 않게 한다. 보유는 유지
+        # (히스테리시스)하되 신규 진입은 남은 슬롯까지만 — 유동형이 한도를 초과하지 않도록.
         retained = set(held_now.keys()) - rotated
         new_bought: set = set()
         for s in cands:
@@ -554,13 +623,15 @@ class PortfolioManager:
             if price <= 0 or t in rotated or cash <= 0:
                 continue
             p = held_now.get(t)
-            if p is None and (len(retained) + len(new_bought)) >= MAX_POSITIONS:
+            if p is None and (len(retained) + len(new_bought)) >= n_slots:
                 continue          # 하드캡: 신규 매수로 보유 종목 수 초과 금지
             cur_val = (p.shares * price) if p else 0.0
             gap = target_val[t] - cur_val
             if gap > REBAL_BAND * target_val[t]:           # 저비중/신규
                 spend = min(gap, cash)
                 qty = int(spend / price)
+                if p is None and qty * price < min_lot:
+                    continue      # 현금이 모자라 자투리로만 열 수 있음 → 신규 진입 안 함
                 if qty >= 1:
                     cost = qty * price
                     buys.append({"ticker": t, "shares": qty, "score": s.total,
