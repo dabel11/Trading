@@ -81,3 +81,6 @@ equity_history.json
 monitor_state.json
 .monitor.lock
 ui_ng/_server.log.1
+
+# 백테스트 연구용 시세·구성 캐시 (재생성 가능)
+.bt_cache/

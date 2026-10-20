@@ -122,3 +122,114 @@ def get_combined(names: list[str]) -> list[str]:
             if s not in seen:
                 seen.add(s); out.append(s)
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# S&P 500 시점별 구성 근사 (백테스트 연구용 — 라이브 경로 미사용)
+# ──────────────────────────────────────────────────────────────────────────────
+# 위키 'Selected changes to the list of S&P 500 components' 표는 2026 현재
+# 'Historical components of the S&P 500' 문서로 옮겨져 있다. 현재 구성종목에서
+# 출발해 변경 이력을 최신→과거로 되감으면 과거 시점의 구성을 근사할 수 있다.
+# 한계: 표가 '선별(selected)' 이력이라 누락이 있을 수 있고, 티커 변경(FB→META 등)은
+# 편입/편출로 기록되지 않아 현재 티커로 이어 붙는다.
+
+SP500_URL = INDEXES["S&P 500"][0]
+SP500_CHANGES_URL = "https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500"
+
+
+def _yf_symbol(s) -> str:
+    """위키 표기 → yfinance 표기 (BRK.B → BRK-B). 비정상 값은 ''."""
+    s = str(s).strip().upper()
+    if not s or s == "NAN":
+        return ""
+    s = s.replace(".", "-")
+    return s if (len(s) <= 6 and s.replace("-", "").isalpha()) else ""
+
+
+def _read_html_tables(url: str):
+    import pandas as pd
+    import urllib.request
+    from io import StringIO
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+    return pd.read_html(StringIO(html))
+
+
+def parse_sp500_changes(tbl) -> list[tuple[str, str, str]]:
+    """변경 이력 표(DataFrame) → [(YYYY-MM-DD, 편입 티커, 편출 티커)] (빈 칸은 '')."""
+    import pandas as pd
+    cols = [" ".join(str(x) for x in c) if isinstance(c, tuple) else str(c)
+            for c in tbl.columns]
+    t = tbl.copy()
+    t.columns = cols
+
+    def _col(*need):
+        for c in cols:
+            if all(n.lower() in c.lower() for n in need):
+                return c
+        raise KeyError(need)
+    c_date = _col("date")
+    c_add, c_rem = _col("added", "ticker"), _col("removed", "ticker")
+    out = []
+    for _, r in t.iterrows():
+        d = pd.to_datetime(r[c_date], errors="coerce")
+        if pd.isna(d):
+            continue
+        out.append((d.strftime("%Y-%m-%d"), _yf_symbol(r[c_add]), _yf_symbol(r[c_rem])))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def fetch_sp500_snapshot() -> dict:
+    """현재 구성(티커·GICS 섹터) + 변경 이력 스냅샷. 네트워크 호출 — 결과는 호출자가 캐시.
+
+    구성종목 티커는 get_index('S&P 500') 를 쓰고, GICS 섹터만 같은 표에서 보강한다."""
+    members = list(get_index("S&P 500"))
+    sectors: dict = {}
+    try:
+        for tbl in _read_html_tables(SP500_URL):
+            if "Symbol" in tbl.columns and "GICS Sector" in tbl.columns:
+                for s, g in zip(tbl["Symbol"], tbl["GICS Sector"]):
+                    if _yf_symbol(s):
+                        sectors[_yf_symbol(s)] = str(g)
+                break
+    except Exception:
+        pass
+    changes = []
+    for tbl in _read_html_tables(SP500_CHANGES_URL):
+        try:
+            changes = parse_sp500_changes(tbl)
+        except KeyError:
+            continue
+        if changes:
+            break
+    if not members or not changes:
+        raise RuntimeError("S&P 500 구성/변경 이력을 가져오지 못했습니다")
+    return {"fetched": time.strftime("%Y-%m-%d"), "members": members,
+            "sectors": sectors, "changes": changes}
+
+
+def sp500_membership(current: list[str], changes: list[tuple[str, str, str]],
+                     dates) -> dict[str, list[bool]]:
+    """시점별 구성 근사 → {티커: [dates 각 날짜에 구성종목이었는지]}.
+
+    현재 구성에서 출발해, 각 날짜 D 보다 '뒤에' 효력이 생긴 변경을 되감는다
+    (편입 티커 제거, 편출 티커 복원). 효력일 당일부터 편입·편출이 반영된다."""
+    import pandas as pd
+    ds = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in dates]
+    chg = sorted(changes, key=lambda x: x[0], reverse=True)
+    cur = {s for s in current if s}
+    order = sorted(range(len(ds)), key=lambda i: ds[i], reverse=True)
+    rows: dict[int, set] = {}
+    j = 0
+    for i in order:
+        while j < len(chg) and chg[j][0] > ds[i]:
+            _, added, removed = chg[j]
+            if added:
+                cur.discard(added)
+            if removed:
+                cur.add(removed)
+            j += 1
+        rows[i] = set(cur)
+    tickers = sorted(set().union(*rows.values())) if rows else []
+    return {t: [t in rows[i] for i in range(len(ds))] for t in tickers}
