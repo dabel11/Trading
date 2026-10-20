@@ -3376,5 +3376,8 @@ if __name__ in {"__main__", "__mp_main__"}:
         _ngapp.on_startup(_start_monitor)
     except Exception:
         pass
-    ui.run(host="127.0.0.1", port=8502, title="AI 트레이딩",
+    # 서버(컨테이너)에선 TRADE_HOST=0.0.0.0 — 외부 노출은 compose 가 127.0.0.1 로만 연다.
+    # UI 에 로그인이 없으므로 이 포트를 인터넷에 직접 열면 누구나 주문할 수 있다.
+    ui.run(host=os.environ.get("TRADE_HOST", "127.0.0.1"),
+           port=int(os.environ.get("TRADE_PORT", "8502")), title="AI 트레이딩",
            show=False, reload=False, dark=True, favicon="📈")
