@@ -7,6 +7,7 @@
   - 이메일  : SMTP (Gmail 앱 비밀번호)
 """
 
+import os
 import json
 import smtplib
 import requests
@@ -398,7 +399,19 @@ def telegram_get_chat_ids(bot_token: str) -> tuple[list[dict], str]:
         return [], f"네트워크 오류: {e}"
 
 
+# 발송 전역 차단 스위치 — 테스트·백테스트·감사 프로브용.
+# 테스트가 실제 체결 경로(core.execution)를 타면 log_order 가 알림까지 발송해
+# 텔레그램에 "가짜 매매"가 찍혔다(AAPL 10주 @$100 → $110 같은 픽스처).
+# 실거래 알림과 구분되지 않아 혼란을 주므로, 돈이 오가지 않는 실행에서는
+# 환경변수로 발송 자체를 끈다.  TRADE_NOTIFY_DISABLED=1
+def notifications_disabled() -> bool:
+    return os.environ.get("TRADE_NOTIFY_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _dispatch(msg: dict, cfg: dict = None) -> dict[str, bool]:
+    if notifications_disabled():
+        return {}
     if cfg is None:
         cfg = load_config()
     results = {}

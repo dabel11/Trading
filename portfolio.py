@@ -600,6 +600,11 @@ class PortfolioManager:
             p = held_now.get(t)
             if p is None or t in rotated:
                 continue
+            if p.days_held() < MIN_ROTATE_DAYS:
+                continue        # 당일 매수 → 트림 안 함(회전과 같은 정책).
+                                # 점수가 흔들려 목표 비중만 바뀌어도 방금 산 물량을
+                                # 즉시 되파는 낭비 거래가 됐다. 위험 축소는 1단계
+                                # (손절·트레일링)가 담당하므로 막아도 안전하다.
             price = current_prices.get(t, p.entry_price)
             cur_val = p.shares * price
             trim_to = min(weight[t], trim_cap) * total_equity

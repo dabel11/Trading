@@ -9,6 +9,14 @@
 """
 
 import os
+
+# ── 알림 발송 전역 차단 (import 보다 먼저) ──────────────────────────────────
+# 테스트는 실제 체결 경로(core.execution.execute_orders)를 타는데, 그 안의
+# log_order 가 notifier 로 알림까지 보낸다. 차단하지 않으면 테스트를 돌릴 때마다
+# 텔레그램에 픽스처 매매(AAPL 10주 @$100 → $110 등)가 실제 알림으로 찍혀
+# 진짜 거래와 구분되지 않는다. 파일 상단 선언이라 모든 테스트에 자동 적용된다.
+os.environ["TRADE_NOTIFY_DISABLED"] = "1"
+
 import json
 import time
 import tempfile
@@ -823,6 +831,30 @@ def test_rotate_requires_score_margin():
                             {"OLD": 100, "NEW": 50},
                             dynamic=True, available_override=0)
     assert any(s["ticker"] == "OLD" and "rotate" in s["reason"] for s in o2["sell"])
+
+
+def test_same_day_buy_is_not_trimmed():
+    """당일 매수분은 트림(비중 축소) 대상이 아니다 — 회전과 같은 정책.
+
+    점수가 흔들려 목표 비중만 바뀌어도 방금 산 물량을 즉시 되파는 낭비 거래가
+    났다. 하루가 지나면 정상적으로 트림된다(리밸런싱 자체는 막지 않는다)."""
+    from datetime import timedelta as _td
+    portfolio = _isolate_portfolio()
+    pm = portfolio.PortfolioManager()
+    pm.record_buy("AAA", shares=100, price=50.0, score=80)   # $5,000 과비중
+    scores = [_score(t, v) for t, v in
+              [("AAA", 80), ("BBB", 78), ("CCC", 76), ("DDD", 74), ("EEE", 72)]]
+    prices = {"AAA": 50.0, "BBB": 40.0, "CCC": 30.0, "DDD": 20.0, "EEE": 10.0}
+
+    o = pm.generate_orders(scores, prices, dynamic=True, available_override=5000.0)
+    assert not [s for s in o["sell"] if "trim" in s["reason"]], \
+        "당일 매수분은 트림되면 안 됨"
+
+    # 하루 지난 뒤에는 정상 트림 (리밸런싱 기능 자체는 살아 있어야 함)
+    pm.positions["AAA"].entry_date = (portfolio._today() - _td(days=1)).isoformat()
+    o2 = pm.generate_orders(scores, prices, dynamic=True, available_override=5000.0)
+    assert [s for s in o2["sell"] if "trim" in s["reason"] and s["ticker"] == "AAA"], \
+        "하루 지난 과비중은 트림돼야 함"
 
 
 def test_dynamic_alloc_keeps_running_winner():
