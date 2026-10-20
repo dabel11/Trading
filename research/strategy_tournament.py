@@ -8,13 +8,17 @@
   • 일간 수익률 상관 + 계층 군집으로 '계열'을 묶고, 계열별 대표만 고른다
     (대표 = S&P 500 유니버스 DSR 최고 — 손으로 고른 23종목은 선택 편향이 커서 보조)
 
+동점 처리: 이산 점수 전략은 수십~백수십 종목이 같은 점수다. 기본은 무작위 동점 처리를 seed K개로
+  평균(지표 = seed 평균 ± sd, DSR·상관 = 평균 곡선). 이전 토너먼트 시도는 DSR 의 N·V 에 합친다.
+
 실행 (긴 작업 — 백그라운드 권장):
-  python3 research/strategy_tournament.py                      # 개발 구간 토너먼트
-  python3 research/strategy_tournament.py --workers 6
+  python3 research/strategy_tournament.py                      # 개발 구간, 무작위 동점 K=20
+  python3 research/strategy_tournament.py --tie-break random,dollar_volume --verify-prior
+  python3 research/strategy_tournament.py --tie-break none     # 이전(입력 순서) 흐름 — 같은 날짜 결과를 덮어씀
   # 봉인 구간 1회 확인 — 사용자 승인 후, 개발 구간에서 고른 대표만:
   python3 research/strategy_tournament.py --holdout --keys a,b,c
 
-결과: docs/strategy-tournament-<날짜>.md · research/results/strategy-tournament-<날짜>.json
+결과: docs/strategy-tournament-<날짜>[-<tag>].md · research/results/strategy-tournament-<날짜>[-<tag>].json
 라이브 경로(portfolio·core)는 건드리지 않는다 — backtester.run 이 결정 로직을 그대로 빌려 쓴다.
 """
 from __future__ import annotations
@@ -57,21 +61,41 @@ RUN_KW = dict(capital=10_000.0, min_score=float(MIN_SCORE_TO_BUY),
 
 # 봉인 구간 통과 기준 (개발 구간에서 고른 대표에만 1회 적용)
 PASS_MDD_SLACK = 0.05                # MDD 가 SPY 보다 5%p 넘게 나쁘면 탈락
-HOLDOUT_MARK = ROOT / "research" / "results" / "holdout-opened.json"
+RESULTS_DIR = ROOT / "research" / "results"
+HOLDOUT_MARK = RESULTS_DIR / "holdout-opened.json"
+TIE_SEEDS = 20                       # 무작위 동점 처리: 전략마다 이만큼 seed 를 돌려 평균
 
 _BUNDLE = None
+_ALPHA: dict = {}
 
 
 def _init_worker(path: str):
-    global _BUNDLE
+    global _BUNDLE, _ALPHA
     with open(path, "rb") as f:
         _BUNDLE = pickle.load(f)
+    names = sorted(_BUNDLE["stock_data"])
+    _ALPHA = {t: i / max(1, len(names) - 1) for i, t in enumerate(names)}
 
 
 def _run_one(key: str):
     t0 = time.time()
     r = bt.run(strategy=key, prefetched=_BUNDLE, **RUN_KW)
     return key, r, time.time() - t0
+
+
+def alpha_position(r, alpha: dict) -> float:
+    """산 종목들의 알파벳 위치 평균(0=맨 앞 'A…', 1=맨 뒤). 편향 없으면 ≈ 0.5."""
+    pos = [alpha[t] for t, _ in {(x.ticker, x.entry_date) for x in r.trades} if t in alpha]
+    return float(np.mean(pos)) if pos else float("nan")
+
+
+def _run_task(task):
+    """(전략, tie_break, seed) 1건. tie_break=None 이면 예전 동작(입력 순서)."""
+    key, mode, seed = task
+    t0 = time.time()
+    b = _BUNDLE if mode is None else dict(_BUNDLE, tie_break=mode, tie_seed=seed)
+    r = bt.run(strategy=key, prefetched=b, **RUN_KW)
+    return task, r, alpha_position(r, _ALPHA), time.time() - t0
 
 
 def run_universe(universe: str, keys: list[str], start: str, end: str,
@@ -103,6 +127,108 @@ def run_universe(universe: str, keys: list[str], start: str, end: str,
     except OSError:
         pass
     return results, meta
+
+
+def run_tasks(universe: str, tasks: list, start: str, end: str, workers: int, log) -> tuple[dict, dict]:
+    """개발 구간 번들 하나로 (전략, tie_break, seed) 작업들을 돌린다 → ({작업: (결과, 알파벳 위치)}, meta)."""
+    t0 = time.time()
+    bundle = bt.load_research_bundle(universe, start, end)
+    meta = bundle["meta"]
+    log(f"[{universe}] 번들 {meta['loaded']}/{meta['requested']}종목 ({time.time() - t0:.0f}s) "
+        f"평가 {meta['eval_start']}~{meta['eval_end']} · 작업 {len(tasks)}건")
+    path = bt.CACHE_DIR / f"bundle_{universe}_{start}_{end}.pkl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    del bundle
+    out: dict = {}
+    try:
+        if workers <= 1:
+            _init_worker(str(path))
+            it = map(_run_task, tasks)
+            ex = None
+        else:
+            ex = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(str(path),))
+            it = ex.map(_run_task, tasks)
+        for task, r, al, dt in it:
+            out[task] = (r, al)
+            k, mode, seed = task
+            log(f"  {universe:9} {str(mode or 'none'):13} {'' if seed is None else seed:>2} {k:20} "
+                f"{r.total_return:+8.1%} 샤프 {r.sharpe:5.2f} 알파벳 {al:.2f} ({dt:.0f}s) "
+                f"[{len(out)}/{len(tasks)}]")
+        if ex:
+            ex.shutdown()
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return out, meta
+
+
+def _spread(xs) -> dict:
+    a = np.asarray(xs, dtype=float)
+    return {"mean": float(a.mean()), "sd": float(a.std(ddof=1)) if len(a) > 1 else 0.0,
+            "min": float(a.min()), "max": float(a.max())}
+
+
+def aggregate_seeds(rs: list) -> tuple:
+    """같은 전략의 seed 별 결과 → (평균 곡선 BacktestResult, seed 통계).
+
+    평균 곡선 = 시드를 K 등분해 seed 마다 한 계좌씩 굴린 합과 같다 — 동점 선택의 운을 평균낸
+    '전략의 기대 수익 흐름'이라 DSR·상관에 쓴다. 다만 K 계좌로 분산된 효과가 있어 한 계좌의
+    샤프보다 높게 나온다. 그래서 보고하는 수익·샤프·MDD 는 seed 평균 ± 표준편차(한 계좌 기대치)."""
+    curve = pd.concat([r.equity_curve for r in rs], axis=1).mean(axis=1)
+    mean = bt.BacktestResult(trades=[], equity_curve=curve, start_capital=rs[0].start_capital,
+                             benchmark=rs[0].benchmark)
+    seed = {"ret": _spread([r.total_return for r in rs]), "cagr": _spread([r.cagr for r in rs]),
+            "mdd": _spread([r.mdd for r in rs]), "sharpe": _spread([r.sharpe for r in rs]),
+            "win": _spread([r.win_rate for r in rs]), "trades": _spread([len(r.trades) for r in rs])}
+    return mean, {"n_seeds": len(rs), "seed": seed, "mdds": [r.mdd for r in rs],
+                  "moments": [bt.sharpe_moments(r.daily_returns) for r in rs]}
+
+
+def apply_seed_stats(row: dict, st: dict, bench: dict, n_trials: int, sr_var: float) -> dict:
+    """summarize_results 의 평균 곡선 행 → 보고용 행. 수익·샤프·MDD·승률·거래 = seed 평균
+    (curve_* 에 평균 곡선 값 보존). DSR·보정 샤프·왜도·첨도·상관은 평균 곡선 그대로."""
+    row = dict(row)
+    row.update(curve_ret=row["ret"], curve_sharpe=row["sharpe"], curve_mdd=row["mdd"],
+               n_seeds=st["n_seeds"])
+    for m, s in st["seed"].items():
+        row[m] = s["mean"]
+        row[f"{m}_sd"], row[f"{m}_min"], row[f"{m}_max"] = s["sd"], s["min"], s["max"]
+    ds = [bt.deflated_sharpe(mo["sr"], mo["T"], mo["skew"], mo["kurt"], n_trials, sr_var)
+          for mo in st["moments"]]
+    sharpes = [mo["sr"] * math.sqrt(252) for mo in st["moments"]]
+    row["seed_dsr_median"] = float(np.median([d["dsr"] for d in ds]))
+    row["seed_sr_deflated_mean"] = float(np.mean([d["sr_deflated"] for d in ds]))
+    row["seed_beat_spy"] = float(np.mean([s >= bench["sharpe"] for s in sharpes]))
+    row["seed_pass_all"] = float(np.mean([
+        s >= bench["sharpe"] and m >= bench["mdd"] - PASS_MDD_SLACK and d["sr_deflated"] > 0
+        for s, m, d in zip(sharpes, st["mdds"], ds)]))
+    return row
+
+
+def load_prior(spec: str, exclude: Path | None = None) -> list[dict]:
+    """이전 토너먼트 결과(JSON) → 그때의 시도들. DSR 의 N·V 에 넣어 '재시도'를 숨기지 않는다.
+
+    spec: "auto"(research/results/strategy-tournament-*.json 전부) · "none" · 쉼표 구분 경로.
+    새 형식은 new_trials(그 실행에서 새로 한 시도만)를 쓰고, 옛 형식은 rows 전부가 시도다
+    — 재실행 결과가 앞선 시도를 다시 담고 있어도 이중으로 세지 않는다."""
+    if spec == "none":
+        return []
+    paths = (sorted(RESULTS_DIR.glob("strategy-tournament-*.json")) if spec == "auto"
+             else [Path(p) if Path(p).is_absolute() else ROOT / p for p in spec.split(",") if p])
+    out = []
+    for p in paths:
+        if exclude is not None and p.resolve() == exclude.resolve():
+            continue
+        d = json.loads(p.read_text())
+        trials = d.get("new_trials") or [
+            {"variant": "none", "universe": u, "key": k, "sr": r["sharpe"] / math.sqrt(252)}
+            for u, rows in d["rows"].items() for k, r in rows.items()]
+        out.append({"path": p, "data": d, "trials": trials})
+    return out
 
 
 # ── 선정 ─────────────────────────────────────────────────────────────────────
@@ -453,6 +579,332 @@ def write_holdout_report(path: Path, out: dict, keys: list[str], end: str, today
     path.write_text("\n".join(L), encoding="utf-8")
 
 
+# ── 동점 처리 재실행 (개발 구간) ──────────────────────────────────────────────
+# 2026-10-20 봉인 구간 사후 감사: 이산 점수 전략은 S&P 500 에서 수십~백수십 종목이 동점이고,
+# 동점이 번들 입력 순서(알파벳순)로 갈려 'A' 종목만 샀다. 동점 처리를 바꿔 개발 구간만 다시 고른다.
+
+TIE_LABEL = {"random": "무작위 (seed 평균)", "dollar_volume": f"거래대금 큰 순 ({bt.TIE_DV_WINDOW}일 평균)",
+             "none": "입력 순서 = 알파벳순 (이전)"}
+
+
+def run_tiebreak(variants: list[str], keys: list[str], seeds: int, prior_spec: str,
+                 verify_prior: bool, workers: int, threshold: float, tag: str, log) -> dict:
+    """동점 처리 방식(variants, 첫 번째가 주 방식)별로 개발 구간 토너먼트를 다시 돌린다.
+
+    • random 은 seed 0..K−1 을 돌려 평균 — 지표는 seed 평균 ± 표준편차, DSR·상관은 평균 곡선
+    • DSR 의 N·V 에 이전 토너먼트 시도(prior)와 이번 모든 방식의 시도를 합친다(재시도 보정)
+    • verify_prior: tie_break 없이 다시 돌려 이전 결과가 그대로 재현되는지 확인(새 시도 아님)"""
+    start, end = bt.DEV_START, bt.DEV_END
+    today = date.today().isoformat()
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    js = RESULTS_DIR / f"strategy-tournament-{today}-{tag}.json"
+    doc = ROOT / "docs" / f"strategy-tournament-{today}-{tag}.md"
+    prior = load_prior(prior_spec, exclude=js)
+    modes = {v: (None if v == "none" else v) for v in variants}
+    raw, metas = {}, {}
+    for u in UNIVERSES:
+        tasks = [(k, modes[v], s) for v in variants
+                 for s in (range(seeds) if v == "random" else [None]) for k in keys]
+        if verify_prior and "none" not in variants:
+            tasks += [(k, None, None) for k in keys]
+        raw[u], metas[u] = run_tasks(u, tasks, start, end, workers, log)
+
+    agg, stats, alpha = {}, {}, {}
+    for v in variants:
+        agg[v], stats[v], alpha[v] = {}, {}, {}
+        for u in UNIVERSES:
+            agg[v][u], stats[v][u], alpha[v][u] = {}, {}, {}
+            for k in keys:
+                ts = sorted((t for t in raw[u] if t[0] == k and t[1] == modes[v]),
+                            key=lambda t: -1 if t[2] is None else t[2])
+                agg[v][u][k], stats[v][u][k] = aggregate_seeds([raw[u][t][0] for t in ts])
+                alpha[v][u][k] = float(np.nanmean([raw[u][t][1] for t in ts]))
+
+    prior_trials = [t for p in prior for t in p["trials"]]
+    new_trials = [{"variant": v, "universe": u, "key": k,
+                   "sr": bt.sharpe_moments(agg[v][u][k].daily_returns)["sr"]}
+                  for v in variants if v != "none" or not prior for u in UNIVERSES for k in keys]
+    srs = [t["sr"] for t in prior_trials + new_trials]
+    n_trials, sr_var = len(srs), float(np.var(srs, ddof=1))
+    log(f"시도 수 N={n_trials} (이전 {len(prior_trials)} + 이번 {len(new_trials)}) · V={sr_var:.3e}")
+
+    res = {}
+    for v in variants:
+        summ = {u: bt.summarize_results(agg[v][u], n_trials=n_trials, sr_var=sr_var,
+                                        family_threshold=threshold) for u in UNIVERSES}
+        bench = {u: summ[u]["benchmark"] for u in UNIVERSES}
+        rows = {u: {r["key"]: {**apply_seed_stats(r, stats[v][u][r["key"]], bench[u], n_trials, sr_var),
+                               "alpha": alpha[v][u][r["key"]]}
+                    for r in summ[u]["rows"]} for u in UNIVERSES}
+        corr, fam = combined_families(summ, threshold)
+        res[v] = {"rows": rows, "bench": bench, "corr": corr, "families": fam,
+                  "reps": pick_representatives(fam, rows, PRIMARY),
+                  "corr_u": {u: summ[u]["corr"] for u in UNIVERSES}}
+
+    before = next((p for p in prior if p["trials"] and p["trials"][0]["variant"] == "none"), None)
+    verify = None
+    if verify_prior and before:
+        base = {u: {k: raw[u][(k, None, None)] for k in keys} for u in UNIVERSES}
+        brows = before["data"]["rows"]
+        diffs = [max(abs(base[u][k][0].total_return - brows[u][k]["ret"]),
+                     abs(base[u][k][0].sharpe - brows[u][k]["sharpe"]))
+                 for u in UNIVERSES for k in keys if k in brows.get(u, {})]
+        verify = {"max_abs_diff": max(diffs) if diffs else None, "n": len(diffs),
+                  "alpha": {u: {k: base[u][k][1] for k in keys} for u in UNIVERSES}}
+        log(f"이전 결과 재현: {len(diffs)}건, 수익률·샤프 최대 차이 {verify['max_abs_diff']:.2e}")
+
+    ctx = dict(today=today, start=start, end=end, keys=keys, variants=variants, seeds=seeds,
+               res=res, metas=metas, n_trials=n_trials, sr_var=sr_var, threshold=threshold,
+               prior=prior, prior_trials=prior_trials, new_trials=new_trials, before=before,
+               verify=verify, tag=tag)
+    write_tiebreak_report(doc, ctx)
+    with open(bt.CACHE_DIR / f"tiebreak-ctx-{today}-{tag}.pkl", "wb") as f:
+        pickle.dump(ctx, f)             # --rewrite-report 로 다시 계산 없이 보고서만 고칠 때
+    js.write_text(json.dumps({
+        "date": today, "window": [start, end], "tag": tag, "tie_breaks": variants,
+        "primary": variants[0], "seeds": seeds, "run_kwargs": RUN_KW,
+        "n_trials": n_trials, "sr_var": sr_var, "threshold": threshold,
+        "prior": [{"path": str(p["path"].relative_to(ROOT)), "n_trials": len(p["trials"])} for p in prior],
+        "new_trials": new_trials, "verify_prior": verify,
+        "variants": {v: {"benchmark": r["bench"], "families": r["families"],
+                         "representatives": r["reps"],
+                         "rows": {u: {k: _clean_row(x) for k, x in r["rows"][u].items()} for u in UNIVERSES},
+                         "corr_avg": r["corr"].round(4).to_dict()} for v, r in res.items()},
+        "meta": metas,
+    }, ensure_ascii=False, indent=1, default=str))
+    log(f"저장: {doc.relative_to(ROOT)} · {js.relative_to(ROOT)}")
+    P, v0 = PRIMARY, variants[0]
+    for f, k in sorted(res[v0]["reps"].items()):
+        r = res[v0]["rows"][P][k]
+        log(f"  계열 {f}: 대표 {k} — S&P 샤프 {r['sharpe']:.2f}±{r.get('sharpe_sd', 0):.2f} "
+            f"(SPY {res[v0]['bench'][P]['sharpe']:.2f}) MDD {r['mdd']:.1%} DSR {r['dsr']:.3f} "
+            f"→ {'생존' if dev_verdict(r, res[v0]['bench'][P])['all'] else '탈락'}")
+    return ctx
+
+
+def _pm(r: dict, m: str, fmt) -> str:
+    """seed 평균 ± 표준편차 (seed 1개면 값만)."""
+    if r.get("n_seeds", 1) <= 1:
+        return fmt(r[m])
+    return f"{fmt(r[m])} ± {fmt(r[f'{m}_sd']).lstrip('+')}"
+
+
+def _sh(x):
+    return _num(x)
+
+
+def _pp(x):
+    return _pct(x, 1)
+
+
+def _ok(v):
+    return "✅" if v else "❌"
+
+
+def _verdict_cells(r, b):
+    v = dev_verdict(r, b)
+    return f"{_ok(v['sharpe'])} | {_ok(v['mdd'])} | {_ok(v['dsr'])} | **{'생존' if v['all'] else '탈락'}**"
+
+
+def write_tiebreak_report(path: Path, ctx: dict):
+    P, W = PRIMARY, "watchlist"
+    v0 = ctx["variants"][0]
+    R = ctx["res"][v0]
+    rows, bench, fam, reps, corr = R["rows"], R["bench"], R["families"], R["reps"], R["corr"]
+    sp = ctx["metas"][P]
+    n, V = ctx["n_trials"], ctx["sr_var"]
+    sr0 = rows[P][ctx["keys"][0]]["sr0"]
+    before = ctx["before"]
+    brow = before["data"]["rows"] if before else {}
+    bbench = before["data"]["benchmark"] if before else {}
+    bfam = {k: int(f) for k, f in (before["data"]["families"] if before else {}).items()}
+    breps = {int(f): k for f, k in (before["data"]["representatives"] if before else {}).items()}
+    verify = ctx["verify"]
+    by_fam: dict = {}
+    for k, f in fam.items():
+        by_fam.setdefault(f, []).append(k)
+
+    def counts(rws, b):
+        return {"beat": sum(r["sharpe"] >= b["sharpe"] for r in rws.values()),
+                "dsr": sum(r["dsr"] > 0.5 for r in rws.values()),
+                "mdd": sum(r["mdd"] >= b["mdd"] - PASS_MDD_SLACK for r in rws.values()),
+                "all": [k for k, r in rws.items() if dev_verdict(r, b)["all"]],
+                "two": [k for k, r in rws.items() if not dev_verdict(r, b)["all"]
+                        and sum(dev_verdict(r, b)[c] for c in ("sharpe", "mdd", "dsr")) >= 2]}
+
+    after_c = {u: counts(rows[u], bench[u]) for u in UNIVERSES}
+    before_c = {u: counts(brow[u], bbench[u]) for u in UNIVERSES} if before else {}
+
+    def bdsr_new(k, u="sp500"):
+        """이전(알파벳순) 결과를 이번 N·V 로 다시 보정한 DSR — N 차이를 뺀 비교용."""
+        r = brow[u][k]
+        return bt.deflated_sharpe(r["sharpe"] / math.sqrt(252), r["n_obs"], r["skew"], r["kurt"], n, V)
+
+    cmd = ("python3 research/strategy_tournament.py --tie-break " + ",".join(ctx["variants"])
+           + f" --seeds {ctx['seeds']} --prior " + ",".join(str(p["path"].relative_to(ROOT)) for p in ctx["prior"])
+           + (" --verify-prior" if verify else "") + f" --tag {ctx['tag']}")
+    surv = after_c[P]["all"]
+    rep_set, brep_set = set(reps.values()), set(breps.values())
+    L = [f"# 규칙 전략 토너먼트 재실행 — 동점 처리 수정 ({ctx['today']})", "",
+         f"개발 구간 **{ctx['start']} ~ {ctx['end']}** (평가 {sp['eval_start']} ~ {sp['eval_end']}) 만 다시 돌렸다. "
+         f"봉인 구간 {bt.HOLDOUT_START}~ 은 **열지 않았다** — 이미 `ichimoku` 1회 확인에 쓰였다 "
+         f"(`{HOLDOUT_MARK.relative_to(ROOT)}`). 이전 결과: `docs/strategy-tournament-2026-10-20.md`, "
+         "결함 감사: `docs/strategy-holdout-2026-10-20.md` '사후 감사' 절.", "",
+         f"생성: `{cmd}`", "",
+         "## 요약 (자동 생성)", "",
+         f"- **동점 처리**: 주 방식 **{TIE_LABEL[v0]}**, seed K={ctx['seeds']}. "
+         + (f"비교 방식: {', '.join(TIE_LABEL[v] for v in ctx['variants'][1:])}. " if len(ctx["variants"]) > 1 else "")
+         + "매매 규칙·파라미터·평가 기준은 이전과 같다(동점을 가르는 순서만 바뀜).",
+         f"- **시도 수 N = {n}** = 이전 토너먼트 {len(ctx['prior_trials'])} + 이번 {len(ctx['new_trials'])} "
+         f"(동점 처리 {len([v for v in ctx['variants'] if v != 'none'])}방식 × 전략 {len(ctx['keys'])} × 유니버스 {len(UNIVERSES)}). "
+         f"재시도이므로 이전 시도를 N·V 에 합쳤다. 운으로 기대되는 최대 샤프 SR0 = **{sr0:.2f}** (연율; 이전 N=52 일 때 "
+         f"{brow[P][ctx['keys'][0]]['sr0']:.2f})." if before else f"- 시도 수 N = {n}, SR0 = {sr0:.2f}.",
+         f"- **개발 구간 생존 (S&P 500, 통과 기준 세 조건 모두)**: "
+         + (", ".join(f"**`{k}`**" for k in surv) if surv else "**없음 (0개)**")
+         + (f" — 이전(알파벳순) {len(before_c[P]['all'])}개." if before else "."),
+         *[f"- {UNIVERSE_LABEL[u]}: 샤프(seed 평균) ≥ SPY {bench[u]['sharpe']:.2f} **{after_c[u]['beat']}개**"
+           + (f" (이전 {before_c[u]['beat']})" if before else "")
+           + f", DSR>0.5 **{after_c[u]['dsr']}개**" + (f" (이전 {before_c[u]['dsr']})" if before else "")
+           + f", MDD 허용 {after_c[u]['mdd']}개, 세 조건 모두 **{len(after_c[u]['all'])}개**"
+           + (f" (이전 {len(before_c[u]['all'])})" if before else "")
+           + (f"; 두 조건만: {', '.join(f'`{k}`' for k in after_c[u]['two'])}" if after_c[u]["two"] else "")
+           + f" / {len(rows[u])}" for u in [P, W]],
+         f"- **계열 {len(by_fam)}개** (이전 {len(set(bfam.values()))}개). 대표 = 계열별 S&P 500 DSR 최고. "
+         + (f"대표가 바뀜: 빠짐 {', '.join(f'`{k}`' for k in sorted(brep_set - rep_set)) or '없음'} · "
+            f"새로 들어옴 {', '.join(f'`{k}`' for k in sorted(rep_set - brep_set)) or '없음'}." if before else ""),
+         ]
+    if verify:
+        al_b = verify["alpha"][P].get("ichimoku")
+        al_a = rows[P].get("ichimoku", {}).get("alpha")
+        L.append(f"- **재현·편향 확인**: tie_break 없이 다시 돌린 {verify['n']}개가 이전 JSON 과 수익률·샤프 최대 차이 "
+                 f"{verify['max_abs_diff']:.1e} (기존 동작 보존). S&P 500 에서 산 종목의 알파벳 위치(0=맨 앞, 0.5=편향 없음): "
+                 + (f"`ichimoku` {al_b:.2f} → {al_a:.2f}, " if al_b is not None and al_a is not None else "")
+                 + f"26개 평균 {np.nanmean(list(verify['alpha'][P].values())):.2f} → "
+                 f"{np.nanmean([r['alpha'] for r in rows[P].values()]):.2f}.")
+    L += ["", "## 동점 처리 — 무엇을 바꿨나", "",
+          "- `backtester.run()` 에 연구용 번들 키 `tie_break`·`tie_seed` 를 추가했다(`bt.tie_order`). "
+          "키가 없으면 예전과 똑같이 안정 정렬(입력 순서). 라이브 경로(`portfolio.py`·`core/`)·`load_market_data`·"
+          "`_strategy_score_bt`·`run()`/`compare_strategies()` 시그니처는 바꾸지 않았다.",
+          f"- **무작위**: 리밸런싱 날마다 (seed, 날짜 인덱스)로 종목 순서를 섞어 동점을 가른다. 종목 이름순으로 섞으므로 "
+          f"번들 입력 순서와 무관하고, 같은 seed 면 결과가 재현된다. 전략마다 seed 0~{ctx['seeds'] - 1} 을 돌렸다.",
+          "  - 보고하는 **수익·CAGR·MDD·샤프·승률·거래 수 = seed 평균 (± 표준편차)** — 한 계좌가 기대할 값. "
+          "통과 기준(샤프·MDD)도 이 값으로 판정했다.",
+          "  - **DSR·보정 샤프·상관·계열 = seed 평균 곡선**(시드를 K 등분해 seed 마다 굴린 계좌들의 합)의 일간 수익률. "
+          "평균 곡선은 동점 선택이 K 갈래로 분산된 포트폴리오라 한 계좌보다 샤프가 높게 나온다(아래 표의 '평균 곡선 샤프'). "
+          "그래서 DSR 은 낙관 쪽이며, 보수적 확인으로 seed 별 DSR 의 중앙값도 병기했다.",
+          f"- **거래대금(비교용)**: 동점이면 최근 {bt.TIE_DV_WINDOW}거래일 평균 거래대금(종가×거래량)이 큰 종목부터. "
+          "결정적이라 seed 가 필요 없지만, 동점이 많은 전략에서는 사실상 '조건 통과 종목 중 대형·유동성주'를 사는 "
+          "**대형주 기울기가 생긴다** — 신호가 아니라 전략 자체가 바뀌는 셈이라 주 방식으로 쓰지 않고 비교만 했다.",
+          "- **라이브는 그대로다**: 라이브(`core/cycle.py` → `portfolio.generate_orders`)도 같은 정렬이라 동점이면 "
+          "후보 목록 순서(워치리스트 순서)대로 산다. 이번 범위 밖이라 고치지 않았다 — 이산 점수 전략을 라이브에 "
+          "올린다면 먼저 고쳐야 한다(아래 '다음 단계').", ""]
+
+    if before:
+        L += ["## 이전(알파벳순) ↔ 이후(무작위) — S&P 500", "",
+              f"이전 DSR 은 그때의 N=52 기준, '이전 DSR(N={n})' 은 이전 결과를 이번 N·V 로 다시 보정한 값(N 차이를 뺀 비교). "
+              "알파벳 위치 = 산 종목의 이름순 위치 평균(0=맨 앞, 0.5=편향 없음). 이후 DSR 내림차순.", "",
+              "| 전략 | 이전 샤프 | 이후 샤프 (평균 ± sd) | Δ샤프 | 이전 MDD | 이후 MDD | 이전 수익 | 이후 수익 | "
+              f"이전 DSR (N=52) | 이전 DSR (N={n}) | 이후 DSR | 알파벳 위치 이전→이후 | 계열 대표 이전 → 이후 |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+        for k in sorted(rows[P], key=lambda k: -rows[P][k]["dsr"]):
+            a, b = rows[P][k], brow[P][k]
+            ab = verify["alpha"][P].get(k) if verify else None
+            L.append(f"| {_name(k)} `{k}` | {_sh(b['sharpe'])} | {_pm(a, 'sharpe', _sh)} | "
+                     f"{a['sharpe'] - b['sharpe']:+.2f} | {_pp(b['mdd'])} | {_pp(a['mdd'])} | {_pct(b['ret'], 0)} | "
+                     f"{_pct(a['ret'], 0)} | {_num(b['dsr'], 3)} | {_num(bdsr_new(k)['dsr'], 3)} | {_num(a['dsr'], 3)} | "
+                     f"{_num(ab) if ab is not None else '—'} → {_num(a['alpha'])} | "
+                     f"`{breps.get(bfam.get(k), '—')}` → `{reps[fam[k]]}` |")
+        L.append("")
+
+    L += ["## 계열·대표 (이후)", "",
+          f"두 유니버스 평균 곡선 일간 수익률 상관행렬의 평균 → 평균 연결 군집, 평균 상관 ≥ {ctx['threshold']:.2f} 이면 같은 계열. "
+          f"대표 = S&P 500 DSR 최고(동률이면 샤프). 판정은 통과 기준 세 조건(개발 구간에 그대로 대 본 것).", "",
+          "| 계열 | 구성 | 대표 | 이전 대표(구성원들의 이전 계열) | 대표 샤프 S&P (평균 ± sd) | SPY | 대표 DSR (S&P/23) | "
+          "seed DSR 중앙값 | 대표 MDD (S&P) | 샤프≥SPY | MDD 허용 | 보정 샤프>0 | 판정 |",
+          "|---|---|---|---|---:|---:|---:|---:|---:|:-:|:-:|:-:|:-:|"]
+    for f in sorted(by_fam):
+        rep = reps[f]
+        rp, rw = rows[P][rep], rows[W][rep]
+        old = sorted({breps[bfam[k]] for k in by_fam[f] if k in bfam})
+        L.append(f"| {f} | {', '.join(f'`{k}`' for k in by_fam[f])} | **{_name(rep)}** `{rep}` | "
+                 f"{', '.join(f'`{k}`' for k in old) or '—'} | {_pm(rp, 'sharpe', _sh)} | {_sh(bench[P]['sharpe'])} | "
+                 f"{_num(rp['dsr'], 3)} / {_num(rw['dsr'], 3)} | {_num(rp['seed_dsr_median'], 3)} | {_pp(rp['mdd'])} | "
+                 f"{_verdict_cells(rp, bench[P])} |")
+
+    for u in (P, W):
+        L += ["", f"## 전체 결과 — {UNIVERSE_LABEL[u]} · {TIE_LABEL[v0]}", "",
+              "DSR(평균 곡선) 내림차순. 수익·MDD·샤프·거래는 seed 평균 (± sd), [최소~최대] 는 seed 별 샤프 범위. "
+              "'SPY 넘은 seed' = 샤프가 SPY 이상인 seed 비율.", "",
+              "| # | 전략 | 계열 | 총수익 | MDD | 샤프 | [최소~최대] | 샤프−SPY | 평균 곡선 샤프 | DSR | 보정 샤프 | "
+              "seed DSR 중앙값 | SPY 넘은 seed | 거래 | 알파벳 위치 | 판정 |",
+              "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|"]
+        for i, k in enumerate(sorted(rows[u], key=lambda k: -rows[u][k]["dsr"]), 1):
+            r = rows[u][k]
+            L.append(f"| {i} | {_name(k)} `{k}` | {fam[k]} | {_pm(r, 'ret', lambda x: _pct(x, 0))} | "
+                     f"{_pm(r, 'mdd', _pp)} | {_pm(r, 'sharpe', _sh)} | [{_sh(r['sharpe_min'])}~{_sh(r['sharpe_max'])}] | "
+                     f"{r['sharpe'] - bench[u]['sharpe']:+.2f} | {_sh(r['curve_sharpe'])} | {_num(r['dsr'], 3)} | "
+                     f"{r['sr_deflated']:+.2f} | {_num(r['seed_dsr_median'], 3)} | {r['seed_beat_spy']:.0%} | "
+                     f"{r['trades']:.0f} | {_num(r['alpha'])} | {'생존' if dev_verdict(r, bench[u])['all'] else '—'} |")
+
+    for v in ctx["variants"][1:]:
+        Rv = ctx["res"][v]
+        cv = counts(Rv["rows"][P], Rv["bench"][P])
+        L += ["", f"## 비교 — {TIE_LABEL[v]}", "",
+              f"같은 N={n}·V 로 보정. S&P 500 에서 샤프 ≥ SPY {cv['beat']}개, DSR>0.5 {cv['dsr']}개, "
+              f"세 조건 모두 **{len(cv['all'])}개**" + (f" ({', '.join(f'`{k}`' for k in cv['all'])})" if cv["all"] else "")
+              + f". 계열 {len(set(Rv['families'].values()))}개, 대표: "
+              + ", ".join(f"`{k}`" for _, k in sorted(Rv["reps"].items())) + ".",
+              "동점이 많은 전략일수록 '조건 통과 대형주' 전략으로 바뀐다는 점을 감안해서 읽어야 한다.", "",
+              f"| 전략 | 샤프 {TIE_LABEL[v0]} | 샤프 {TIE_LABEL[v]} | MDD (무작위/거래대금) | DSR (무작위/거래대금) | "
+              f"알파벳 위치 (거래대금) | 판정 ({TIE_LABEL[v]}) |",
+              "|---|---:|---:|---:|---:|---:|:-:|"]
+        for k in sorted(Rv["rows"][P], key=lambda k: -Rv["rows"][P][k]["dsr"]):
+            a, d = rows[P][k], Rv["rows"][P][k]
+            L.append(f"| {_name(k)} `{k}` | {_pm(a, 'sharpe', _sh)} | {_sh(d['sharpe'])} | {_pp(a['mdd'])} / {_pp(d['mdd'])} | "
+                     f"{_num(a['dsr'], 3)} / {_num(d['dsr'], 3)} | {_num(d['alpha'])} | "
+                     f"{'생존' if dev_verdict(d, Rv['bench'][P])['all'] else '탈락'} |")
+
+    L += ["", "## 평가 기준 (고정 — 이전과 동일)", "",
+          f"- 구간·SPY 벤치마크·매매 규칙·시점별 편입은 `docs/strategy-tournament-2026-10-20.md` '평가 기준' 절과 같다 "
+          f"(시드 ${RUN_KW['capital']:,.0f}, 문턱 {RUN_KW['min_score']:.0f}, 손절 {RUN_KW['stop_loss']:.0%}, 익절 기준 "
+          f"{RUN_KW['take_profit']:.0%}, 트레일링 {RUN_KW['trailing_stop']:.0%}, {bt.REBALANCE_DAYS}거래일 리밸런싱, EV 끔).",
+          f"- 통과 기준(사전 고정, 바꾸지 않음): ① 샤프 ≥ SPY 샤프 ② MDD ≥ SPY MDD − {PASS_MDD_SLACK:.0%}p "
+          "③ 보정 샤프 > 0 (= DSR 확률 > 0.5). 여기서는 개발 구간에 그대로 대 본 것 — 봉인 구간 판정이 아니다.",
+          f"- DSR: N={n} (이전 {len(ctx['prior_trials'])} + 이번 {len(ctx['new_trials'])}), 시도들 일간 샤프 분산 V={V:.2e}, "
+          "SR0 = √V·((1−γ)Φ⁻¹(1−1/N) + γΦ⁻¹(1−1/(Ne))). 무작위 방식의 시도 샤프는 평균 곡선 값. "
+          "seed 는 고른 게 아니라 평균낸 것이라 시도로 세지 않았다. tie_break 없는 재현 확인 실행도 이전 시도와 같아 세지 않았다.",
+          "", "## SPY 기준선 (같은 구간)", "",
+          "| 유니버스 | 구간 | 총수익 | CAGR | MDD | 샤프 |", "|---|---|---:|---:|---:|---:|"]
+    for u in (P, W):
+        b = bench[u]
+        L.append(f"| {UNIVERSE_LABEL[u]} | {b['start']}~{b['end']} | {_pp(b['ret'])} | {_pp(b['cagr'])} | "
+                 f"{_pp(b['mdd'])} | {_sh(b['sharpe'])} |")
+    L += ["", "## 다음 단계", "",
+          f"- **봉인 구간은 다시 열지 않는다.** {bt.HOLDOUT_START}~ 은 `ichimoku` 확인에 이미 한 번 쓰였고, 그 결과를 본 뒤 "
+          "동점 처리를 고쳤으므로 같은 구간으로 다시 판정하면 스누핑이다(`--holdout` 은 표식 때문에 거부된다).",
+          "- **다음 표본 외 검증은 앞으로의 페이퍼 운영(forward)** — 개발 구간 후보를 고정하고, 라이브와 같은 설정으로 "
+          "지금부터 쌓이는 날짜에서만 SPY 대비 같은 세 기준으로 판정한다. 기간·판정 시점은 시작 전에 정한다.",
+          "- **이산 점수 전략을 페이퍼·라이브에 올린다면 라이브 동점 처리를 먼저 고친다** — 지금 라이브는 동점이면 "
+          "후보 목록(워치리스트) 순서대로 사므로 백테스트(무작위)와 다른 종목을 산다.",
+          "- 개발 구간 생존 전략이 없으면 통과 기준을 낮추지 않고 실거래를 미룬다(10/20 사용자 결정 방침).",
+          "", "## 한계", "",
+          f"- 생존 편향·편입 이력 근사·같은 봉 체결·23종목 선택 편향은 이전과 같다(구성종목-일 시세 커버리지 "
+          f"{sp.get('member_day_coverage', 1.0):.1%}, 시세 없는 과거 구성종목 {len(sp.get('missing', []))}개).",
+          "- 무작위 동점 처리는 '조건을 통과한 종목 중 아무거나'를 산다. 이산 점수 전략에 원래 순위 정보가 없다는 뜻이고, "
+          "seed 간 편차(± sd)가 크면 결과가 신호보다 선택의 운에 달렸다는 뜻이다.",
+          "- 평균 곡선 DSR 은 분산 효과로 한 계좌보다 낙관적이다. seed DSR 중앙값과 함께 봐야 한다.",
+          "- 이번 재실행 자체도 개발 구간을 한 번 더 본 것이다 — N 에 넣었지만, 개발 구간 결과만으로 고른 전략은 "
+          "표본 외 검증 없이 실거래로 가면 안 된다.",
+          "", "<details><summary>부록 — 평균 곡선 일간 수익률 상관행렬(두 유니버스 평균)</summary>", ""]
+    keys = list(corr.columns)
+    L.append("| | " + " | ".join(f"`{k}`" for k in keys) + " |")
+    L.append("|---" * (len(keys) + 1) + "|")
+    for a_ in keys:
+        L.append(f"| `{a_}` | " + " | ".join(f"{corr.loc[a_, b_]:.2f}" for b_ in keys) + " |")
+    L += ["", "</details>", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -462,7 +914,22 @@ def main(argv=None):
     ap.add_argument("--keys", default="", help="쉼표 구분 전략 키 (기본: ai_influencer 제외 전부)")
     ap.add_argument("--holdout", action="store_true", help="봉인 구간 1회 확인 (사용자 승인 후)")
     ap.add_argument("--force", action="store_true", help="봉인 구간 재실행 (비권장)")
+    ap.add_argument("--tie-break", default="random",
+                    help="동점 처리 방식(쉼표 구분, 첫 번째가 주 방식): random · dollar_volume · none(이전=입력 순서). "
+                         "none 하나만 주면 이전 토너먼트와 같은 흐름")
+    ap.add_argument("--seeds", type=int, default=TIE_SEEDS, help="random 방식 seed 수 K")
+    ap.add_argument("--prior", default="auto",
+                    help="DSR 의 N·V 에 넣을 이전 토너먼트 JSON (auto=research/results 전부, none, 쉼표 구분 경로)")
+    ap.add_argument("--verify-prior", action="store_true",
+                    help="tie_break 없이 다시 돌려 이전 결과 재현·알파벳 편향 확인 (시도로 세지 않음)")
+    ap.add_argument("--tag", default="tiebreak", help="결과 파일 접미사 (strategy-tournament-<날짜>-<tag>)")
+    ap.add_argument("--rewrite-report", metavar="DATE",
+                    help="그날 --tag 실행의 저장된 결과(.bt_cache)로 보고서만 다시 쓴다 (재계산 없음)")
     a = ap.parse_args(argv)
+    if a.rewrite_report:
+        with open(bt.CACHE_DIR / f"tiebreak-ctx-{a.rewrite_report}-{a.tag}.pkl", "rb") as f:
+            ctx = pickle.load(f)
+        return write_tiebreak_report(ROOT / "docs" / f"strategy-tournament-{a.rewrite_report}-{a.tag}.md", ctx)
 
     def log(msg):
         print(time.strftime("%H:%M:%S"), msg, flush=True)
@@ -482,6 +949,14 @@ def main(argv=None):
         if not a.keys:
             raise SystemExit("--holdout 은 개발 구간에서 고른 대표만 --keys 로 명시해야 합니다.")
         return run_holdout(keys, a.workers, a.force, log)
+
+    variants = [v for v in a.tie_break.split(",") if v]
+    bad = [v for v in variants if v != "none" and v not in bt.TIE_BREAKS]
+    if bad or not variants:
+        raise SystemExit(f"알 수 없는 --tie-break: {bad or a.tie_break} (가능: none, {', '.join(bt.TIE_BREAKS)})")
+    if variants != ["none"]:
+        return run_tiebreak(variants, keys, a.seeds, a.prior, a.verify_prior, a.workers,
+                            a.threshold, a.tag, log)
 
     start, end = bt.DEV_START, bt.DEV_END
     all_res, metas = {}, {}
