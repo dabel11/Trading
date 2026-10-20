@@ -62,7 +62,8 @@ def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
     # 3) 채점 — AI 인플루언서 엔진 또는 전략 공식
     if strategy == "ai_influencer":
         from influence import engine as _eng
-        smap, _verdicts = _eng.score_universe(valid, regime=regime, log=log)
+        smap, _verdicts = _eng.score_universe(valid, regime=regime, log=log,
+                                              prices=prices)
         scores = [{"ticker": t, "score": round(float(smap.get(t, 50.0)), 1)}
                   for t in valid]
     else:
@@ -104,7 +105,7 @@ def _score_ai(tickers: list, log=None):
             pass
     regime = sb.market_regime()
     valid = [t for t in tickers if prices.get(t, 0) > 0]
-    smap, _v = _eng.score_universe(valid, regime=regime, log=log)
+    smap, _v = _eng.score_universe(valid, regime=regime, log=log, prices=prices)
     scores = [{"ticker": t, "score": round(float(smap.get(t, 50.0)), 1)} for t in valid]
     scores.sort(key=lambda x: -x["score"])
     return scores, prices, regime

@@ -26,6 +26,8 @@ order_intents.json
 day_state.json
 # 실행 루프 상태 (daily 모드 마지막 실행 ET 날짜)
 runner_state.json
+# AI 판단 시점 기록 (forward 검증용 누적 로그, 월별 회전)
+influence_log-*.jsonl
 # 가격 알림
 price_alerts.json
 # 매매 규칙 + 가중치
