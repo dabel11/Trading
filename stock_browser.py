@@ -794,6 +794,33 @@ def _nasdaq_daily(ticker: str, months: int = 6) -> list[float]:
     return []
 
 
+def nasdaq_dollar_volume(ticker: str, days: int = 20) -> float:
+    """최근 days 거래일 평균 거래대금(종가×거래량, 달러) — Nasdaq 공개 일봉. 실패하면 0.0."""
+    import json as _j, urllib.request
+    from datetime import date, timedelta
+    to = date.today(); frm = to - timedelta(days=days * 2 + 10)
+    for acls in ("stocks", "etf"):
+        try:
+            url = (f"https://api.nasdaq.com/api/quote/{ticker}/chart"
+                   f"?assetclass={acls}&fromdate={frm}&todate={to}")
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_UA),
+                                        timeout=8) as r:
+                d = _j.loads(r.read().decode())
+            vals = []
+            for p in (d.get("data") or {}).get("chart") or []:
+                z = p.get("z") or {}
+                c = float(str(z.get("close") or 0).replace(",", "").replace("$", ""))
+                v = float(str(z.get("volume") or 0).replace(",", ""))
+                if c > 0 and v > 0:
+                    vals.append(c * v)
+            if vals:
+                tail = vals[-days:]
+                return sum(tail) / len(tail)
+        except Exception:
+            continue
+    return 0.0
+
+
 def _yahoo_daily(ticker: str, rng: str = "6mo", interval: str = "1d") -> list[float]:
     import json as _j, urllib.request
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
