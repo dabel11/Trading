@@ -2,7 +2,7 @@
 
 개발 구간 **2020-01-01 ~ 2024-12-31** (평가 2020-01-02 ~ 2024-12-31). 봉인 구간 2025-01-01~ 은 열지 않았다. 생성: `research/strategy_tournament.py`.
 
-> ⚠️ **사후 발견(2026-10-20, 봉인 구간 확인 중)**: 이산 점수 전략은 S&P 500 에서 수십~백수십 종목이 같은 점수로 동점이고, 동점은 티커 알파벳순으로 갈렸다. `ichimoku`·`adx_trend`·`rsi2`·`zscore`·`stochastic`·`ma_ribbon`·`golden_cross`·`bollinger`·`macd`·`risk_adj_momentum` 등의 S&P 500 결과와 계열 대표 선정은 신호가 아니라 동점 처리 규칙의 영향을 크게 받았다. 측정치는 `docs/strategy-holdout-2026-10-20.md` '사후 감사' 절.
+> ⚠️ **사후 발견(2026-10-20, 봉인 구간 확인 중)**: 이산 점수 전략은 S&P 500 에서 수십~백수십 종목이 같은 점수로 동점이고, 동점은 티커 알파벳순으로 갈렸다. `ichimoku`·`adx_trend`·`rsi2`·`zscore`·`stochastic`·`ma_ribbon`·`golden_cross`·`bollinger`·`macd`·`risk_adj_momentum` 등의 S&P 500 결과와 계열 대표 선정은 신호가 아니라 동점 처리 규칙의 영향을 크게 받았다. 측정치는 `docs/strategy-holdout-2026-10-20.md` '사후 감사' 절. **동점 처리를 고친 재실행 결과(생존 0개, 계열 16→12개): `docs/strategy-tournament-2026-10-20-tiebreak.md`.**
 
 ## 요약 (자동 생성)
 
