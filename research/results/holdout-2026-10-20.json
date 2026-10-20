@@ -1,0 +1,139 @@
+{
+ "watchlist": {
+  "rows": {
+   "ichimoku": {
+    "key": "ichimoku",
+    "ret": 0.4209607049791302,
+    "cagr": 0.21743549075872393,
+    "mdd": -0.2178086651133158,
+    "sharpe": 1.0332505974324484,
+    "win": 0.46153846153846156,
+    "eq": 14209.607049791302,
+    "trades": 78,
+    "spy_ret": 0.33678497138709296,
+    "spy_cagr": 0.17650687804859633,
+    "spy_mdd": -0.1875522400789541,
+    "spy_sharpe": 1.047970013599552,
+    "skew": 0.03407818616569106,
+    "kurt": 6.710673357181082,
+    "n_obs": 449,
+    "dsr": 0.915439951601243,
+    "sr0": 0.0,
+    "sr_deflated": 1.0332505974324484,
+    "n_trials": 1,
+    "family": 1,
+    "pass_sharpe": false,
+    "pass_mdd": true,
+    "pass_dsr": true,
+    "pass": false
+   }
+  },
+  "benchmark": {
+   "ret": 0.33678497138709296,
+   "cagr": 0.17650687804859633,
+   "mdd": -0.1875522400789541,
+   "sharpe": 1.047970013599552,
+   "start": "2025-01-02",
+   "end": "2026-10-19"
+  },
+  "meta": {
+   "universe": "watchlist",
+   "start": "2025-01-01",
+   "end": "2026-10-19",
+   "warmup_from": "2023-10-09",
+   "eval_start": "2025-01-02",
+   "eval_end": "2026-10-19",
+   "holdout": true,
+   "requested": 23,
+   "loaded": 23,
+   "missing": [],
+   "aliases": {}
+  }
+ },
+ "sp500": {
+  "rows": {
+   "ichimoku": {
+    "key": "ichimoku",
+    "ret": -0.20487778244988786,
+    "cagr": -0.1204855527623293,
+    "mdd": -0.2622576037269512,
+    "sharpe": -0.6810785403110651,
+    "win": 0.3173076923076923,
+    "eq": 7951.2221755011215,
+    "trades": 104,
+    "spy_ret": 0.33678497138709296,
+    "spy_cagr": 0.17650687804859633,
+    "spy_mdd": -0.1875522400789541,
+    "spy_sharpe": 1.047970013599552,
+    "skew": -2.0082989718446775,
+    "kurt": 18.106888972035282,
+    "n_obs": 449,
+    "dsr": 0.1721031750430932,
+    "sr0": 0.0,
+    "sr_deflated": -0.6810785403110651,
+    "n_trials": 1,
+    "family": 1,
+    "pass_sharpe": false,
+    "pass_mdd": false,
+    "pass_dsr": false,
+    "pass": false
+   }
+  },
+  "benchmark": {
+   "ret": 0.33678497138709296,
+   "cagr": 0.17650687804859633,
+   "mdd": -0.1875522400789541,
+   "sharpe": 1.047970013599552,
+   "start": "2025-01-02",
+   "end": "2026-10-19"
+  },
+  "meta": {
+   "universe": "sp500",
+   "start": "2025-01-01",
+   "end": "2026-10-19",
+   "warmup_from": "2023-10-09",
+   "eval_start": "2025-01-02",
+   "eval_end": "2026-10-19",
+   "holdout": true,
+   "snapshot": "2026-10-20",
+   "changes_in_window": 42,
+   "current_members": 501,
+   "requested": 538,
+   "loaded": 524,
+   "missing": [
+    "ANSS",
+    "AVB",
+    "CTRA",
+    "DAY",
+    "DFS",
+    "EA",
+    "HES",
+    "HOLX",
+    "IPG",
+    "JNPR",
+    "K",
+    "VYLR",
+    "WBA",
+    "WBD"
+   ],
+   "aliases": {},
+   "member_day_coverage": 0.9853827720465448,
+   "effectively_missing": [
+    "ANSS",
+    "AVB",
+    "CTRA",
+    "DAY",
+    "DFS",
+    "EA",
+    "HES",
+    "HOLX",
+    "IPG",
+    "JNPR",
+    "K",
+    "VYLR",
+    "WBA",
+    "WBD"
+   ]
+  }
+ }
+}
