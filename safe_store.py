@@ -7,12 +7,15 @@
   - 파일 락(fcntl): 여러 프로세스(앱 + 스케줄러)가
     동시에 쓰는 경쟁 상태 방지
   - 손상 백업: 읽기 실패 시 .corrupt 백업 후 기본값 반환
+  - JSONL 추가(append_jsonl): 누적 기록용 — 여러 프로세스가 동시에 붙여도
+    줄이 섞이지 않게 한 줄 단위로 락을 잡고 쓴다
 """
 
 import os
 import json
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -113,6 +116,42 @@ def atomic_write_json(path, data, indent: int = 2):
         except OSError:
             pass
         raise
+
+
+def append_jsonl(path, record, lock_timeout: float = 1.0):
+    """JSONL 한 줄 추가 — 여러 프로세스(앱·데몬)가 동시에 붙여도 줄이 섞이지 않는다.
+
+    한 줄 전체를 bytes 로 만든 뒤 O_APPEND fd 에 flock(LOCK_EX) 을 잡고 쓴다.
+    락은 lock_timeout 초까지만 비차단 재시도로 기다리고, 넘기면 TimeoutError
+    (호출자 — 매매 사이클 — 를 붙잡지 않기 위함). 직전 기록이 크래시로 줄 중간에
+    끊겼으면 줄바꿈부터 넣어, 새 줄이 깨진 줄에 이어 붙어 함께 망가지지 않게 한다.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":"),
+                       default=str) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        if _HAS_FCNTL:
+            deadline = time.monotonic() + lock_timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{path.name} 락 대기 {lock_timeout:.1f}s 초과")
+                    time.sleep(0.01)
+                except OSError:
+                    break            # 락 미지원 FS — atomic_write_json 과 같이 락 없이 진행
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                line = b"\n" + line
+        view = memoryview(line)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)                 # close 가 flock 도 함께 푼다
 
 
 def safe_read_json(path, default=None):

@@ -3,6 +3,7 @@
 워치리스트(소수)만 보던 한계를 없앤다. Finnhub 무료 한도(분당 60회)를 지키려고
 저우선 속도 제한으로 천천히 돌며(첫 회 약 30분, 이후 캐시로 10분 내외), 판단 결과는
 종목별로 즉시 FULL 에 반영된다. 자동매매는 이 결과의 상위 매수 종목을 대상에 편입한다.
+배치마다 판단을 시점 그대로 influence_log 에 기록한다(src="scanner", 스키마는 engine).
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ def scan_once(batch: int = 8):
     try:
         for i in range(0, len(tickers), batch):
             chunk = tickers[i:i + batch]
+            t0 = time.time()
             items = []
             for t in chunk:
                 try:
@@ -76,6 +78,13 @@ def scan_once(batch: int = 8):
                 for v in verdicts:
                     FULL[v.ticker] = v
                 STATE["done"] = min(len(tickers), i + len(chunk))
+            try:
+                from influence import engine as _eng
+                _eng.log_judgment(t0, set(), "neutral", buy_th, sell_th, verdicts,
+                                  src="scanner")
+            except Exception as e:
+                print(f"[scanner] AI 판단 기록 실패(스캔 영향 없음): "
+                      f"{type(e).__name__}: {e}", flush=True)
     except Exception as e:
         STATE["error"] = str(e)[:120]
     finally:
