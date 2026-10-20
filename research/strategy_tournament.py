@@ -389,7 +389,13 @@ def run_holdout(keys: list[str], workers: int, force: bool, log):
     if HOLDOUT_MARK.exists() and not force:
         raise SystemExit(f"봉인 구간은 이미 열렸습니다: {HOLDOUT_MARK.read_text()} — 재실행은 데이터 스누핑. "
                          "정말 필요하면 --force (사유를 기록할 것).")
+    today = date.today().isoformat()
     end = (date.today() - timedelta(days=1)).isoformat()
+    # 여는 순간 기록한다 — 중간에 실패해도 이미 일부를 본 것이므로 재실행은 막는다
+    HOLDOUT_MARK.parent.mkdir(parents=True, exist_ok=True)
+    mark = {"opened": today, "keys": keys, "window": [bt.HOLDOUT_START, end],
+            "judged_on": PRIMARY, "status": "started"}
+    HOLDOUT_MARK.write_text(json.dumps(mark, ensure_ascii=False))
     out = {}
     for u in UNIVERSES:
         res, meta = run_universe(u, keys, bt.HOLDOUT_START, end, True, workers, log)
@@ -407,12 +413,44 @@ def run_holdout(keys: list[str], workers: int, force: bool, log):
                 f"MDD {r['mdd']:.1%} (SPY {b['mdd']:.1%}) DSR {r['dsr']:.3f} → "
                 f"{'통과' if r['pass'] else '탈락'}")
         out[u] = {"rows": rows, "benchmark": b, "meta": meta}
-    HOLDOUT_MARK.parent.mkdir(parents=True, exist_ok=True)
-    HOLDOUT_MARK.write_text(json.dumps({"opened": date.today().isoformat(), "keys": keys,
-                                        "end": end}, ensure_ascii=False))
-    p = ROOT / "research" / "results" / f"holdout-{date.today().isoformat()}.json"
+    mark.update(status="done", passed=[k for k, r in out[PRIMARY]["rows"].items() if r["pass"]])
+    HOLDOUT_MARK.write_text(json.dumps(mark, ensure_ascii=False))
+    p = ROOT / "research" / "results" / f"holdout-{today}.json"
     p.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str))
-    log(f"저장: {p.relative_to(ROOT)}")
+    doc = ROOT / "docs" / f"strategy-holdout-{today}.md"
+    write_holdout_report(doc, out, keys, end, today)
+    log(f"저장: {p.relative_to(ROOT)} · {doc.relative_to(ROOT)}")
+
+
+def write_holdout_report(path: Path, out: dict, keys: list[str], end: str, today: str):
+    P = PRIMARY
+    L = [f"# 봉인 구간 확인 — {today}", "",
+         f"구간 **{bt.HOLDOUT_START} ~ {end}** (평가 {out[P]['meta']['eval_start']} ~ {out[P]['meta']['eval_end']}). "
+         f"개발 구간 토너먼트에서 사용자가 고른 대표 {', '.join(f'`{k}`' for k in keys)} 만 1회 확인 "
+         f"(N={len(keys)}). 매매 규칙·파라미터는 개발 구간과 동일 — `docs/strategy-tournament-*.md` 참고.", "",
+         f"**통과 판정은 {UNIVERSE_LABEL[P]} 결과로 한다.** 기준(사전 고정): 샤프 ≥ SPY 샤프 · "
+         f"MDD ≥ SPY MDD − {PASS_MDD_SLACK:.0%}p · 보정 샤프 > 0 (DSR 확률 > 0.5).", ""]
+    for u in [P] + [x for x in out if x != P]:
+        b = out[u]["benchmark"]
+        L += [f"## {UNIVERSE_LABEL[u]}" + ("" if u == P else " — 참고"), "",
+              "| 전략 | 총수익 | CAGR | MDD | 샤프 | DSR | 보정 샤프 | 거래 | 샤프 ≥ SPY | MDD 허용 | 보정 샤프 > 0 | 판정 |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|:-:|:-:|:-:|:-:|",
+              f"| SPY | {_pct(b['ret'], 1)} | {_pct(b['cagr'])} | {_pct(b['mdd'])} | {_num(b['sharpe'])} "
+              "| — | — | — | — | — | — | 기준 |"]
+        ok = lambda v: "✅" if v else "❌"
+        for k, r in out[u]["rows"].items():
+            L.append(f"| {_name(k)} `{k}` | {_pct(r['ret'], 1)} | {_pct(r['cagr'])} | {_pct(r['mdd'])} | "
+                     f"{_num(r['sharpe'])} | {_num(r['dsr'], 3)} | {r['sr_deflated']:+.2f} | {r['trades']} | "
+                     f"{ok(r['pass_sharpe'])} | {ok(r['pass_mdd'])} | {ok(r['pass_dsr'])} | "
+                     f"**{'통과' if r['pass'] else '탈락'}** |")
+        L.append("")
+    m = out[P]["meta"]
+    L += ["## 참고", "",
+          f"- S&P 500 구성종목 {m.get('requested')}개 중 {len(m.get('missing', []))}개 시세 없음, "
+          f"구성종목-일 커버리지 {m.get('member_day_coverage', 1.0):.1%}.",
+          f"- 이 확인은 `{HOLDOUT_MARK.relative_to(ROOT)}` 에 기록됐고 재실행은 거부된다. "
+          "결과를 보고 기준·파라미터를 바꿔 다시 돌리면 봉인 구간도 개발 구간이 된다.", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
 
 
 # ── main ────────────────────────────────────────────────────────────────────
