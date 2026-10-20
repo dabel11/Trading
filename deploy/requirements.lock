@@ -1,0 +1,14 @@
+# 서버(리눅스 컨테이너) 의존성 — 맥 실가동 venv 와 같은 버전으로 고정해
+# "맥에선 되는데 서버에선 깨지는" 버전 차이를 막는다. pywebview(맥 창)는 제외.
+# 올릴 때: 맥에서 먼저 검증한 버전으로 이 파일을 갱신 → deploy.sh 가 이미지를 다시 빌드한다.
+nicegui==3.18.0
+pandas==3.0.3
+numpy==2.4.5
+lxml==6.1.1
+yfinance==1.4.1
+curl_cffi==0.15.0
+finnhub-python==2.4.28
+websocket-client==1.9.0
+alpaca-py==0.43.4
+requests==2.34.2
+pytz==2026.2

@@ -11,6 +11,13 @@ Backtester: 과거 데이터로 전략 성과를 시뮬레이션합니다.
       과거 데이터로 proxy 지표를 사용합니다.
 """
 
+import json
+import math
+import os
+import time
+from pathlib import Path
+from statistics import NormalDist
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -572,6 +579,7 @@ class BacktestResult:
     trades:       list[Trade]
     equity_curve: pd.Series
     start_capital: float
+    benchmark:    dict | None = None   # 같은 구간 SPY(수정주가) 성과 — benchmark_stats()
 
     # ── 핵심 지표 ──────────────────────────────
     @property
@@ -599,6 +607,10 @@ class BacktestResult:
         return float(rets.mean() / rets.std() * np.sqrt(252))
 
     @property
+    def daily_returns(self) -> pd.Series:
+        return self.equity_curve.pct_change().dropna()
+
+    @property
     def win_rate(self) -> float:
         if not self.trades:
             return 0.0
@@ -624,8 +636,12 @@ class BacktestResult:
             f"  평균 보유기간: {self.avg_hold_days:.0f}일",
             f"  최종 자산    : ${self.equity_curve.iloc[-1]:,.0f}  "
             f"(시작 ${self.start_capital:,.0f})",
-            "=" * 55,
         ]
+        b = self.benchmark
+        if b:
+            lines.append(f"  SPY 같은 구간: {b['ret']:+.1%} · CAGR {b['cagr']:+.1%} · "
+                         f"MDD {b['mdd']:.1%} · 샤프 {b['sharpe']:.2f}")
+        lines.append("=" * 55)
         return "\n".join(lines)
 
 
@@ -777,6 +793,28 @@ def run(
         date_index = _b["date_index"]; spy_close = _b["spy_close"]
         spy_ma200  = _b["spy_ma200"];  spy_ma50  = _b["spy_ma50"]
 
+    # 연구용 번들(load_research_bundle) 전용 키 — 없으면 기존 동작 그대로.
+    #   eval_start_idx : 워밍업 구간(지표용 과거 데이터)은 매매·평가에서 제외
+    #   members        : 시점별 지수 구성 — 그날 구성종목이 아니면 신규 매수 후보 제외
+    #   n_valid/min_history : 상장 직후(이력 부족) 종목은 신규 매수 후보 제외
+    #   sector_map     : 섹터 신호용 티커→섹터 ETF 보강(이 런 동안만, 기존 키는 불변)
+    #   tie_break/tie_seed : 같은 점수(동점) 순서 — tie_order() 참고. 없으면 입력 순서
+    _px = prefetched or {}
+    eval_start = int(_px.get("eval_start_idx") or 0)
+    members    = _px.get("members")
+    n_valid    = _px.get("n_valid")
+    min_hist   = int(_px.get("min_history") or 0)
+    _sec_added = [k for k in (_px.get("sector_map") or {}) if k not in TICKER_SECTOR_MAP]
+    _tie = tie_order(_px.get("tie_break"), stock_data, _px.get("tie_seed"))
+
+    def _rank(scores: list, i: int) -> None:
+        """점수 내림차순. 동점은 tie_order 보조 키(없으면 안정 정렬 = 입력 순서)."""
+        if _tie is None:
+            scores.sort(key=lambda s: -s.total)
+        else:
+            tk = _tie(i)
+            scores.sort(key=lambda s: (-s.total, tk[s.ticker]))
+
     def _live_regime(i: int) -> str:
         """시장 국면 — 라이브(core.scoring.score)와 동일: SPY vs 200일선 ±2%."""
         if spy_close is None or spy_ma200 is None:
@@ -830,6 +868,8 @@ def run(
         portfolio.HOLD_DAYS_MEDIUM    = int(HOLD_M)
         portfolio.BUY_PRICE_MIN       = 0.0
         portfolio.BUY_PRICE_MAX       = 0.0
+        for k in _sec_added:
+            TICKER_SECTOR_MAP[k] = _px["sector_map"][k]
 
         ev_stats: dict = {}
         if ev_filter:
@@ -841,6 +881,8 @@ def run(
                 ev_exit=float(ev_exit), min_score=float(MIN_SC), sell_score=float(SELL_SC),
                 n_paths=1000)
         for idx, today in enumerate(date_index):
+            if idx < eval_start:
+                continue          # 워밍업 — 지표 계산용 과거 데이터일 뿐 매매·평가 없음
             # --- 일일 평가(mark-to-market) ---
             pv = cash
             for t, pos in pmbt.positions.items():
@@ -849,7 +891,7 @@ def run(
                     pv += float(df["Close"].iloc[idx]) * pos.shares
             equity_curve.append(pv)
 
-            if idx % REBAL != 0:
+            if (idx - eval_start) % REBAL != 0:
                 continue
 
             # 가상 '오늘' 주입 — 보유기간/재진입 쿨다운이 시뮬 날짜 기준으로 계산되게
@@ -861,13 +903,23 @@ def run(
             for t, df in stock_data.items():
                 if idx >= len(df):
                     continue
-                prices[t] = float(df["Close"].iloc[idx])
+                if t not in pmbt.positions:
+                    if members is not None and not (t in members and members[t][idx]):
+                        continue      # 그날 지수 구성종목 아님 → 신규 후보 아님
+                    if n_valid is not None and t in n_valid and n_valid[t][idx] < min_hist:
+                        continue      # 상장 직후 — 전략 룩백을 채울 이력 부족
+                px = float(df["Close"].iloc[idx])
+                if not px > 0:
+                    continue          # 상장 전(NaN) 구간
+                prices[t] = px
                 try:
                     sc = _strategy_score_bt(strategy, t, stock_data, etf_data, idx)
                 except Exception:
                     sc = 0.0
+                if sc != sc:          # NaN(결측 룩백) → 신호 없음
+                    sc = 0.0
                 scores.append(StockScore(t, float(sc), 0, 0, 0, 0))
-            scores.sort(key=lambda s: -s.total)
+            _rank(scores, idx)
 
             # EV 판단 — 라이브 run_cycle 과 같은 core.ev (당일까지의 종가만 사용, 미래 참조 없음)
             if ev_filter:
@@ -877,7 +929,7 @@ def run(
                     today=today.date())
                 _g = _ev.gate_scores({s.ticker: s.total for s in scores}, _decs, _evp)
                 scores = [StockScore(s.ticker, _g[s.ticker], 0, 0, 0, 0) for s in scores]
-                scores.sort(key=lambda s: -s.total)
+                _rank(scores, idx)
                 for _d in _decs:
                     ev_stats[_d.action] = ev_stats.get(_d.action, 0) + 1
 
@@ -945,6 +997,8 @@ def run(
         portfolio.set_clock(None)
         for k, v in _saved.items():
             setattr(portfolio, k, v)
+        for k in _sec_added:
+            TICKER_SECTOR_MAP.pop(k, None)
 
     # 인메모리 청산 내역 → Trade 객체 (리포트·지표용)
     trades: list[Trade] = []
@@ -962,8 +1016,9 @@ def run(
         except Exception:
             continue
 
-    equity_series = pd.Series(equity_curve, index=date_index)
-    res = BacktestResult(trades=trades, equity_curve=equity_series, start_capital=capital)
+    equity_series = pd.Series(equity_curve, index=date_index[eval_start:])
+    res = BacktestResult(trades=trades, equity_curve=equity_series, start_capital=capital,
+                         benchmark=benchmark_stats(spy_close, equity_series.index))
     res.ev_stats = ev_stats          # EV 판단 집계(ev_filter=True 일 때)
     return res
 
@@ -974,18 +1029,485 @@ def compare_strategies(keys: list[str], universe: list[str], start: str, end: st
     """여러 전략을 같은 데이터 번들로 백테스트해 총수익률 내림차순 지표 목록 반환.
 
     앱의 '최고 수익 전략 찾기'가 core.isolated 로 별도 프로세스에서 부른다
-    (모듈 최상위 함수여야 자식 프로세스가 import 할 수 있다)."""
+    (모듈 최상위 함수여야 자식 프로세스가 import 할 수 있다).
+
+    각 행에는 기존 키(ret·cagr·mdd·sharpe·win·eq)에 더해 정직한 평가 지표가 붙는다:
+      spy_ret·spy_cagr·spy_mdd·spy_sharpe : 같은 구간 SPY(수정주가)
+      dsr·sr_deflated·sr0                 : 이번 비교의 시도 수 N=len(keys) 로 운 보정한 샤프
+      family·corr                         : 일간 수익률 상관 + 계층 군집으로 묶은 '계열'
+    """
     bundle = load_market_data(universe, start, end)
-    rows = []
+    results: dict = {}
     for k in keys:
         try:
-            r = run(strategy=k, start=start, end=end, capital=capital,
-                    universe=universe, min_score=min_score, stop_loss=stop_loss,
-                    take_profit=take_profit, prefetched=bundle, ev_filter=ev_filter)
-            rows.append({"key": k, "ret": r.total_return, "cagr": r.cagr,
-                         "mdd": r.mdd, "sharpe": r.sharpe, "win": r.win_rate,
-                         "eq": float(r.equity_curve.iloc[-1])})
+            results[k] = run(strategy=k, start=start, end=end, capital=capital,
+                             universe=universe, min_score=min_score, stop_loss=stop_loss,
+                             take_profit=take_profit, prefetched=bundle, ev_filter=ev_filter)
         except Exception:
             pass
+    rows = summarize_results(results, n_trials=len(keys))["rows"]
     rows.sort(key=lambda x: -x["ret"])
     return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 정직한 평가 기준 (연구용) — SPY 벤치마크 · 봉인 구간 · 운 보정 샤프 · 전략 계열
+# ──────────────────────────────────────────────────────────────────────────────
+# 손으로 고른 종목·같은 기간에서 27개 중 1등을 고르면 운(데이터 스누핑)을 실력으로
+# 착각한다. 그래서 (1) 같은 구간 SPY 를 항상 같이 보고, (2) 2025-01-01 이후는 봉인해
+# 최종 확인에 1회만 쓰고, (3) 시도한 전략 수만큼 샤프를 깎고(DSR), (4) 사실상 같은
+# 전략(높은 상관)끼리 '계열'로 묶어 계열별 대표만 비교한다.
+
+DEV_START = "2020-01-01"          # 개발 구간 (포함)
+DEV_END = "2024-12-31"            # 개발 구간 (포함)
+HOLDOUT_START = "2025-01-01"      # 봉인 구간 시작 — holdout=True 일 때만 연다
+WARMUP_CAL_DAYS = 450             # 지표 워밍업(최장 룩백 momentum_max 273봉 + 여유)
+MIN_HISTORY_BARS = 252            # 이보다 이력이 짧은(상장 직후) 종목은 신규 후보 제외
+FAMILY_CORR = 0.7                 # 계열 기준: 평균 상관 ≥ 이 값이면 같은 계열
+CACHE_DIR = Path(os.environ.get("TRADE_BT_CACHE",
+                                str(Path(__file__).parent / ".bt_cache")))
+
+# GICS 섹터 → 섹터 ETF (커뮤니케이션은 기존 TICKER_SECTOR_MAP 관례대로 XLK)
+GICS_TO_ETF = {
+    "Information Technology": "XLK", "Communication Services": "XLK",
+    "Financials": "XLF", "Energy": "XLE", "Health Care": "XLV",
+    "Industrials": "XLI", "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP", "Materials": "XLB", "Utilities": "XLU",
+    "Real Estate": "XLRE",
+}
+
+# 티커만 바뀐 같은 회사 — 위키 이력의 옛 티커를 yfinance 의 현재 티커 시세로 잇는다
+# (옛 티커로는 이력 전체가 사라져 생존 편향에 잘못 섞이던 것들)
+YF_ALIASES = {"WLTW": "WTW", "GPS": "GAP", "FBHS": "FBIN", "HFC": "DINO",
+              "ADS": "BFH", "ARNC": "HWM"}
+
+_EULER_GAMMA = 0.5772156649015329
+_ND = NormalDist()
+
+
+def check_window(start: str, end: str, holdout: bool = False) -> tuple[str, str]:
+    """평가 구간 가드. 봉인 구간(HOLDOUT_START~)에 닿으면 holdout=True 를 요구한다.
+
+    end 는 포함(inclusive). 반환: 정규화된 (start, end) 'YYYY-MM-DD'."""
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    if e < s:
+        raise ValueError(f"평가 구간이 거꾸로입니다: {start} ~ {end}")
+    if e >= pd.Timestamp(HOLDOUT_START) and not holdout:
+        raise ValueError(f"봉인 구간({HOLDOUT_START}~)은 holdout=True 를 명시해야 엽니다 "
+                         f"(요청: {start} ~ {end}). 개발은 {DEV_START}~{DEV_END} 에서.")
+    return s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")
+
+
+TIE_BREAKS = ("random", "dollar_volume")
+TIE_DV_WINDOW = 20                # dollar_volume: 최근 N거래일 평균 거래대금
+
+
+def tie_order(mode, stock_data: dict, seed=None):
+    """동점 처리(연구용 번들 키 tie_break) → idx 를 받아 {티커: 보조 키(작을수록 앞)} 를
+    돌려주는 함수. mode 가 None 이면 None — run() 이 예전처럼 입력 순서(안정 정렬)로 가른다.
+
+    이산 점수 전략은 S&P 500 에서 수십~백수십 종목이 같은 점수라, 입력 순서(번들은
+    알파벳순)로 가르면 'A' 로 시작하는 종목만 산다. 라이브는 이 함수를 쓰지 않는다.
+      "random"        : 리밸런싱 날마다 (seed, idx) 로 정한 무작위 순서. 같은 seed 면 재현되고,
+                        종목 이름순으로 섞으므로 번들의 입력 순서와도 무관하다.
+      "dollar_volume" : 최근 TIE_DV_WINDOW 거래일 평균 거래대금(종가×거래량) 큰 순 — 당일까지만
+                        본다. 동점이면 대형·유동성주를 사는 셈이라 전략에 대형주 기울기가 생긴다."""
+    if mode is None:
+        return None
+    names = sorted(stock_data)
+    if mode == "random":
+        base = int(seed or 0)
+
+        def _random(idx: int) -> dict:
+            perm = np.random.default_rng([base, int(idx)]).permutation(len(names))
+            return dict(zip(names, perm.tolist()))
+        return _random
+    if mode == "dollar_volume":
+        dv = {}
+        for t in names:
+            df = stock_data[t]
+            if "Volume" in df.columns:
+                v = (df["Close"] * df["Volume"]).rolling(TIE_DV_WINDOW, min_periods=1).mean()
+                dv[t] = np.nan_to_num(v.to_numpy(dtype=float), nan=0.0)
+            else:
+                dv[t] = np.zeros(len(df))
+        pos = {t: i for i, t in enumerate(names)}   # 거래대금까지 같으면 이름순(사실상 없음)
+
+        def _dollar_volume(idx: int) -> dict:
+            return {t: (-(a[idx] if idx < len(a) else 0.0), pos[t]) for t, a in dv.items()}
+        return _dollar_volume
+    raise ValueError(f"알 수 없는 tie_break: {mode!r} (가능: None, {', '.join(TIE_BREAKS)})")
+
+
+def perf_stats(curve: pd.Series) -> dict:
+    """자산(또는 가격) 곡선 → 총수익률·CAGR·MDD·샤프 (BacktestResult 와 같은 정의)."""
+    c = pd.Series(curve, dtype=float).dropna()
+    if len(c) < 2 or c.iloc[0] <= 0:
+        return {"ret": 0.0, "cagr": 0.0, "mdd": 0.0, "sharpe": 0.0}
+    growth = float(c.iloc[-1] / c.iloc[0])
+    years = len(c) / 252
+    rets = c.pct_change().dropna()
+    sd = float(rets.std())
+    return {"ret": growth - 1,
+            "cagr": growth ** (1 / years) - 1 if growth > 0 else -1.0,
+            "mdd": float(((c - c.cummax()) / c.cummax()).min()),
+            "sharpe": float(rets.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0}
+
+
+def benchmark_stats(spy_close, index) -> dict | None:
+    """같은 날짜들(index)의 SPY 성과. spy_close 는 auto_adjust 수정주가(배당 재투자 근사)."""
+    if spy_close is None or index is None or len(index) < 2:
+        return None
+    try:
+        s = pd.Series(spy_close).reindex(index).ffill().dropna()
+    except Exception:
+        return None
+    if len(s) < 2:
+        return None
+    out = perf_stats(s)
+    out["start"] = str(pd.Timestamp(s.index[0]).date())
+    out["end"] = str(pd.Timestamp(s.index[-1]).date())
+    return out
+
+
+def sharpe_moments(returns) -> dict:
+    """일간 수익률 → 비연율 샤프·관측 수·왜도·첨도(정규=3). DSR 입력."""
+    r = pd.Series(returns, dtype=float).dropna()
+    T = len(r)
+    sd = float(r.std()) if T > 1 else 0.0
+    if T < 2 or sd == 0:
+        return {"sr": 0.0, "T": T, "skew": 0.0, "kurt": 3.0}
+    z = (r - r.mean()) / r.std(ddof=0)
+    return {"sr": float(r.mean() / sd), "T": T,
+            "skew": float((z ** 3).mean()), "kurt": float((z ** 4).mean())}
+
+
+def expected_max_sharpe(n_trials: int, sr_var: float) -> float:
+    """N 개 시도에서 '운만으로' 기대되는 최대 샤프 SR0 (Bailey & López de Prado 2014).
+
+    SR0 = √V[SR] · ((1−γ)·Φ⁻¹(1−1/N) + γ·Φ⁻¹(1−1/(N·e))),  γ = 오일러-마스케로니 상수.
+    sr_var 는 시도들 샤프(비연율)의 분산. N ≤ 1 이면 고른 게 없으니 0."""
+    n = int(n_trials or 0)
+    if n <= 1 or not sr_var or sr_var <= 0:
+        return 0.0
+    return math.sqrt(sr_var) * ((1 - _EULER_GAMMA) * _ND.inv_cdf(1 - 1 / n)
+                                + _EULER_GAMMA * _ND.inv_cdf(1 - 1 / (n * math.e)))
+
+
+def probabilistic_sharpe(sr: float, sr_star: float, T: int, skew: float, kurt: float) -> float:
+    """PSR: 참 샤프가 sr_star 보다 클 확률 (비연율 샤프, 왜도·첨도(정규=3) 반영)."""
+    if T < 2:
+        return 0.0
+    den = 1 - skew * sr + (kurt - 1) / 4 * sr ** 2
+    if den <= 0:
+        return 0.0
+    return _ND.cdf((sr - sr_star) * math.sqrt(T - 1) / math.sqrt(den))
+
+
+def deflated_sharpe(sr: float, T: int, skew: float, kurt: float,
+                    n_trials: int, sr_var: float) -> dict:
+    """Deflated Sharpe Ratio (Bailey & López de Prado 2014).
+
+    입력은 비연율(일간) 샤프. 반환:
+      dsr         : PSR(SR0) — 'N 번 시도 중 운으로 나온 최대치'를 넘는 실력일 확률 (0~1)
+      sr0         : 운으로 기대되는 최대 샤프 (연율)
+      sr_deflated : 연율 샤프 − SR0. > 0 ⇔ dsr > 0.5 (운 보정 후에도 양(+)의 실력)"""
+    sr0 = expected_max_sharpe(n_trials, sr_var)
+    return {"dsr": probabilistic_sharpe(sr, sr0, T, skew, kurt),
+            "sr0": sr0 * math.sqrt(252),
+            "sr_deflated": (sr - sr0) * math.sqrt(252)}
+
+
+def cluster_by_correlation(corr: pd.DataFrame, threshold: float = FAMILY_CORR) -> dict:
+    """상관행렬 → 평균 연결 계층 군집(거리 1−ρ). 두 군집 간 평균 상관이 threshold
+    이상인 동안 합친다. 반환: {키: 계열 번호(1부터, 큰 계열 먼저)}."""
+    keys = list(corr.columns)
+    c = corr.reindex(index=keys, columns=keys).astype(float).fillna(0.0)
+    for k in keys:
+        c.loc[k, k] = 1.0
+    clusters = [[k] for k in keys]
+    while len(clusters) > 1:
+        best = None
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                d = float((1.0 - c.loc[clusters[i], clusters[j]].to_numpy()).mean())
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        if best[0] > 1.0 - threshold + 1e-12:
+            break
+        _, i, j = best
+        clusters[i] = clusters[i] + clusters[j]
+        del clusters[j]
+    clusters.sort(key=lambda g: (-len(g), keys.index(g[0])))
+    return {k: n for n, g in enumerate(clusters, 1) for k in g}
+
+
+def strategy_families(returns: pd.DataFrame, threshold: float = FAMILY_CORR):
+    """전략별 일간 수익률(열=전략) → (상관행렬, {전략: 계열 번호}).
+    거래가 없어 수익률이 상수인 전략은 상관이 정의되지 않아 단독 계열이 된다."""
+    corr = returns.corr()
+    return corr, cluster_by_correlation(corr, threshold)
+
+
+def summarize_results(results: dict, n_trials: int | None = None,
+                      sr_var: float | None = None,
+                      family_threshold: float = FAMILY_CORR) -> dict:
+    """{전략: BacktestResult} → 지표 행(SPY·DSR·계열 포함)·상관행렬·계열.
+
+    n_trials: DSR 의 시도 수 N (기본: 결과 수). 다른 유니버스·설정까지 합쳐 시도했다면
+              그 전체 수를 넘겨라 — 시도를 숨길수록 DSR 이 부풀려진다.
+    sr_var  : 시도들 샤프(비연율) 분산 (기본: 이 결과들의 분산)."""
+    if not results:
+        return {"rows": [], "corr": pd.DataFrame(), "families": {}, "benchmark": None}
+    rets = pd.DataFrame({k: r.daily_returns for k, r in results.items()})
+    mom = {k: sharpe_moments(rets[k]) for k in rets.columns}
+    srs = [m["sr"] for m in mom.values()]
+    if sr_var is None:
+        sr_var = float(np.var(srs, ddof=1)) if len(srs) > 1 else 0.0
+    n = int(n_trials or len(results))
+    corr, fam = strategy_families(rets, family_threshold)
+    bench = next((r.benchmark for r in results.values() if r.benchmark), None)
+    rows = []
+    for k, r in results.items():
+        m = mom[k]
+        d = deflated_sharpe(m["sr"], m["T"], m["skew"], m["kurt"], n, sr_var)
+        b = r.benchmark or {}
+        rows.append({
+            "key": k, "ret": r.total_return, "cagr": r.cagr, "mdd": r.mdd,
+            "sharpe": r.sharpe, "win": r.win_rate, "eq": float(r.equity_curve.iloc[-1]),
+            "trades": len(r.trades),
+            "spy_ret": b.get("ret"), "spy_cagr": b.get("cagr"),
+            "spy_mdd": b.get("mdd"), "spy_sharpe": b.get("sharpe"),
+            "skew": m["skew"], "kurt": m["kurt"], "n_obs": m["T"],
+            "dsr": d["dsr"], "sr0": d["sr0"], "sr_deflated": d["sr_deflated"],
+            "n_trials": n, "family": fam.get(k),
+            "corr": {o: round(float(corr.loc[k, o]), 3) for o in corr.columns
+                     if o != k and corr.loc[k, o] == corr.loc[k, o]},
+        })
+    return {"rows": rows, "corr": corr, "families": fam, "benchmark": bench,
+            "returns": rets, "sr_var": sr_var, "n_trials": n}
+
+
+# ── 연구용 데이터 번들 (디스크 캐시) ────────────────────────────────────────────
+
+def _save_df(df: pd.DataFrame, path: Path):
+    try:
+        df.to_parquet(path.with_suffix(".parquet"))
+    except Exception:                       # pyarrow 없음 → pickle (자체 생성 캐시)
+        df.to_pickle(path.with_suffix(".pkl"))
+
+
+def _load_df(path: Path):
+    for suf, fn in ((".parquet", pd.read_parquet), (".pkl", pd.read_pickle)):
+        p = path.with_suffix(suf)
+        if p.exists():
+            try:
+                return fn(p)
+            except Exception:
+                return None
+    return None
+
+
+def _extract(raw: pd.DataFrame, t: str, multi: bool):
+    try:
+        df = raw.xs(t, axis=1, level=1) if multi else raw
+    except Exception:
+        return None
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+    if "Close" not in cols:
+        return None
+    df = df[cols].dropna(how="all")
+    return df if df["Close"].notna().sum() > 30 else None
+
+
+def download_prices(tickers: list[str], start: str, end_excl: str,
+                    chunk: int = 80, retry_missing: bool = False) -> tuple[dict, list]:
+    """일봉(auto_adjust 수정주가) 대량 다운로드 + 디스크 캐시.
+
+    캐시: CACHE_DIR/prices/<start>_<end_excl>/<티커>.parquet — 구간이 키라서 개발 구간
+    캐시에는 봉인 구간 데이터가 들어가지 않는다. 받지 못한 티커(상장폐지 등)는
+    _missing.json 에 기록해 재시도하지 않는다(retry_missing=True 면 재시도).
+    반환: ({티커: DataFrame}, [못 받은 티커])"""
+    d = CACHE_DIR / "prices" / f"{start}_{end_excl}"
+    d.mkdir(parents=True, exist_ok=True)
+    miss_file = d / "_missing.json"
+    known_missing = set()
+    if miss_file.exists() and not retry_missing:
+        try:
+            known_missing = set(json.loads(miss_file.read_text()))
+        except Exception:
+            pass
+    out: dict = {}
+    todo = []
+    for t in dict.fromkeys(tickers):
+        df = _load_df(d / t)
+        if df is not None:
+            out[t] = df
+        elif t not in known_missing:
+            todo.append(t)
+
+    def _keep(t, df):
+        df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+        out[t] = df
+        _save_df(df, d / t)
+
+    # 1차: 대량 다운로드(빠름). yfinance 1.x 는 실패 원인을 돌려주지 않으므로
+    for i in range(0, len(todo), chunk):
+        batch = todo[i:i + chunk]
+        try:
+            raw = yf.download(batch, start=start, end=end_excl, auto_adjust=True,
+                              progress=False, threads=True)
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        multi = isinstance(raw.columns, pd.MultiIndex)
+        for t in batch:
+            df = _extract(raw, t, multi)
+            if df is not None:
+                _keep(t, df)
+
+    # 2차: 실패분만 종목별로 — '없는 종목'(상장폐지)과 일시 오류(레이트리밋)를 구분한다.
+    # 없는 종목만 _missing.json 에 남기고, 일시 오류는 다음 실행에서 다시 시도한다.
+    from yfinance import exceptions as _yfe
+    confirmed = set()
+    for t in [t for t in todo if t not in out]:
+        for attempt in range(3):
+            try:
+                h = yf.Ticker(t).history(start=start, end=end_excl, auto_adjust=True,
+                                         raise_errors=True)
+                df = _extract(h, t, False) if h is not None else None
+                if df is not None:
+                    _keep(t, df)
+                else:
+                    confirmed.add(t)
+                break
+            except _yfe.YFTickerMissingError:
+                confirmed.add(t)
+                break
+            except Exception:                 # 레이트리밋·네트워크 → 잠시 후 재시도
+                time.sleep(3 * (attempt + 1))
+    missing = sorted(t for t in dict.fromkeys(tickers) if t not in out)
+    try:
+        miss_file.write_text(json.dumps(sorted(known_missing | confirmed)))
+    except Exception:
+        pass
+    return out, missing
+
+
+def load_sp500_snapshot(max_age_days: int = 30) -> dict:
+    """S&P 500 현재 구성·GICS 섹터·변경 이력 스냅샷(디스크 캐시, 기본 30일)."""
+    import universe as _uni
+    p = CACHE_DIR / "sp500_snapshot.json"
+    if p.exists() and time.time() - p.stat().st_mtime < max_age_days * 86400:
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    snap = _uni.fetch_sp500_snapshot()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(snap, ensure_ascii=False))
+    return snap
+
+
+def _align(df: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
+    """공통 거래일 축에 맞춘다(위치 인덱스 정렬 보장). 상장 전은 NaN 그대로,
+    상장 후 결측(거래정지·상장폐지 이후)은 직전 가격 유지·거래량 0."""
+    a = df.reindex(index)
+    first = a["Close"].first_valid_index()
+    if first is None:
+        return a
+    after = a.index >= first
+    px_cols = [c for c in ("Open", "High", "Low", "Close") if c in a.columns]
+    a.loc[after, px_cols] = a.loc[after, px_cols].ffill()
+    if "Volume" in a.columns:
+        a.loc[after, "Volume"] = a.loc[after, "Volume"].fillna(0)
+    return a
+
+
+def load_research_bundle(universe="sp500", start: str = DEV_START, end: str = DEV_END,
+                         holdout: bool = False, warmup_days: int = WARMUP_CAL_DAYS,
+                         min_history: int = MIN_HISTORY_BARS) -> dict:
+    """정직한 평가용 번들 — run(prefetched=...) / evaluate 에 그대로 넘긴다.
+
+    universe: "sp500"     — universe.py 의 S&P 500 구성 + 변경 이력으로 시점별 편입 근사
+              "watchlist" — config 의 손으로 고른 종목(TRADEABLE_UNIVERSE, 선택 편향 큼)
+              list        — 임의 티커
+    load_market_data 와 달리 (1) 봉인 구간 가드, (2) 워밍업 후 start 부터 평가,
+    (3) 모든 종목을 SPY 거래일 축에 정렬(상장 시점이 달라도 위치 인덱스 일치),
+    (4) 디스크 캐시. meta 에 생존 편향 정보(받지 못한 과거 구성종목)를 담는다."""
+    s, e = check_window(start, end, holdout)
+    end_excl = (pd.Timestamp(e) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    warm = (pd.Timestamp(s) - pd.Timedelta(days=warmup_days)).strftime("%Y-%m-%d")
+
+    spy_px, _ = download_prices(["SPY"], warm, end_excl)
+    if "SPY" not in spy_px:
+        raise ValueError("SPY 데이터를 받지 못했습니다")
+    spy_full = spy_px["SPY"]["Close"].astype(float)
+    date_index = pd.DatetimeIndex(spy_full.index)
+    eval_start_idx = int(date_index.searchsorted(pd.Timestamp(s)))
+    if eval_start_idx >= len(date_index) - 1:
+        raise ValueError("평가 구간에 거래일이 없습니다")
+
+    meta: dict = {"universe": universe if isinstance(universe, str) else "custom",
+                  "start": s, "end": e, "warmup_from": warm,
+                  "eval_start": str(date_index[eval_start_idx].date()),
+                  "eval_end": str(date_index[-1].date()), "holdout": bool(holdout)}
+    members = None
+    sector_map: dict = {}
+    if universe == "sp500":
+        snap = load_sp500_snapshot()
+        import universe as _uni
+        mem = _uni.sp500_membership(snap["members"], snap["changes"], date_index)
+        ev = slice(eval_start_idx, None)
+        tickers = [t for t, m in mem.items() if any(m[ev])]
+        members = {t: np.array(mem[t], dtype=bool) for t in tickers}
+        sector_map = {t: GICS_TO_ETF[g] for t, g in snap.get("sectors", {}).items()
+                      if g in GICS_TO_ETF}
+        n_changes = sum(1 for c in snap["changes"] if s <= c[0] <= e)
+        meta.update(snapshot=snap.get("fetched"), changes_in_window=n_changes,
+                    current_members=len(snap["members"]))
+    elif universe == "watchlist":
+        tickers = list(TRADEABLE_UNIVERSE)
+    else:
+        tickers = list(universe)
+
+    src = {t: YF_ALIASES.get(t, t) for t in tickers}
+    px, _ = download_prices(sorted(set(src.values()) | SECTOR_ETFS), warm, end_excl)
+    stock_data, n_valid = {}, {}
+    for t in tickers:
+        if src[t] not in px:
+            continue
+        a = _align(px[src[t]], date_index)
+        if a["Close"].iloc[eval_start_idx:].notna().sum() < 2:
+            continue
+        stock_data[t] = a
+        n_valid[t] = a["Close"].notna().cumsum().to_numpy()
+    etf_data = {t: _align(px[t], date_index) for t in SECTOR_ETFS if t in px}
+    if not stock_data:
+        raise ValueError("다운로드된 종목 데이터가 없습니다")
+
+    miss_stocks = sorted(t for t in tickers if t not in stock_data)
+    meta.update(requested=len(tickers), loaded=len(stock_data), missing=miss_stocks,
+                aliases={t: a for t, a in src.items() if a != t})
+    if members is not None:
+        # 생존 편향 측정: 구성종목이던 날(평가 구간) 중 시세가 있는 날의 비율
+        ev = slice(eval_start_idx, None)
+        tot = cov = 0
+        thin = []
+        for t, m in members.items():
+            mdays = int(m[ev].sum())
+            have = (int((m[ev] & stock_data[t]["Close"].iloc[ev].notna().to_numpy()).sum())
+                    if t in stock_data else 0)
+            tot += mdays; cov += have
+            if mdays and have / mdays < 0.5:
+                thin.append(t)
+        meta.update(member_day_coverage=cov / tot if tot else 1.0,
+                    effectively_missing=sorted(thin))
+        members = {t: m for t, m in members.items() if t in stock_data}
+    return {"stock_data": stock_data, "etf_data": etf_data, "date_index": date_index,
+            "spy_close": spy_full,
+            "spy_ma200": spy_full.rolling(200, min_periods=100).mean(),
+            "spy_ma50": spy_full.rolling(50, min_periods=25).mean(),
+            "eval_start_idx": eval_start_idx, "members": members, "n_valid": n_valid,
+            "min_history": int(min_history), "sector_map": sector_map, "meta": meta}

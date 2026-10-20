@@ -1,0 +1,50 @@
+# AI 트레이딩 — 서버 실행 구성 (docker compose)
+#   app      : NiceGUI 앱 = 자동매매 루프 + 텔레그램 봇 + 감시/리포트 (맥 앱과 같은 프로세스)
+#   watchdog : 외부 감시 — 앱이 통째로 죽거나 멈추면 텔레그램 경보 (맥의 launchd 5분 점검 대체)
+#
+# 보안: UI 에 로그인이 없다. 포트는 서버 자신(127.0.0.1)에만 열고, 접속은 Tailscale 이나
+#       SSH 터널로만 한다. "0.0.0.0:8502" 로 바꾸면 인터넷의 누구나 주문할 수 있다.
+name: trade
+
+x-base: &base
+  image: aitrading:latest
+  build: .
+  init: true
+  # 장부 파일이 배포 계정 소유로 남도록 같은 uid 로 실행 (server-setup.sh 가 .env 에 기록)
+  user: "${TRADE_UID:-1000}:${TRADE_GID:-1000}"
+  volumes:
+    - ${TRADE_DIR:-/opt/trade}:/app
+  # PID 파일로 '실행 중' 을 판정하므로 app 과 watchdog 이 같은 PID 공간을 봐야 한다.
+  pid: host
+  restart: unless-stopped
+  ulimits:
+    nofile: { soft: 8192, hard: 65536 }
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  app:
+    <<: *base
+    environment:
+      TZ: Asia/Seoul
+      HOME: /tmp
+      TRADE_HOST: 0.0.0.0
+      TRADE_PORT: "8502"
+    ports:
+      - "127.0.0.1:${TRADE_PORT:-8502}:8502"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8502), 3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  watchdog:
+    <<: *base
+    command: ["python", "watchdog.py", "--loop", "300"]
+    environment:
+      TZ: Asia/Seoul
+      HOME: /tmp
+    depends_on: [app]
