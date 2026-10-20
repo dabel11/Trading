@@ -83,3 +83,6 @@ equity_history.json
 monitor_state.json
 .monitor.lock
 ui_ng/_server.log.1
+
+# 맥 앱 원격 모드 — 서버 주소(사용자별)
+.remote_url

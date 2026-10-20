@@ -8,6 +8,10 @@ NiceGUI 자체 native=True(멀티프로세싱) 대신 이 방식을 쓰는 이�
   나중에 런처 한 줄만 바꾸면 Streamlit→NiceGUI로 스위치됨.
 
 실행:  ngvenv/bin/python -m ui_ng.window   (프로젝트 루트에서)
+
+원격 모드: 매매를 서버로 옮긴 뒤엔 프로젝트 루트의 `.remote_url`(또는 환경변수
+TRADE_REMOTE_URL)에 서버 주소를 적어 둔다. 그러면 로컬 서버를 띄우지 않고 그 주소만
+창에 연다 — 맥과 서버가 동시에 매매·텔레그램 봇을 돌리는 일을 막는다.
 """
 from __future__ import annotations
 import os, sys, time, socket, subprocess
@@ -16,6 +20,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 8502
 URL = f"http://127.0.0.1:{PORT}"
+REMOTE_FILE = ROOT / ".remote_url"
+
+
+def _remote_url():
+    """원격 모드면 서버 주소(아직 안 적었으면 ""), 로컬 모드면 None.
+    .remote_url 파일이 '있기만 해도' 원격 모드 — 로컬 서버(=매매 루프·텔레그램 봇)를 절대 띄우지 않는다."""
+    url = os.environ.get("TRADE_REMOTE_URL", "").strip()
+    if url:
+        return url
+    try:
+        lines = REMOTE_FILE.read_text().splitlines()
+    except OSError:
+        return None
+    return next((ln.strip() for ln in lines
+                 if ln.strip() and not ln.strip().startswith("#")), "")
+
+
+_NO_URL_HTML = """<body style="background:#0B0B0F;color:#ddd;font:15px -apple-system;padding:48px">
+<h2>매매는 서버에서 돌고 있습니다</h2>
+<p>이 맥은 원격 모드입니다(<code>~/trade/.remote_url</code>). 서버 화면 주소를 그 파일에 적으면
+이 창이 서버 화면을 엽니다. 텔레그램 봇으로도 상태를 볼 수 있습니다.</p></body>"""
 
 
 def _port_open(port: int) -> bool:
@@ -68,18 +93,23 @@ def _start_server():
 
 
 def main():
-    proc = _start_server()
-    for _ in range(120):               # 최대 60초 대기
-        if _port_open(PORT):
-            break
-        time.sleep(0.5)
+    remote = _remote_url()
+    proc = None
+    if remote is None:
+        proc = _start_server()
+        for _ in range(120):               # 최대 60초 대기
+            if _port_open(PORT):
+                break
+            time.sleep(0.5)
 
     _set_app_name("AI 트레이딩")
 
     import webview
+    target = URL if remote is None else (remote or None)
     win = webview.create_window(
         "AI 트레이딩",
-        URL,
+        target,
+        html=None if target else _NO_URL_HTML,
         width=1440, height=900,
         min_size=(1100, 700),
         background_color="#0B0B0F",

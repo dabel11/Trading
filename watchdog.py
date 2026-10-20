@@ -8,6 +8,7 @@ launchd 가 5분마다 이 스크립트를 실행해, 장중인데 자동매매 
     python3 watchdog.py --install    # launchd 에이전트 설치(로그인 시 자동, 5분 주기)
     python3 watchdog.py --uninstall  # 제거
     python3 watchdog.py --status     # 설치 여부·최근 점검 결과
+    python3 watchdog.py --loop [초]  # 서버 컨테이너용: launchd 없이 주기 점검(기본 300초)
 """
 from __future__ import annotations
 
@@ -85,6 +86,16 @@ if __name__ == "__main__":
         uninstall()
     elif arg == "--status":
         status()
+    elif arg == "--loop":
+        # 서버(리눅스 컨테이너)용 — launchd 대신 자기 루프로 5분마다 점검. 실패해도 계속 돈다.
+        import time
+        every = float(sys.argv[2]) if len(sys.argv) > 2 else 300.0
+        while True:
+            try:
+                print(time.strftime("%m-%d %H:%M:%S"), check_once(), flush=True)
+            except Exception as e:
+                print(time.strftime("%m-%d %H:%M:%S"), f"점검 실패: {e}", flush=True)
+            time.sleep(every)
     else:
         import time
         try:
