@@ -7,6 +7,7 @@ test_core.py 가 다루지 않던(그리고 실제로 사고가 났던) 경로�
   · 근거 없는(시간초과) AI 판단이 근거 있는 판단을 덮던 문제
   · 페이퍼 키(PK)로 '실거래' 모드 시 실계좌 엔드포인트로 가서 401 나던 문제
   · AI 판단 시점 기록(forward 검증용 JSONL) — 판단마다 1줄·캐시 적중 미기록·실패 무영향
+    (자동매매 엔진 + 전체 시장 스캐너 배치)
 
 모든 상태 파일은 tmp_path 로 격리 — 실제 장부·설정·.env 는 건드리지 않는다.
 실행: python3 -m pytest test_influence_and_config.py -q
@@ -133,8 +134,8 @@ def test_judgment_appends_one_point_in_time_line(eng_log):
     rows = _log_rows(d)
     assert len(rows) == 1
     r = rows[0]
-    assert (r["v"], r["regime"], r["by"], r["provider"], r["model"]) == \
-        (1, "bull", "rule", None, None)
+    assert (r["v"], r["src"], r["regime"], r["by"], r["provider"], r["model"]) == \
+        (1, "engine", "bull", "rule", None, None)
     assert (r["buy_th"], r["sell_th"], r["held"]) == (60.0, 35.0, ["BBB"])
     assert r["iso"].endswith("+00:00") and abs(r["ts"] - time.time()) < 60
     assert (d / f"influence_log-{time.strftime('%Y%m', time.gmtime(r['ts']))}.jsonl").exists()
@@ -184,6 +185,39 @@ def test_llm_judgment_logs_model_but_never_key(eng_log, monkeypatch):
     assert (r["by"], r["provider"], r["model"]) == ("llm", "anthropic", "claude-test")
     assert r["verdicts"][0]["score"] == 77.0
     assert "SECRET" not in text
+
+
+@pytest.fixture
+def scan_log(eng_log, monkeypatch):
+    from influence import scanner
+    monkeypatch.setattr(scanner, "market_universe", lambda: ["AAA", "BBB", "CCC"])
+    monkeypatch.setattr(scanner, "_thresholds", lambda: (65.0, 30.0))   # 실제 설정 파일 안 건드림
+    monkeypatch.setattr(scanner, "STATE", {"running": False, "passes": 0, "error": ""})
+    return scanner, eng_log[1]
+
+
+def test_scanner_logs_one_line_per_batch(scan_log):
+    sc, d = scan_log
+    sc.scan_once(batch=2)
+    rows = _log_rows(d)
+    assert [[v["ticker"] for v in r["verdicts"]] for r in rows] == [["AAA", "BBB"], ["CCC"]]
+    for r in rows:
+        assert (r["src"], r["regime"], r["held"], r["buy_th"], r["sell_th"]) == \
+            ("scanner", "neutral", [], 65.0, 30.0)
+        assert r["t0"] <= r["ts"] and r["verdicts"][0]["evidence"][0]["source_key"] == "analyst"
+        assert r["verdicts"][0]["score"] == sc.FULL[r["verdicts"][0]["ticker"]].score
+
+
+def test_scanner_log_failure_never_breaks_scan(scan_log, monkeypatch, capsys):
+    from influence import engine
+    sc, d = scan_log
+    blocker = d / "not_a_dir"
+    blocker.write_text("")
+    monkeypatch.setattr(engine, "LOG_DIR", blocker / "sub")
+    sc.scan_once(batch=2)
+    assert set(sc.FULL) == {"AAA", "BBB", "CCC"}
+    assert sc.STATE["error"] == "" and sc.STATE["done"] == 3
+    assert "기록 실패" in capsys.readouterr().out
 
 
 def test_append_jsonl_concurrent_processes_never_interleave(tmp_path):

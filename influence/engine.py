@@ -6,15 +6,18 @@
 
 판단 기록(forward 검증용): LLM 판단은 학습데이터 미래 누설로 백테스트가 불가능해
 시점 그대로의 누적 기록이 유일한 성과 측정 수단이다. `score_universe()` 가 새로
-판단할 때마다(캐시 적중 제외) 한 줄을 `influence_log-YYYYMM.jsonl`(UTC 월 회전,
-설정 파일과 같은 폴더 — 격리 모드면 격리 폴더)에 붙인다. 기록 실패는 로그만 남기고
-매매 사이클엔 영향이 없다. 한 줄 스키마(v1):
+판단할 때마다(캐시 적중 제외), 그리고 전체 시장 스캐너가 배치 하나를 판단할 때마다
+한 줄을 `influence_log-YYYYMM.jsonl`(UTC 월 회전, 설정 파일과 같은 폴더 — 격리
+모드면 격리 폴더)에 붙인다. 기록 실패는 로그만 남기고 매매·스캔엔 영향이 없다.
+한 줄 스키마(v1):
 
-    {"v": 1, "ts": 판단 완료 epoch, "iso": 같은 시각 ISO8601(UTC), "t0": 수집 시작 epoch,
-     "regime": "bull"|"bear"|"neutral", "by": "llm"|"rule",
+    {"v": 1, "src": "engine"|"scanner", "ts": 판단 완료 epoch,
+     "iso": 같은 시각 ISO8601(UTC), "t0": 수집 시작 epoch,
+     "regime": 판단기에 준 국면("bull"|"bear"|"neutral" — 스캐너는 "neutral" 고정),
+     "by": "llm"|"rule",
      "provider": LLM 제공자|null, "model": LLM 모델명|null, "buy_th", "sell_th",
      "held": [보유 티커],
-     "verdicts": [Verdict.to_dict() + {"price": 판단 시점 가격|null}, ...]}
+     "verdicts": [Verdict.to_dict() + {"price": 판단 시점 가격|null(스캐너·UI 경로)}, ...]}
 
     Verdict.to_dict = {ticker, action, score, conviction, rationale, by(종목별 — LLM 응답
     누락 종목은 rule), ts, evidence: [{source_key, source_label, category, credibility,
@@ -48,13 +51,17 @@ def _log_file(ts: float) -> Path:
     return Path(base) / f"influence_log-{time.strftime('%Y%m', time.gmtime(ts))}.jsonl"
 
 
-def _append_log(t0: float, held: set, regime: str, buy_th: float, sell_th: float,
-                by: str, verdicts_list: list, prices: dict | None) -> None:
-    """새 판단 1회를 시점 그대로 JSONL 한 줄로 누적 (스키마는 모듈 docstring)."""
+def log_judgment(t0: float, held: set, regime: str, buy_th: float, sell_th: float,
+                 verdicts_list: list, prices: dict | None = None,
+                 src: str = "engine") -> None:
+    """새 판단 1회를 시점 그대로 JSONL 한 줄로 누적 (스키마는 모듈 docstring).
+
+    실패하면 예외를 그대로 던진다 — 호출자가 잡아 로그만 남길 것."""
     if not verdicts_list:
         return
     from safe_store import append_jsonl
     ts = time.time()
+    by = verdicts_list[0].by
     cfg = ai_judge._llm_config() if by == "llm" else None   # 키는 기록하지 않는다
     prices = prices or {}
     rows = []
@@ -64,7 +71,7 @@ def _append_log(t0: float, held: set, regime: str, buy_th: float, sell_th: float
         d["price"] = float(px) if px else None
         rows.append(d)
     append_jsonl(_log_file(ts), {
-        "v": 1, "ts": round(ts, 3),
+        "v": 1, "src": src, "ts": round(ts, 3),
         "iso": datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds"),
         "t0": round(t0, 3), "regime": regime, "by": by,
         "provider": cfg["provider"] if cfg else None,
@@ -133,7 +140,7 @@ def score_universe(tickers: list, held: set | None = None, regime: str = "neutra
         pass
     # 3) 판단 기록 — 실패해도 사이클은 그대로 진행(로그만)
     try:
-        _append_log(now, held, regime, buy_th, sell_th, by, verdicts_list, prices)
+        log_judgment(now, held, regime, buy_th, sell_th, verdicts_list, prices)
     except Exception as e:
         L(f"AI 판단 기록 실패(매매 영향 없음): {type(e).__name__}: {e}")
     return ({t: verdicts[t].score for t in tickers if t in verdicts}, verdicts)
