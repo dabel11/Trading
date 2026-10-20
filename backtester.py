@@ -798,12 +798,22 @@ def run(
     #   members        : 시점별 지수 구성 — 그날 구성종목이 아니면 신규 매수 후보 제외
     #   n_valid/min_history : 상장 직후(이력 부족) 종목은 신규 매수 후보 제외
     #   sector_map     : 섹터 신호용 티커→섹터 ETF 보강(이 런 동안만, 기존 키는 불변)
+    #   tie_break/tie_seed : 같은 점수(동점) 순서 — tie_order() 참고. 없으면 입력 순서
     _px = prefetched or {}
     eval_start = int(_px.get("eval_start_idx") or 0)
     members    = _px.get("members")
     n_valid    = _px.get("n_valid")
     min_hist   = int(_px.get("min_history") or 0)
     _sec_added = [k for k in (_px.get("sector_map") or {}) if k not in TICKER_SECTOR_MAP]
+    _tie = tie_order(_px.get("tie_break"), stock_data, _px.get("tie_seed"))
+
+    def _rank(scores: list, i: int) -> None:
+        """점수 내림차순. 동점은 tie_order 보조 키(없으면 안정 정렬 = 입력 순서)."""
+        if _tie is None:
+            scores.sort(key=lambda s: -s.total)
+        else:
+            tk = _tie(i)
+            scores.sort(key=lambda s: (-s.total, tk[s.ticker]))
 
     def _live_regime(i: int) -> str:
         """시장 국면 — 라이브(core.scoring.score)와 동일: SPY vs 200일선 ±2%."""
@@ -909,7 +919,7 @@ def run(
                 if sc != sc:          # NaN(결측 룩백) → 신호 없음
                     sc = 0.0
                 scores.append(StockScore(t, float(sc), 0, 0, 0, 0))
-            scores.sort(key=lambda s: -s.total)
+            _rank(scores, idx)
 
             # EV 판단 — 라이브 run_cycle 과 같은 core.ev (당일까지의 종가만 사용, 미래 참조 없음)
             if ev_filter:
@@ -919,7 +929,7 @@ def run(
                     today=today.date())
                 _g = _ev.gate_scores({s.ticker: s.total for s in scores}, _decs, _evp)
                 scores = [StockScore(s.ticker, _g[s.ticker], 0, 0, 0, 0) for s in scores]
-                scores.sort(key=lambda s: -s.total)
+                _rank(scores, idx)
                 for _d in _decs:
                     ev_stats[_d.action] = ev_stats.get(_d.action, 0) + 1
 
@@ -1086,6 +1096,47 @@ def check_window(start: str, end: str, holdout: bool = False) -> tuple[str, str]
         raise ValueError(f"봉인 구간({HOLDOUT_START}~)은 holdout=True 를 명시해야 엽니다 "
                          f"(요청: {start} ~ {end}). 개발은 {DEV_START}~{DEV_END} 에서.")
     return s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")
+
+
+TIE_BREAKS = ("random", "dollar_volume")
+TIE_DV_WINDOW = 20                # dollar_volume: 최근 N거래일 평균 거래대금
+
+
+def tie_order(mode, stock_data: dict, seed=None):
+    """동점 처리(연구용 번들 키 tie_break) → idx 를 받아 {티커: 보조 키(작을수록 앞)} 를
+    돌려주는 함수. mode 가 None 이면 None — run() 이 예전처럼 입력 순서(안정 정렬)로 가른다.
+
+    이산 점수 전략은 S&P 500 에서 수십~백수십 종목이 같은 점수라, 입력 순서(번들은
+    알파벳순)로 가르면 'A' 로 시작하는 종목만 산다. 라이브는 이 함수를 쓰지 않는다.
+      "random"        : 리밸런싱 날마다 (seed, idx) 로 정한 무작위 순서. 같은 seed 면 재현되고,
+                        종목 이름순으로 섞으므로 번들의 입력 순서와도 무관하다.
+      "dollar_volume" : 최근 TIE_DV_WINDOW 거래일 평균 거래대금(종가×거래량) 큰 순 — 당일까지만
+                        본다. 동점이면 대형·유동성주를 사는 셈이라 전략에 대형주 기울기가 생긴다."""
+    if mode is None:
+        return None
+    names = sorted(stock_data)
+    if mode == "random":
+        base = int(seed or 0)
+
+        def _random(idx: int) -> dict:
+            perm = np.random.default_rng([base, int(idx)]).permutation(len(names))
+            return dict(zip(names, perm.tolist()))
+        return _random
+    if mode == "dollar_volume":
+        dv = {}
+        for t in names:
+            df = stock_data[t]
+            if "Volume" in df.columns:
+                v = (df["Close"] * df["Volume"]).rolling(TIE_DV_WINDOW, min_periods=1).mean()
+                dv[t] = np.nan_to_num(v.to_numpy(dtype=float), nan=0.0)
+            else:
+                dv[t] = np.zeros(len(df))
+        pos = {t: i for i, t in enumerate(names)}   # 거래대금까지 같으면 이름순(사실상 없음)
+
+        def _dollar_volume(idx: int) -> dict:
+            return {t: (-(a[idx] if idx < len(a) else 0.0), pos[t]) for t, a in dv.items()}
+        return _dollar_volume
+    raise ValueError(f"알 수 없는 tie_break: {mode!r} (가능: None, {', '.join(TIE_BREAKS)})")
 
 
 def perf_stats(curve: pd.Series) -> dict:

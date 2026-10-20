@@ -229,6 +229,89 @@ def test_compare_strategies_adds_honest_metrics(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 동점 처리 (tie_break) — 이산 점수 전략이 알파벳순으로 사던 결함
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TIE_NAMES = [f"T{i:02d}" for i in range(20)]
+
+
+def _tie_bundle(names=_TIE_NAMES, volumes=None, **extra):
+    """같은 가격 경로 20종목 → 모든 리밸런싱에서 점수가 전부 동점."""
+    b = _research_bundle()
+    idx = b["date_index"]
+    up = np.linspace(50, 150, len(idx))
+    sd = {}
+    for t in names:
+        df = _px(up, idx)
+        if volumes:
+            df["Volume"] = float(volumes[t])
+        sd[t] = df
+    b.update(stock_data=sd, members={t: np.ones(len(idx), bool) for t in names},
+             n_valid={t: df["Close"].notna().cumsum().to_numpy() for t, df in sd.items()},
+             sector_map={}, **extra)
+    return b
+
+
+def _first_buys(r):
+    d0 = min(t.entry_date for t in r.trades)
+    return sorted(t.ticker for t in r.trades if t.entry_date == d0)
+
+
+def test_tie_break_absent_keeps_input_order():
+    """키가 없거나 None 이면 예전과 똑같이 입력 순서 앞쪽을 산다 (기존 동작 보존)."""
+    a = _run(_tie_bundle())
+    b = _run(_tie_bundle(tie_break=None, tie_seed=7))
+    assert _first_buys(a) == _TIE_NAMES[:3]
+    pd.testing.assert_series_equal(a.equity_curve, b.equity_curve)
+    assert [t.ticker for t in a.trades] == [t.ticker for t in b.trades]
+
+
+def test_tie_break_random_is_reproducible_per_seed():
+    r1 = _run(_tie_bundle(tie_break="random", tie_seed=3))
+    r2 = _run(_tie_bundle(tie_break="random", tie_seed=3))
+    assert [(t.ticker, t.entry_date) for t in r1.trades] == [(t.ticker, t.entry_date) for t in r2.trades]
+    pd.testing.assert_series_equal(r1.equity_curve, r2.equity_curve)
+    picks = {tuple(_first_buys(_run(_tie_bundle(tie_break="random", tie_seed=s)))) for s in range(6)}
+    assert len(picks) > 1                                    # seed 가 다르면 동점 선택도 다르다
+
+
+def test_tie_break_random_ignores_input_order():
+    """같은 seed 면 번들의 종목 입력 순서를 뒤집어도 같은 종목을 산다 — 순서 편향 없음."""
+    fwd = _run(_tie_bundle(tie_break="random", tie_seed=11))
+    rev = _run(_tie_bundle(names=_TIE_NAMES[::-1], tie_break="random", tie_seed=11))
+    assert [(t.ticker, t.entry_date) for t in fwd.trades] == [(t.ticker, t.entry_date) for t in rev.trades]
+
+
+def test_tie_break_random_has_no_alphabetical_bias():
+    """여러 seed 에 걸쳐 동점 20종목이 고르게 뽑힌다(입력 순서 앞쪽 몰림 없음)."""
+    from collections import Counter
+    cnt = Counter()
+    for s in range(40):
+        cnt.update(_first_buys(_run(_tie_bundle(tie_break="random", tie_seed=s))))
+    assert sum(cnt.values()) == 120                          # seed 당 3종목
+    rank = {t: i for i, t in enumerate(_TIE_NAMES)}
+    mean_pct = sum(rank[t] * c for t, c in cnt.items()) / sum(cnt.values()) / (len(_TIE_NAMES) - 1)
+    assert 0.38 < mean_pct < 0.62                            # 입력 순서였다면 0.05
+    assert len(cnt) >= 16 and max(cnt.values()) <= 15        # 기대 6회/종목 — 특정 종목 쏠림 없음
+
+
+def test_tie_order_random_depends_only_on_seed_and_day():
+    sd = {t: None for t in _TIE_NAMES}
+    f = bt.tie_order("random", sd, seed=5)
+    assert f(10) == bt.tie_order("random", dict(reversed(list(sd.items()))), seed=5)(10)
+    assert f(10) != f(11) and sorted(f(10).values()) == list(range(len(_TIE_NAMES)))
+    assert bt.tie_order(None, sd) is None
+    with pytest.raises(ValueError):
+        bt.tie_order("alphabetical", sd)
+
+
+def test_tie_break_dollar_volume_prefers_liquid_names():
+    vols = {t: 1e6 * (i + 1) for i, t in enumerate(_TIE_NAMES)}   # T19 가 거래대금 최대
+    r = _run(_tie_bundle(volumes=vols, tie_break="dollar_volume"))
+    assert _first_buys(r) == ["T17", "T18", "T19"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 디스크 캐시
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -313,3 +396,55 @@ def test_tournament_holdout_requires_keys_and_runs_once(monkeypatch, tmp_path):
         AssertionError("이미 열린 봉인 구간을 다시 돌리면 안 된다")))
     with pytest.raises(SystemExit, match="이미 열렸습니다"):
         st.main(["--holdout", "--keys", "momentum_max"])
+
+
+def _curve_result(vals, start="2020-01-01"):
+    idx = pd.bdate_range(start, periods=len(vals))
+    return bt.BacktestResult(trades=[], equity_curve=pd.Series(vals, index=idx, dtype=float),
+                             start_capital=float(vals[0]))
+
+
+def test_tournament_aggregate_seeds_mean_curve_and_spread():
+    st = _tournament()
+    a = _curve_result([100, 110, 99, 120])
+    b = _curve_result([100, 90, 95, 100])
+    mean, s = st.aggregate_seeds([a, b])
+    assert list(mean.equity_curve) == [100, 100, 97, 110]            # 평균 곡선 = seed 계좌들의 합/K
+    assert s["n_seeds"] == 2 and s["mdds"] == [a.mdd, b.mdd]
+    assert s["seed"]["ret"]["mean"] == pytest.approx((0.20 + 0.0) / 2)
+    assert s["seed"]["sharpe"]["min"] == min(a.sharpe, b.sharpe)
+    assert s["seed"]["sharpe"]["sd"] == pytest.approx(np.std([a.sharpe, b.sharpe], ddof=1))
+    bench = {"sharpe": 0.0, "mdd": -0.5}
+    row = st.apply_seed_stats({"ret": mean.total_return, "sharpe": mean.sharpe, "mdd": mean.mdd},
+                              s, bench, n_trials=10, sr_var=1e-4)
+    assert row["sharpe"] == pytest.approx(s["seed"]["sharpe"]["mean"])   # 보고 = seed 평균
+    assert row["curve_sharpe"] == mean.sharpe                             # 평균 곡선 값은 따로 보존
+    assert 0.0 <= row["seed_beat_spy"] <= 1.0 and 0.0 <= row["seed_dsr_median"] <= 1.0
+
+
+def test_tournament_prior_trials_counted_once(tmp_path, monkeypatch):
+    """옛 형식(rows 전부가 시도)과 새 형식(new_trials 만)을 섞어도 이전 시도를 두 번 세지 않는다."""
+    import json as _json
+    st = _tournament()
+    old = tmp_path / "strategy-tournament-2026-10-20.json"
+    old.write_text(_json.dumps({"rows": {"sp500": {"a": {"sharpe": 0.5 * math.sqrt(252)},
+                                                   "b": {"sharpe": 0.0}},
+                                         "watchlist": {"a": {"sharpe": 0.1 * math.sqrt(252)}}}}))
+    new = tmp_path / "strategy-tournament-2026-10-20-tiebreak.json"
+    new.write_text(_json.dumps({"rows": {"sp500": {"a": {}, "b": {}}},
+                                "new_trials": [{"variant": "random", "universe": "sp500",
+                                                "key": "a", "sr": 0.2}]}))
+    monkeypatch.setattr(st, "RESULTS_DIR", tmp_path)
+    prior = st.load_prior("auto")
+    assert sum(len(p["trials"]) for p in prior) == 4                 # 3(옛) + 1(새) — 새 파일의 rows 는 무시
+    srs = sorted(t["sr"] for p in prior for t in p["trials"])
+    assert srs == pytest.approx([0.0, 0.1, 0.2, 0.5])
+    assert [p["path"] for p in st.load_prior("auto", exclude=new)] == [old]   # 쓰려는 결과 파일은 제외
+    assert st.load_prior("none") == []
+    assert len(st.load_prior(str(old))[0]["trials"]) == 3
+
+
+def test_tournament_rejects_unknown_tie_break():
+    st = _tournament()
+    with pytest.raises(SystemExit, match="tie-break"):
+        st.main(["--tie-break", "alphabetical", "--keys", "momentum"])
