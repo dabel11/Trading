@@ -7,6 +7,8 @@
 - 결과: `research/results/strategy-tournament-2026-10-20-filters.json`.
 - backtester·라이브 코드는 수정하지 않았다.
 
+> **병합 후 메모(2026-10-21):** 같은 시기에 병렬로 돈 동점 처리 재실행(`strategy-tournament-2026-10-20-tiebreak.json`, 시도 104개)은 이 보고서의 시도 수 N 에 들어가지 않았다. 병합 후 `--prior auto` 기준 누적 시도는 **366**이다. N 이 클수록 운 보정 샤프·DSR 은 낮아질 뿐이라 이 보고서의 판정(통과 없음)은 바뀌지 않는다.
+
 ## 결론
 
 **두 필터 모두 채택하지 않는다.**
