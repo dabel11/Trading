@@ -40,7 +40,8 @@ TRAIL_GIVEBACK_PCT = 0.08
 
 # 유동형(동적 배분) 모드 파라미터
 # REBAL_BAND : 보유와 목표의 차이가 목표의 이 비율을 넘을 때만 매수/매도(잦은 거래 억제)
-# ROTATE_MARGIN : 슬롯이 꽉 찼을 때, 신규 후보가 최약 보유보다 이 점수 이상 높아야 교체
+# ROTATE_MARGIN : 교체는 자리 하나씩 — 들어올 신규가 나갈 보유보다 이 점수 이상 높아야 그 한 자리를
+#   바꾼다(약한 보유↔강한 신규 순으로 짝지음. 1등 후보 하나와 비교해 전부 바꾸지 않음)
 REBAL_BAND = 0.25
 ROTATE_MARGIN = 10.0
 # MIN_ROTATE_DAYS : 이 일수 미만 보유는 회전(목표 이탈)으로 팔지 않는다. 손절·트레일링·점수 급락·
@@ -469,7 +470,8 @@ class PortfolioManager:
           2) 점수 ≥ 매수문턱 상위 후보로 목표 포트폴리오 구성
              - 확신(=점수)에 비례해 비중 배분, 종목 수·종목당 상한은 lot_plan
                (자본이 적으면 적은 종목에 크게, 적당한 단위로 못 사는 종목은 제외)
-          3) 목표에서 빠진 보유는 회전 청산(단, 트레일링이 관리 중인 승자는 유지)
+          3) 목표에서 빠진 보유는 회전 청산 — 자리 하나씩, 들어온 신규가 그 보유보다
+             ROTATE_MARGIN 이상 높을 때만(트레일링이 관리 중인 승자·당일 매수는 유지)
           4) 보유 ↔ 목표 차이가 리밸런스 밴드를 넘을 때만 그 차액만큼 매수/매도
           5) 시드가 하드 캡 — 가용 현금 한도 내에서만 매수(점수 높은 순 우선)
         """
@@ -575,27 +577,33 @@ class PortfolioManager:
             weight = _weights(cands)
             target_val = {t: min(w, cap) * total_equity for t, w in weight.items()}
 
-        # ── 3) 목표 이탈 보유 → 회전 청산 (트레일링 관리 승자는 예외) ────────
-        # 회전은 교체 이득이 분명할 때만: 신규 후보의 점수가 보유 점수보다
-        # ROTATE_MARGIN 이상 높아야 한다. 점수가 문턱 부근에서 미세하게
-        # 출렁이는 것만으로 멀쩡한 보유를 팔고 비슷한 걸 사는 낭비 회전 방지.
-        _best_new = max((s.total for s in cands if s.ticker not in held_now),
-                        default=None)
-        rotated = set()
-        for t, p in held_now.items():
-            if t in target_val:
-                continue
-            _held_sc = score_map[t].total if t in score_map else 0.0
-            if _best_new is None or _best_new - _held_sc < ROTATE_MARGIN:
-                continue        # 교체 이득 불충분 → 회전하지 않음
+        # ── 3) 목표 이탈 보유 → 회전 청산 (자리 하나씩, 트레일링 관리 승자는 예외) ──
+        # 교체는 '자리 하나씩' 판정한다: 목표에서 밀린 보유(약한 것부터)와 목표에 들어온 신규
+        # (강한 것부터)를 한 쌍씩 맞춰, 그 신규가 그 보유보다 ROTATE_MARGIN 이상 높을 때만 판다.
+        # 예전엔 신규 '1등' 점수 하나와 비교해 밀린 보유를 전부 팔았다 — 넓은 유니버스에선 1등이
+        # 거의 항상 보유보다 10점 이상 높아, 1점 높은 신규로도 보유가 통째로 바뀌었다
+        # (10/20 장 시작 5종목 전부 교체). 짝이 없는 보유는 남고, 그 자리를 못 얻은 신규는
+        # 5단계 하드캡이 막는다.
+        def _rotatable(t: str, p) -> bool:
             if p.days_held() < MIN_ROTATE_DAYS:
-                continue        # 당일 매수 → 회전 안 함(위험 청산은 1단계에서 이미 처리)
+                return False    # 당일 매수 → 회전 안 함(위험 청산은 1단계에서 이미 처리)
             price = current_prices.get(t, p.entry_price)
             peak_gain = ((p.peak_price - p.entry_price) / p.entry_price
                          if p.entry_price else 0.0)
             pnl = (price - p.entry_price) / p.entry_price if p.entry_price else 0.0
-            if peak_gain >= TAKE_PROFIT_PCT and pnl > 0:
-                continue        # 목표 도달 승자 → 트레일링 스탑이 관리, 회전 제외
+            return not (peak_gain >= TAKE_PROFIT_PCT and pnl > 0)   # 목표 도달 승자 → 트레일링 몫
+
+        _held_sc = {t: (score_map[t].total if t in score_map else 0.0) for t in held_now}
+        _out = sorted((t for t, p in held_now.items()
+                       if t not in target_val and _rotatable(t, p)),
+                      key=lambda t: _held_sc[t])
+        _in = sorted((s.total for s in cands if s.ticker not in held_now), reverse=True)
+        rotated = set()
+        for t, new_sc in zip(_out, _in):
+            if new_sc - _held_sc[t] < ROTATE_MARGIN:
+                break           # 약한 보유↔강한 신규 순이라 다음 쌍도 마진 미달
+            p = held_now[t]
+            price = current_prices.get(t, p.entry_price)
             sells.append({"ticker": t, "shares": p.shares,
                           "reason": "rotate (목표 이탈)", "est_price": price})
             cash += p.shares * price

@@ -63,3 +63,19 @@ def test_only_one_share_class_when_flat(pf):
     o = _orders(pf, {"GOOG": 90, "GOOGL": 88, "MSFT": 70})
     bought = {b["ticker"] for b in o["buy"]}
     assert "GOOG" in bought and "GOOGL" not in bought
+
+
+def test_rotation_pairs_one_slot_at_a_time(pf):
+    """10/20 장 시작 5종목 전부 교체 재현 — 신규 1등(88)만 압도적이고 나머지는 보유보다 조금 높다.
+    예전: 1등 88 이 모든 보유(66~75)보다 10점 이상 높아 5개 전부 회전.
+    지금: 약한 보유↔강한 신규를 한 쌍씩 — 66↔88(+22), 68↔79(+11) 만 교체, 70↔78(+8)에서 멈춘다."""
+    held = {"H1": 66, "H2": 68, "H3": 70, "H4": 72, "H5": 75}
+    for t, sc in held.items():
+        pf.PortfolioManager(paper=True).record_buy(t, 20, 100.0, sc)
+    pf.set_clock(D1)
+    scores = {**held, "N1": 88, "N2": 79, "N3": 78, "N4": 77, "N5": 76}
+    pm = pf.PortfolioManager(paper=True)
+    sc = [StockScore(t, s, 0, 0, 0, 0) for t, s in sorted(scores.items(), key=lambda x: -x[1])]
+    o = pm.generate_orders(sc, {t: 100.0 for t in scores}, dynamic=True, available_override=0.0)
+    assert sorted(s["ticker"] for s in o["sell"] if s["reason"].startswith("rotate")) == ["H1", "H2"]
+    assert sorted(b["ticker"] for b in o["buy"]) == ["N1", "N2"]       # 슬롯 5 유지

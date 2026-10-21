@@ -1508,7 +1508,8 @@ def render_auto_panel(d):
             else:
                 ui.button("▶ 자동매매 시작", on_click=lambda: confirm(
                     "자동매매 시작",
-                    f'{cfg.get("interval",300)}초 주기로 run_cycle(발굴·채점·주문)을 실행합니다. 모의 체결.',
+                    f'{cfg.get("interval",300)}초 주기로 사이클을 돌립니다 — 매수·교체·비중조정은 하루 1번'
+                    f'(개장 후 {cfg.get("decision_time", "09:35")} ET 이후 첫 사이클), 나머지는 손절·트레일링 감시. 모의 체결.',
                     lambda: (DAEMON.start() and None, ui.notify("자동매매 시작 — 첫 사이클 실행 중…", position="top"), _hooks["auto"]()),
                     ok_label="시작")).classes("tbtn tbtn-primary")
             ui.button("↻ 지금 1회 실행", on_click=lambda: confirm(
@@ -1671,11 +1672,13 @@ def page_auto():
         else:
             ui.button("▶ 자동매매 시작", on_click=lambda: confirm(
                 "자동매매 시작",
-                f'{cfg.get("interval",300)}초 주기로 run_cycle(발굴·채점·주문)을 실행합니다. '
+                f'{cfg.get("interval",300)}초 주기로 사이클을 돌립니다 — 매수·교체·비중조정은 하루 1번'
+                f'(개장 후 {cfg.get("decision_time", "09:35")} ET 이후 첫 사이클), 나머지는 손절·트레일링 감시. '
                 '격리된 모의계좌로 실제 매매 결정·체결이 일어납니다.',
                 _start, ok_label="시작")).classes("tbtn tbtn-primary")
         ui.button("↻ 지금 1회 실행", on_click=lambda: confirm(
-            "지금 1회 실행", "run_cycle 사이클을 1회 실행합니다. 모의계좌에 주문이 발생할 수 있습니다.",
+            "지금 1회 실행", "사이클을 1회 실행합니다. 오늘 판단을 이미 했으면 손절·트레일링만 확인합니다. "
+            "모의계좌에 주문이 발생할 수 있습니다.",
             _once, ok_label="실행")).classes("tbtn")
     # 최근 사이클 로그
     if DAEMON.last_log:

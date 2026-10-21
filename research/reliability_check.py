@@ -134,6 +134,8 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--all", action="store_true", help="26개 전략 전부")
     ap.add_argument("--seeds", type=int, default=2, help="--all 의 무작위 동점 seed 수")
+    ap.add_argument("--tag", default="", help="결과 파일 이름 꼬리표(이전 결과를 덮어쓰지 않게)")
+    ap.add_argument("--variants", default="ABCD", help="돌릴 변형(예: AD)")
     a = ap.parse_args()
     t0 = time.time()
     bundle = bt.load_research_bundle("sp500", bt.DEV_START, bt.DEV_END)
@@ -145,7 +147,8 @@ def main():
     raw = {}
     with ProcessPoolExecutor(max_workers=a.workers, initializer=_init,
                              initargs=(str(path),)) as ex:
-        for task, m, dt in ex.map(_task, tasks_all(a.seeds) if a.all else tasks()):
+        todo = [t for t in (tasks_all(a.seeds) if a.all else tasks()) if t[1] in a.variants]
+        for task, m, dt in ex.map(_task, todo):
             raw[task] = m
             print(f"  {task[1]} {task[0]:16} seed={task[2]} {m['ret']:+7.1%} 샤프 {m['sharpe']:5.2f} "
                   f"MDD {m['mdd']:6.1%} 거래 {m['trades']:4d} 보유중앙 {m['med_hold']:4.0f}일 "
@@ -157,10 +160,12 @@ def main():
            "universe": "sp500", "run_kwargs": RUN_KW,
            "variants": {k: {"label": v[0], "kwargs": v[1]} for k, v in VARIANTS.items()},
            "seeds": {"ABC": SEEDS_ABC, "D": SEEDS_D}, "benchmark": bench,
-           "mode": "all" if a.all else "focus",
-           "verify_A_vs_tournament": None if a.all else verify(agg), "results": agg,
+           "mode": "all" if a.all else "focus", "tag": a.tag,
+           "verify_A_vs_tournament": None if (a.all or "A" not in agg) else verify(agg),
+           "results": agg,
            "meta": {k: v for k, v in bundle["meta"].items() if isinstance(v, (str, int, float, bool))}}
-    dest = RESULTS / f"reliability-{date.today().isoformat()}{'-all' if a.all else ''}.json"
+    dest = RESULTS / (f"reliability-{date.today().isoformat()}{'-all' if a.all else ''}"
+                      f"{'-' + a.tag if a.tag else ''}.json")
     dest.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str))
     v = out["verify_A_vs_tournament"]
     print(f"저장 {dest} · 재현 확인 {v and v['max_abs_ret_diff']} · 총 {time.time() - t0:.0f}s",

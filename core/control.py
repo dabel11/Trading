@@ -22,6 +22,9 @@ DEFAULT_CONFIG = {
     "daily_loss_limit": 0.05, "discover": {"enabled": False},
     # schedule: "interval"=주기 실행 | "daily"=매일 1회(개장 후 daily_time ET)
     "schedule": "interval", "daily_time": "10:00",
+    # decision: "daily"=매수·교체·비중조정은 하루 1번(decision_time ET 이후 첫 사이클), 나머지 사이클은
+    #   손절·트레일링 감시만 | "every_cycle"=매 사이클 판단(예전). core/cycle.decision_due 참고
+    "decision": "daily", "decision_time": "09:35",
     # EV(기대값) 판단 — core/ev.py. 매수 후보는 EV ≥ ev_min 일 때만, 보유는 EV < ev_exit 면 매도
     "ev_enabled": True, "ev_min": 0.0, "ev_exit": -0.005, "ev_p_min": 0.40, "ev_cost_bps": 5,
 }

@@ -142,6 +142,7 @@ def test_live_cycle_plans_with_real_account_cash(pf, monkeypatch, tmp_path):
     monkeypatch.setattr(cycle, "execute_orders",
                         lambda orders, *a, **k: captured.update(orders) or {"bought": [], "sold": []})
     logs = []
-    cycle._run_cycle({"paper": False, "strategy": "composite", "ev_enabled": False}, log=logs.append)
+    cycle._run_cycle({"paper": False, "strategy": "composite", "ev_enabled": False,
+                      "decision": "every_cycle"}, log=logs.append)   # 판단 사이클 — 시각과 무관하게
     assert [(b["ticker"], b["shares"]) for b in captured["buy"]] == [("A", 8)]
     assert any("소액 자본 정책" in m and "최대 1종목" in m for m in logs)

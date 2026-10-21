@@ -57,6 +57,55 @@ def mark_to_market_equity(pm, prices: dict, paper: bool) -> float:
     return cash + mv
 
 
+# ── 하루 1번 판단 (decision="daily", 기본) ─────────────────────────────────
+# 매수·교체·비중조정은 ET 거래일마다 decision_time(기본 09:35 ET) 이후 첫 사이클 1번만 한다.
+# 그 뒤 사이클은 감시 모드 — 손절·트레일링 매도만. 채점은 전일까지 완성된 일봉이라 장중에
+# 다시 판단해도 새 정보가 거의 없고, 5분마다 다시 판단하면 상위 5 경계(5·6위 차 중앙 0.6점)가
+# 흔들려 교체·비중조정이 반복됐다. 하루 1번(다음 날 시가 근처 체결)이면 일봉 백테스트
+# (execution="next_open", daily_stops, rebalance_days=1 — backtester.live_equivalent_kwargs)로
+# 라이브를 그대로 재현할 수 있다. decision="every_cycle" 이면 예전처럼 매 사이클 판단.
+RISK_EXITS = ("stop_loss", "trailing_stop")
+
+
+def _decision_file():
+    # 호출 시점에 계산 — 격리 모드가 control 경로를 바꿔도 따라간다
+    from core import control
+    return control.CONFIG_FILE.parent / "decision_state.json"
+
+
+def decision_due(cfg: dict, now_et=None) -> bool:
+    """이번 사이클이 오늘(ET 거래일)의 판단 사이클인가."""
+    if cfg.get("decision", "daily") != "daily":
+        return True
+    import market_hours as mh
+    from safe_store import safe_read_json
+    et = now_et or mh.now_et()
+    try:
+        hh, mm = (cfg.get("decision_time") or "09:35").split(":")
+        if et < et.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0):
+            return False
+    except Exception:
+        pass
+    last = (safe_read_json(_decision_file(), {}) or {}).get("day")
+    return last != mh.trading_day(et).isoformat()
+
+
+def _mark_decided(now_et=None) -> None:
+    import market_hours as mh
+    from safe_store import atomic_write_json
+    et = now_et or mh.now_et()
+    atomic_write_json(_decision_file(), {"day": mh.trading_day(et).isoformat(),
+                                         "at": et.isoformat(timespec="seconds")})
+
+
+def monitor_only(orders: dict) -> tuple[dict, int]:
+    """감시 모드 — 손절·트레일링 매도만 남긴다. 반환: (주문, 보류한 건수)."""
+    keep = [o for o in orders.get("sell", [])
+            if str(o.get("reason", "")).startswith(RISK_EXITS)]
+    held_back = len(orders.get("buy", [])) + len(orders.get("sell", [])) - len(keep)
+    return {"sell": keep, "buy": []}, held_back
+
+
 _LOT_NOTE = {"last": None}
 
 
@@ -224,9 +273,10 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     # EV(기대값) 판단 — 매수 후보·보유 종목별 '매수/대기/보유/매도'.
     # 주문 로직이 읽는 점수만 조정(대기 → 매수 문턱 아래, 매도 → 매도 문턱 아래)해
     # 기존 청산·하드캡·이중매도 방지를 그대로 거친다. 표시용 scores_raw 는 원점수 유지.
+    decide = decision_due(cfg)
     ev_decisions: list = []
     gated = {r["ticker"]: r["score"] for r in scores_raw}
-    if cfg.get("ev_enabled", True):
+    if cfg.get("ev_enabled", True) and decide:
         try:
             from core import ev as _ev
             ev_decisions = _ev.decide_live(cfg, scores_raw, prices, pm.positions, log=L)
@@ -293,6 +343,10 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
     if halted and orders["buy"]:
         L(f"대조 불일치 → 매수 {len(orders['buy'])}건 보류")
         orders["buy"] = []
+    if not decide:
+        orders, n_held_back = monitor_only(orders)
+        if n_held_back:
+            L(f"감시 모드(오늘 판단 완료) — 손절·트레일링 외 주문 {n_held_back}건 보류")
 
     top = scores_raw[0] if scores_raw else None
     n_b, n_s = len(orders["buy"]), len(orders["sell"])
@@ -305,7 +359,11 @@ def _run_cycle(cfg: dict, log: Optional[Callable[[str], None]] = None) -> dict:
 
     result = execute_orders(orders, prices, paper, pm, broker=broker, log=L,
                             cycle_id=cycle_id, price_ts=price_ts, cfg=cfg)
+    if decide and cfg.get("decision", "daily") == "daily":
+        _mark_decided()
+        L("오늘 판단 완료 — 다음 판단은 다음 거래일. 그때까지 손절·트레일링만 감시")
     result["regime"] = regime
+    result["decided"] = decide
     if halted:
         result["halted"], result["reconcile"] = True, halted
     result["top"] = scores_raw[:10]
