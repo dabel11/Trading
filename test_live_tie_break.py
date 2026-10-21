@@ -35,6 +35,32 @@ def _days(n, start=date(2026, 1, 1)):
     return [(start + timedelta(days=i)).isoformat() for i in range(n)]
 
 
+def _weeks(n, start=date(2026, 1, 5)):      # 월요일들
+    return [start + timedelta(weeks=i) for i in range(n)]
+
+
+def _trading_days(n, start=date(2026, 1, 5)):
+    out, d = [], start
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _period(d: date) -> str:
+    """그날(ET 정오) 라이브가 쓰는 동점 기준 — scoring._tie_period() 를 그대로 호출."""
+    import market_hours as mh
+    import pytz
+    et = pytz.timezone("America/New_York")
+    orig = mh.now_et
+    mh.now_et = lambda: et.localize(datetime(d.year, d.month, d.day, 12, 0))
+    try:
+        return scoring._tie_period()
+    finally:
+        mh.now_et = orig
+
+
 # ── 키 성질 ──────────────────────────────────────────────────────────────────
 
 def test_tie_key_survives_process_restart():
@@ -69,6 +95,19 @@ def test_tie_period_is_us_eastern_week(monkeypatch):
     assert _order(rows, "2026-10-26") != _order(rows, "2026-10-19")
 
 
+def test_week_boundaries_including_year_end():
+    """주는 월~일. 연말·연초도 달력 연도와 무관하게 한 주로 묶인다(주 중간에 순서가 안 바뀜)."""
+    assert _period(date(2026, 10, 19)) == _period(date(2026, 10, 25)) == "2026-10-19"
+    assert _period(date(2026, 10, 26)) == "2026-10-26"
+    assert (_period(date(2026, 12, 28)) == _period(date(2027, 1, 1))
+            == _period(date(2027, 1, 3)) == "2026-12-28")
+    assert _period(date(2027, 1, 4)) == "2027-01-04"
+    assert _period(date(2025, 12, 29)) == _period(date(2026, 1, 1)) == "2025-12-29"
+    rows = _tied(NAMES)
+    assert _order(rows, _period(date(2026, 12, 31))) == _order(rows, _period(date(2027, 1, 1)))
+    assert _order(rows, _period(date(2027, 1, 1))) != _order(rows, _period(date(2027, 1, 4)))
+
+
 # ── 정렬 성질 ────────────────────────────────────────────────────────────────
 
 def test_non_tied_order_is_plain_score_descending():
@@ -86,13 +125,14 @@ def test_non_tied_order_is_plain_score_descending():
             assert got[i]["ticker"] == r["ticker"]
 
 
-def test_same_day_order_is_stable_and_ignores_input_order():
-    base = _order(_tied(NAMES))
+def test_same_week_order_is_stable_across_days_cycles_and_input_order():
+    base = _order(_tied(NAMES), _period(date(2026, 10, 19)))   # 월요일
     rnd = random.Random(7)
-    for _ in range(50):                               # 300초마다 재채점 + 입력 순서 뒤섞임
-        rows = _tied(NAMES)
-        rnd.shuffle(rows)
-        assert _order(rows) == base
+    for d in (date(2026, 10, 19) + timedelta(days=k) for k in range(7)):   # 월 ~ 일
+        for _ in range(10):                           # 300초마다 재채점 + 입력 순서 뒤섞임
+            rows = _tied(NAMES)
+            rnd.shuffle(rows)
+            assert _order(rows, _period(d)) == base, d
     assert base != NAMES                              # 이름순(옛 안정 정렬)과는 다르다
 
 
@@ -108,7 +148,9 @@ def test_universe_change_keeps_relative_order():
 def test_order_changes_across_days():
     orders = [_order(_tied(NAMES), d) for d in _days(30)]
     assert len({tuple(o) for o in orders}) == 30
-    assert len({o[0] for o in orders}) >= 10          # 첫 매수 후보가 날마다 고루 바뀐다
+    assert len({o[0] for o in orders}) >= 10          # 첫 매수 후보가 기준마다 고루 바뀐다
+    fri, mon = _period(date(2026, 10, 23)), _period(date(2026, 10, 26))
+    assert _order(_tied(NAMES), fri) != _order(_tied(NAMES), mon)
 
 
 def test_no_alphabetical_bias_in_first_pick():
@@ -141,7 +183,7 @@ def _df(close: float, volume: float, n: int = 80) -> pd.DataFrame:
     return pd.DataFrame({"Close": [close] * n, "Volume": [volume] * n})
 
 
-def test_strategy_path_ties_use_daily_key_not_dollar_volume(monkeypatch):
+def test_strategy_path_ties_use_tie_key_not_dollar_volume(monkeypatch):
     import backtester as bt
     sd = {"AAA": _df(10.0, 1_000),        # 거래대금 $10k
           "BBB": _df(100.0, 1_000_000),   # $100M — 거래대금 순이면 항상 맨 앞이었다
@@ -190,32 +232,38 @@ def test_ai_path_breaks_ties_without_network(ai_path):
 # ── 회전(churn) — 동점 순서가 날마다 바뀌어도 멀쩡한 보유를 팔지 않는가 ────────
 
 @pytest.fixture
-def full_book(monkeypatch, tmp_path):
-    """$100 × 20주 보유 5개(점수 70, 3일 전 매수), 현금 0 → 자본 $10k = 슬롯 5개 꽉 참."""
+def book(monkeypatch, tmp_path):
+    """격리된 장부 + 기본 파라미터(자본 $10k → 슬롯 5개·종목당 25%)."""
     import portfolio
     monkeypatch.setenv("TRADE_NOTIFY_DISABLED", "1")
     for k, v in {"STATE_FILE": tmp_path / "state.json", "MAX_POSITIONS": 5,
                  "MAX_POSITION_PCT": 0.25, "MIN_SCORE_TO_BUY": 60, "SELL_SCORE_THRESHOLD": 35,
                  "STOP_LOSS_PCT": 0.07, "TAKE_PROFIT_PCT": 0.15, "HOLD_DAYS_STRONG": 60,
                  "HOLD_DAYS_MEDIUM": 30, "BUY_PRICE_MIN": 0.0, "BUY_PRICE_MAX": 0.0,
-                 "ROTATE_MARGIN": 10.0, "MIN_ROTATE_DAYS": 1}.items():
+                 "ROTATE_MARGIN": 10.0, "MIN_ROTATE_DAYS": 1, "_CLOCK": None}.items():
         monkeypatch.setattr(portfolio, k, v)
-    pm = portfolio.PortfolioManager()
+    return portfolio
+
+
+@pytest.fixture
+def full_book(book):
+    """$100 × 20주 보유 5개(점수 70, 3일 전 매수), 현금 0 → 슬롯 5개 꽉 참."""
+    pm = book.PortfolioManager()
     held = [f"HLD{i}" for i in range(5)]
     for t in held:
         pm.record_buy(t, shares=20, price=100.0, score=70)
     for t in held:      # record_buy 가 디스크 장부를 다시 읽으므로 매수를 다 끝낸 뒤에 바꾼다
-        pm.positions[t].entry_date = (portfolio._today() - timedelta(days=3)).isoformat()
+        pm.positions[t].entry_date = (book._today() - timedelta(days=3)).isoformat()
     return pm, held
 
 
-def _plan(pm, rows, day):
+def _plan(pm, rows, day, cash=0.0):
     from scorer import StockScore
     rows = [dict(r) for r in rows]
     scoring.rank(rows, day=day)
     scores = [StockScore(r["ticker"], r["score"], 0, 0, 0, 0) for r in rows]
     prices = {r["ticker"]: 100.0 for r in rows}
-    o = pm.generate_orders(scores, prices, dynamic=True, available_override=0.0)
+    o = pm.generate_orders(scores, prices, dynamic=True, available_override=cash)
     top5 = {r["ticker"] for r in rows[:5]}
     return o, top5
 
@@ -252,3 +300,42 @@ def test_strong_new_candidate_rotation_count_depends_on_tie_order(full_book):
     per_day = _rotations_per_day(pm, held)
     assert min(per_day) >= 1                          # 85점 신규를 위한 1건은 항상
     assert sum(per_day) / len(per_day) > 3            # 동점 순서 탓에 평균 3건 넘게 판다
+
+
+def simulate_rotations(portfolio, period, n_days=60):
+    """장부를 날마다 실제로 갱신하는 회전 시뮬레이션(가격 $100 고정, 자본 $10k, 슬롯 5).
+
+    동점 풀 T00~T14(70점) + 매 거래일 85점 신규 S{i} 하나 — 다음 날부터 70점 동점으로 합류.
+    필요한 회전은 하루 1건(새 85점을 넣을 자리). period(d) = 그날의 동점 기준.
+    반환: 거래일별 회전 매도 수."""
+    pm = portfolio.PortfolioManager()
+    cash = 10_000.0
+    per_day = []
+    for i, d in enumerate(_trading_days(n_days)):
+        portfolio.set_clock(d)
+        rows = _tied([f"T{k:02d}" for k in range(15)] + [f"S{j:02d}" for j in range(i)])
+        rows.append({"ticker": f"S{i:02d}", "score": 85.0})
+        o, _ = _plan(pm, rows, period(d), cash)
+        for s in o["sell"]:
+            pm.record_sell(s["ticker"], exit_price=100.0, reason=s["reason"], shares=s["shares"])
+            cash += s["shares"] * 100.0
+        for b in o["buy"]:
+            pm.record_buy(b["ticker"], shares=b["shares"], price=100.0, score=b["score"])
+            cash -= b["shares"] * 100.0
+        per_day.append(sum(s["reason"].startswith("rotate") for s in o["sell"]))
+    portfolio.set_clock(None)
+    return per_day
+
+
+def test_weekly_reshuffle_cuts_excess_rotation_vs_daily(book, monkeypatch, tmp_path):
+    """주 단위로 섞으면 이번 주에 산 동점 보유는 이번 주 순서의 앞쪽이라, 강한 신규가 와도
+    그 자리 1건만 판다. 과잉 회전은 주가 바뀐 월요일에 몰린다. 매일 섞으면(이전 방식) 매일 과잉."""
+    weekly = simulate_rotations(book, _period)
+    days = _trading_days(len(weekly))
+    assert all(r == 1 for r, d in zip(weekly[1:], days[1:]) if d.weekday() != 0)   # 화~금은 필요한 1건만
+
+    monkeypatch.setattr(book, "STATE_FILE", tmp_path / "daily" / "state.json")
+    (tmp_path / "daily").mkdir()
+    daily = simulate_rotations(book, lambda d: d.isoformat())                    # 이전: 매일 섞기
+    assert sum(weekly) < sum(daily)
+    assert sum(weekly) / len(weekly) < 2 < sum(daily) / len(daily)
