@@ -17,12 +17,15 @@ BUNDLE_TTL = 180     # 3분 — 점수는 천천히 변하므로 재다운로드
 TIE_SEED = 0         # 동점 순서 seed — 바꾸면 모든 날의 순서가 다른 표본으로 바뀐다
 
 
-def _tie_day() -> str:
-    """동점 순서를 고정하는 기준일 = 미국 동부(ET) 날짜.
+def _tie_period() -> str:
+    """동점 순서를 고정하는 기준 = 미국 동부(ET) 날짜가 속한 주의 월요일(주간 재셔플).
 
-    로컬(KST) date.today() 는 ET 오전 10~11시, 장중에 바뀌어 같은 세션 안에서 순서가 뒤집힌다."""
+    매 거래일 섞으면 강한 신규 후보가 있는 날마다 동점 보유가 다시 회전돼(rank 3번 참고)
+    백테스트(7거래일 주기)보다 훨씬 자주 판다 — 주 단위로 고정해 그 주기에 가깝게 맞춘다.
+    로컬(KST) 날짜를 쓰면 ET 장중에 날짜가 바뀌어 같은 세션 안에서 순서가 뒤집힌다."""
     import market_hours as mh
-    return mh.now_et().date().isoformat()
+    d = mh.now_et().date()
+    return (d - timedelta(days=d.weekday())).isoformat()
 
 
 def tie_key(ticker: str, day: str, seed: int = TIE_SEED) -> int:
@@ -35,11 +38,12 @@ def tie_key(ticker: str, day: str, seed: int = TIE_SEED) -> int:
 
 
 def rank(scores: list, day: str | None = None, seed: int = TIE_SEED) -> None:
-    """점수 내림차순 정렬(제자리). 동점은 그날(ET)의 무작위 순서 tie_key, 키까지 같으면 티커순.
+    """점수 내림차순 정렬(제자리). 동점은 그 주(ET)의 무작위 순서 tie_key, 키까지 같으면 티커순.
 
     예전엔 안정 정렬이라 동점이면 입력(워치리스트) 순서대로 샀다 — 이산 점수 전략은 동점이
-    흔해 앞쪽 종목만 사는 편향이 생긴다. 300초마다 다시 채점해도 같은 날엔 순서가 같아야
-    빈 슬롯을 채우는 종목이 사이클마다 바뀌지 않는다. 날이 바뀌면 새 순서.
+    흔해 앞쪽 종목만 사는 편향이 생긴다. 300초마다 다시 채점해도 같은 주엔 순서가 같아야
+    빈 슬롯을 채우는 종목이 사이클마다 바뀌지 않는다. 주가 바뀌면(ET 월요일) 새 순서.
+    day 를 주면 그 값을 기준으로 쓴다(테스트·재현용 — 기본은 _tie_period()).
 
     백테스트 tie_order("random") 와의 관계 — 분포는 같고 실현값은 다르다:
       · 백테스트: 결정일(idx)마다 default_rng([seed, idx]) 로 유니버스 전체(이름순)의 균등
@@ -53,17 +57,17 @@ def rank(scores: list, day: str | None = None, seed: int = TIE_SEED) -> None:
       2) 백테스트 순열은 유니버스 구성에 의존한다(이름 하나가 늘면 전원 순서가 바뀜). 라이브는
          구성과 무관 — 장중에 워치리스트가 바뀌어도 남은 종목끼리의 순서는 그대로다.
       3) 순서가 바뀌는 주기: 백테스트는 결정일마다(기본 REBALANCE_DAYS=7거래일), 라이브는 ET
-         거래일마다. 라이브가 더 자주 섞인다. 순서만 바뀌어서는 보유를 팔지 않지만(ROTATE_MARGIN),
-         보유보다 마진 이상 높은 신규 후보가 하나라도 있으면 그날 순서로 목표에서 밀린 동점 보유가
-         전부 회전된다 — test_live_tie_break 의 회전 테스트 참고."""
-    d = day or _tie_day()
+         주마다(5거래일). 순서만 바뀌어서는 보유를 팔지 않지만(ROTATE_MARGIN), 보유보다 마진 이상
+         높은 신규 후보가 하나라도 있으면 그 주 순서로 목표에서 밀린 동점 보유가 전부 회전된다 —
+         매일 섞으면 이게 매일 반복돼 주간으로 고정했다. test_live_tie_break 의 회전 테스트 참고."""
+    d = day or _tie_period()
     scores.sort(key=lambda r: (-r["score"], tie_key(r["ticker"], d, seed), r["ticker"]))
 
 
 def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
     """전략 점수 + 현재가 + 시장 국면. 반환: (scores, prices, regime)
 
-    scores: [{"ticker", "score"}] 내림차순(동점은 rank — 그날의 무작위 순서) · prices: {ticker: 현재가}
+    scores: [{"ticker", "score"}] 내림차순(동점은 rank — 그 주의 무작위 순서) · prices: {ticker: 현재가}
     regime: "bull"|"bear"|"neutral" (SPY vs 200일선 ±2%)
     """
     if strategy == "ai_influencer":

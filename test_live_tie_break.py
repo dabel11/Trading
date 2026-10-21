@@ -1,5 +1,5 @@
 """
-라이브 동점 처리 — 같은 점수면 그날(ET)의 무작위 순서로 가른다.
+라이브 동점 처리 — 같은 점수면 그 주(ET, 월요일 기준)의 무작위 순서로 가른다.
 (예전: 워치리스트 순서 → 0473d9f: 거래대금 큰 순 → 지금: 백테스트 tie_order("random") 와 같은 의미)
 core.scoring.rank / tie_key 참고.
 실행: python3 -m pytest test_live_tie_break.py -q
@@ -48,18 +48,25 @@ def test_tie_key_survives_process_restart():
         assert int(out.stdout.strip()) == here
 
 
-def test_tie_day_is_us_eastern_date(monkeypatch):
-    """KST 자정(= ET 오전 10~11시, 장중)에 순서가 바뀌면 안 된다 → 기준일은 ET 날짜."""
+def test_tie_period_is_us_eastern_week(monkeypatch):
+    """주간 재셔플 — 기준은 ET 날짜가 속한 주의 월요일. KST 자정(= ET 장중)에도 안 바뀐다."""
     import market_hours as mh
     import pytz
     et = pytz.timezone("America/New_York")
-    # KST 2026-10-22 00:30 = ET 2026-10-21 11:30 — 아직 ET 10/21 세션
-    monkeypatch.setattr(mh, "now_et", lambda: et.localize(datetime(2026, 10, 21, 11, 30)))
-    assert scoring._tie_day() == "2026-10-21"
+    same_week = [datetime(2026, 10, 19, 9, 35),    # 월 개장 직후
+                 datetime(2026, 10, 21, 11, 30),   # 수 — KST 10/22 00:30, 아직 ET 10/21 장중
+                 datetime(2026, 10, 23, 15, 55),   # 금 마감 직전
+                 datetime(2026, 10, 25, 12, 0)]    # 일
+    for t in same_week:
+        monkeypatch.setattr(mh, "now_et", lambda t=t: et.localize(t))
+        assert scoring._tie_period() == "2026-10-19", t
+    monkeypatch.setattr(mh, "now_et", lambda: et.localize(datetime(2026, 10, 26, 9, 31)))
+    assert scoring._tie_period() == "2026-10-26"      # 다음 주 월요일 → 새 순서
     rows = _tied(NAMES[:20])
     a = [dict(r) for r in rows]
-    scoring.rank(a)                                   # day 생략 → _tie_day()
-    assert [r["ticker"] for r in a] == _order(rows, "2026-10-21")
+    scoring.rank(a)                                   # day 생략 → _tie_period()
+    assert [r["ticker"] for r in a] == _order(rows, "2026-10-26")
+    assert _order(rows, "2026-10-26") != _order(rows, "2026-10-19")
 
 
 # ── 정렬 성질 ────────────────────────────────────────────────────────────────
@@ -140,7 +147,7 @@ def test_strategy_path_ties_use_daily_key_not_dollar_volume(monkeypatch):
           "BBB": _df(100.0, 1_000_000),   # $100M — 거래대금 순이면 항상 맨 앞이었다
           "CCC": _df(50.0, 100_000)}
     monkeypatch.setattr(scoring, "_BUNDLE_CACHE", {})
-    monkeypatch.setattr(scoring, "_tie_day", lambda: DAY)
+    monkeypatch.setattr(scoring, "_tie_period", lambda: DAY)
     monkeypatch.setattr(bt, "load_market_data", lambda *a, **k: {
         "stock_data": sd, "etf_data": {}, "spy_close": None, "spy_ma200": None})
     monkeypatch.setattr(bt, "_strategy_score_bt", lambda *a, **k: 70.0)   # 전부 동점
@@ -163,7 +170,7 @@ def ai_path(monkeypatch):
         raise OSError("테스트: 네트워크 금지")
 
     monkeypatch.setattr(socket.socket, "connect", no_connect)
-    monkeypatch.setattr(scoring, "_tie_day", lambda: DAY)
+    monkeypatch.setattr(scoring, "_tie_period", lambda: DAY)
     monkeypatch.setattr(realtime_feed, "get_price", lambda t: None)
     monkeypatch.setattr(sb, "quote_prices", lambda ts: {t: 100.0 for t in ts})
     monkeypatch.setattr(sb, "market_regime", lambda: "neutral")
@@ -237,10 +244,10 @@ def _rotations_per_day(pm, held, n_days=60):
 
 def test_strong_new_candidate_rotation_count_depends_on_tie_order(full_book):
     """알려진 한계(현재 동작을 고정): ROTATE_MARGIN 은 '신규 후보 최고점'과 비교한다.
-    85점 신규가 하나 있으면 85 − 70 ≥ 10 이라, 그날 동점 순서로 목표(상위 5)에서 밀린 70점 보유는
+    85점 신규가 하나 있으면 85 − 70 ≥ 10 이라, 그 순서(재셔플 1회)로 목표(상위 5)에서 밀린 70점 보유는
     모두 회전된다 — 필요한 교체는 1건인데 날에 따라 1~5건(60일 평균 3.8건), 빈자리는 같은 70점
     신규가 채운다. 백테스트도 같은 generate_orders 라 이 효과는 판정에 이미 들어 있다(다만 백테스트는
-    7거래일마다, 라이브는 매 거래일 섞여 기회가 더 많다). 고치면 이 테스트를 '하루 1건'으로 바꾼다."""
+    7거래일마다, 라이브는 주마다 섞인다 — 매일 섞으면 이 회전이 매일 반복돼 주간으로 고정). 고치면 이 테스트를 '하루 1건'으로 바꾼다."""
     pm, held = full_book
     per_day = _rotations_per_day(pm, held)
     assert min(per_day) >= 1                          # 85점 신규를 위한 1건은 항상
