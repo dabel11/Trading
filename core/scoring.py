@@ -8,72 +8,62 @@ strategy == "ai_influencer" 이면 전략 공식 대신 influence.engine 이 공
 소스(애널리스트·내부자·미디어·SNS·군중)를 모아 AI/LLM 로 판단한 0~100 점수를
 쓴다. 가격·시장국면은 기존 번들에서 그대로 얻으므로 하위 파이프라인은 무수정.
 """
+import hashlib
 import time
 from datetime import date, timedelta
 
 _BUNDLE_CACHE: dict = {}
 BUNDLE_TTL = 180     # 3분 — 점수는 천천히 변하므로 재다운로드 최소화
-_DV_CACHE: dict = {}   # TK -> (ts, 최근 평균 거래대금) — AI 경로 동점 처리용
-DV_TTL = 6 * 3600      # 20일 평균이라 천천히 변한다
+TIE_SEED = 0         # 동점 순서 seed — 바꾸면 모든 날의 순서가 다른 표본으로 바뀐다
 
 
-def rank(scores: list, dollar_volume: dict) -> None:
-    """점수 내림차순 정렬(제자리). 동점은 최근 평균 거래대금 큰 순, 그것도 같으면 티커순.
+def _tie_day() -> str:
+    """동점 순서를 고정하는 기준일 = 미국 동부(ET) 날짜.
 
-    예전엔 안정 정렬이라 동점이면 입력(워치리스트) 순서대로 샀다 — 이산 점수 전략은
-    동점이 흔해 앞쪽 종목만 사는 편향이 생긴다. 백테스트 tie_order("dollar_volume") 와 같은 기준."""
-    scores.sort(key=lambda r: (-r["score"], -float(dollar_volume.get(r["ticker"]) or 0.0),
-                               r["ticker"]))
-
-
-def _tied(scores: list) -> list:
-    """다른 종목과 점수가 같은 티커들."""
-    from collections import Counter
-    n = Counter(r["score"] for r in scores)
-    return [r["ticker"] for r in scores if n[r["score"]] > 1]
+    로컬(KST) date.today() 는 ET 오전 10~11시, 장중에 바뀌어 같은 세션 안에서 순서가 뒤집힌다."""
+    import market_hours as mh
+    return mh.now_et().date().isoformat()
 
 
-def _dv_from_bundle(sd: dict, tickers: list) -> dict:
-    """번들 일봉 → 최근 TIE_DV_WINDOW 거래일 평균 거래대금(종가×거래량)."""
-    from backtester import TIE_DV_WINDOW
-    out = {}
-    for t in tickers:
-        try:
-            df = sd[t]
-            v = float((df["Close"] * df["Volume"]).tail(TIE_DV_WINDOW).mean())
-            out[t] = v if v == v else 0.0
-        except Exception:
-            out[t] = 0.0
-    return out
+def tie_key(ticker: str, day: str, seed: int = TIE_SEED) -> int:
+    """동점 보조 키(작을수록 앞) — blake2b(seed|day|ticker) 64비트.
+
+    티커 하나만 보므로 입력 순서·유니버스 구성과 무관하다. 내장 hash() 는 PYTHONHASHSEED 로
+    프로세스마다 달라져(재시작하면 순서가 바뀜) 쓰면 안 된다."""
+    h = hashlib.blake2b(f"{seed}|{day}|{ticker}".encode(), digest_size=8)
+    return int.from_bytes(h.digest(), "big")
 
 
-def _dv_live(tickers: list) -> dict:
-    """번들이 없는 AI 경로 — Nasdaq 일봉으로 평균 거래대금(캐시 DV_TTL)."""
-    import stock_browser as sb
-    from concurrent.futures import ThreadPoolExecutor
-    from backtester import TIE_DV_WINDOW
-    now = time.time()
-    out, need = {}, []
-    for t in tickers:
-        hit = _DV_CACHE.get(t)
-        if hit and now - hit[0] < DV_TTL:
-            out[t] = hit[1]
-        else:
-            need.append(t)
-    if need:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            vals = list(ex.map(lambda t: sb.nasdaq_dollar_volume(t, TIE_DV_WINDOW), need))
-        for t, v in zip(need, vals):
-            out[t] = v
-            if v > 0:
-                _DV_CACHE[t] = (time.time(), v)
-    return out
+def rank(scores: list, day: str | None = None, seed: int = TIE_SEED) -> None:
+    """점수 내림차순 정렬(제자리). 동점은 그날(ET)의 무작위 순서 tie_key, 키까지 같으면 티커순.
+
+    예전엔 안정 정렬이라 동점이면 입력(워치리스트) 순서대로 샀다 — 이산 점수 전략은 동점이
+    흔해 앞쪽 종목만 사는 편향이 생긴다. 300초마다 다시 채점해도 같은 날엔 순서가 같아야
+    빈 슬롯을 채우는 종목이 사이클마다 바뀌지 않는다. 날이 바뀌면 새 순서.
+
+    백테스트 tie_order("random") 와의 관계 — 분포는 같고 실현값은 다르다:
+      · 백테스트: 결정일(idx)마다 default_rng([seed, idx]) 로 유니버스 전체(이름순)의 균등
+        무작위 순열. 균등 순열을 동점 부분집합으로 좁혀도 균등 순서다.
+      · 라이브: 티커마다 독립 균등 64비트 키로 정렬 = 동점 집합의 균등 무작위 순서
+        (키 충돌 확률 ≈ k²/2⁶⁵, 무시 가능 — 충돌하면 티커순).
+      → 둘 다 '결정일마다 새 무작위 순서, 동점 종목 간 선호 없음'.
+    다른 점:
+      1) 같은 seed 라도 백테스트 순서를 재현하지 않는다(판정은 seed 20개 평균이라 불필요).
+         라이브는 seed 하나 = 그 분포의 한 표본 — 성과는 평균이 아니라 seed 간 퍼짐(±sd)과 비교.
+      2) 백테스트 순열은 유니버스 구성에 의존한다(이름 하나가 늘면 전원 순서가 바뀜). 라이브는
+         구성과 무관 — 장중에 워치리스트가 바뀌어도 남은 종목끼리의 순서는 그대로다.
+      3) 순서가 바뀌는 주기: 백테스트는 결정일마다(기본 REBALANCE_DAYS=7거래일), 라이브는 ET
+         거래일마다. 라이브가 더 자주 섞인다. 순서만 바뀌어서는 보유를 팔지 않지만(ROTATE_MARGIN),
+         보유보다 마진 이상 높은 신규 후보가 하나라도 있으면 그날 순서로 목표에서 밀린 동점 보유가
+         전부 회전된다 — test_live_tie_break 의 회전 테스트 참고."""
+    d = day or _tie_day()
+    scores.sort(key=lambda r: (-r["score"], tie_key(r["ticker"], d, seed), r["ticker"]))
 
 
 def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
     """전략 점수 + 현재가 + 시장 국면. 반환: (scores, prices, regime)
 
-    scores: [{"ticker", "score"}] 내림차순 · prices: {ticker: 현재가}
+    scores: [{"ticker", "score"}] 내림차순(동점은 rank — 그날의 무작위 순서) · prices: {ticker: 현재가}
     regime: "bull"|"bear"|"neutral" (SPY vs 200일선 ±2%)
     """
     if strategy == "ai_influencer":
@@ -130,11 +120,7 @@ def score(strategy: str, tickers: list, ttl: int = BUNDLE_TTL, log=None):
                 s = 0.0
             scores.append({"ticker": t, "score": round(float(s), 1)})
 
-    try:
-        dv = _dv_from_bundle(sd, _tied(scores))
-    except Exception:
-        dv = {}
-    rank(scores, dv)
+    rank(scores)
     return scores, prices, regime
 
 
@@ -166,13 +152,5 @@ def _score_ai(tickers: list, log=None):
     valid = [t for t in tickers if prices.get(t, 0) > 0]
     smap, _v = _eng.score_universe(valid, regime=regime, log=log, prices=prices)
     scores = [{"ticker": t, "score": round(float(smap.get(t, 50.0)), 1)} for t in valid]
-    dv: dict = {}
-    tied = _tied(scores)
-    if tied:
-        try:
-            dv = _dv_live(tied)
-        except Exception as e:
-            if log:
-                log(f"동점 거래대금 조회 실패 — 티커순으로 정렬: {e}")
-    rank(scores, dv)
+    rank(scores)
     return scores, prices, regime
