@@ -11,6 +11,7 @@ Capital rotation logic:
 """
 
 from datetime import date, timedelta
+from itertools import groupby
 from pathlib import Path
 from typing import Optional
 
@@ -522,6 +523,13 @@ class PortfolioManager:
                          and s.ticker not in _cooldown
                          and not self._reentry_blocked(
                              current_prices[s.ticker], _exit_px.get(s.ticker))))]
+        # 같은 점수(동점) 안에서는 보유를 먼저 둔다. 동점 순서는 그날(ET)의 무작위 순서
+        # (core.scoring.rank)라 그대로 두면 날마다 다른 동점 보유가 목표(상위 n_slots) 밖으로
+        # 밀리고, 3단계가 그 보유를 같은 점수 신규로 바꿔 판다 — 마진 이상 높은 신규가 하나라도
+        # 있으면 필요한 교체는 1건인데 밀린 동점 보유 전부(test_live_tie_break 회전 테스트).
+        # 연속한 같은 점수 구간 안에서만 자리를 바꾸므로 동점이 없으면 순서·결과가 그대로다.
+        _pre = [s for _, g in groupby(_pre, key=lambda s: s.total)
+                for s in sorted(g, key=lambda s: s.ticker not in held_now)]
         # 섹터 집중 상한: 같은 섹터 신규 진입은 MAX_PER_SECTOR 까지만
         # (보유 종목은 항상 통과 — 강제 청산 방지, 섹터 미상('')은 상한 미적용)
         _sec_cnt: dict = {}

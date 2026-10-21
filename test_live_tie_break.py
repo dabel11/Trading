@@ -281,33 +281,40 @@ def test_tie_reshuffle_alone_never_rotates_held(full_book):
     assert pushed_out >= 50                           # 대부분의 날 보유가 상위 5 밖 — 그래도 무매도
 
 
-def _rotations_per_day(pm, held, n_days=60):
-    rows = _tied(held + [f"NEW{i}" for i in range(10)]) + [{"ticker": "STRONG", "score": 85.0}]
-    out = []
-    for d in _days(n_days):
-        o, _ = _plan(pm, rows, d)
-        out.append(sum(s["reason"].startswith("rotate") for s in o["sell"]))
-    return out
-
-
-def test_strong_new_candidate_rotation_count_depends_on_tie_order(full_book):
-    """알려진 한계(현재 동작을 고정): ROTATE_MARGIN 은 '신규 후보 최고점'과 비교한다.
-    85점 신규가 하나 있으면 85 − 70 ≥ 10 이라, 그 순서(재셔플 1회)로 목표(상위 5)에서 밀린 70점 보유는
-    모두 회전된다 — 필요한 교체는 1건인데 날에 따라 1~5건(60일 평균 3.8건), 빈자리는 같은 70점
-    신규가 채운다. 백테스트도 같은 generate_orders 라 이 효과는 판정에 이미 들어 있다(다만 백테스트는
-    7거래일마다, 라이브는 주마다 섞인다 — 매일 섞으면 이 회전이 매일 반복돼 주간으로 고정). 고치면 이 테스트를 '하루 1건'으로 바꾼다."""
+def test_strong_new_candidate_rotates_exactly_one_tied_holding(full_book):
+    """85점 신규가 하나 있으면 85 − 70 ≥ ROTATE_MARGIN 이라 70점 보유 1개를 바꾼다 — 필요한 교체는
+    1건. 예전엔 '신규 최고점'과만 비교하고 목표(상위 5)를 고를 때 동점 보유를 우선하지 않아, 그
+    순서로 밀린 70점 보유가 모두 회전되고 빈자리를 같은 70점 신규가 채웠다(1~5건, 60회 평균 3.8건).
+    이제 같은 점수면 보유가 먼저라 매번 정확히 1건, 사는 건 85점 신규뿐."""
     pm, held = full_book
-    per_day = _rotations_per_day(pm, held)
-    assert min(per_day) >= 1                          # 85점 신규를 위한 1건은 항상
-    assert sum(per_day) / len(per_day) > 3            # 동점 순서 탓에 평균 3건 넘게 판다
+    rows = _tied(held + [f"NEW{i}" for i in range(10)]) + [{"ticker": "STRONG", "score": 85.0}]
+    sold = set()
+    for d in _days(60):
+        o, _ = _plan(pm, rows, d)
+        rot = [s["ticker"] for s in o["sell"] if s["reason"].startswith("rotate")]
+        assert len(rot) == 1 and rot[0] in held, (d, o["sell"])
+        assert [b["ticker"] for b in o["buy"]] == ["STRONG"], (d, o["buy"])
+        sold.add(rot[0])
+    assert len(sold) >= 3                             # 어느 70점 보유를 파는지는 그 순서(편향 없음)
+
+
+def test_non_tied_rotation_unchanged(full_book):
+    """동점이 아니면 예전 그대로 — 82점 신규 5개가 70점 보유 5개보다 마진(10) 이상 높으면 전부 바꾼다."""
+    pm, held = full_book
+    rows = _tied(held + [f"NEW{i}" for i in range(10)]) + _tied([f"HI{i}" for i in range(5)], 82.0)
+    for d in _days(5):
+        o, _ = _plan(pm, rows, d)
+        assert sorted(s["ticker"] for s in o["sell"]) == held, d
+        assert sorted(b["ticker"] for b in o["buy"]) == [f"HI{i}" for i in range(5)], d
 
 
 def simulate_rotations(portfolio, period, n_days=60):
     """장부를 날마다 실제로 갱신하는 회전 시뮬레이션(가격 $100 고정, 자본 $10k, 슬롯 5).
 
     동점 풀 T00~T14(70점) + 매 거래일 85점 신규 S{i} 하나 — 다음 날부터 70점 동점으로 합류.
-    필요한 회전은 하루 1건(새 85점을 넣을 자리). period(d) = 그날의 동점 기준.
-    반환: 거래일별 회전 매도 수."""
+    필요한 청산은 하루 1건(새 85점을 넣을 자리 — 보통 회전, 보유기간 만료와 겹치면 그 매도).
+    85점에 산 종목은 다음 날 70점이 되며 비중 축소(trim)도 나오는데, 그건 청산이 아니다.
+    period(d) = 그날의 동점 기준. 반환: 거래일별 (회전 매도 수, trim 제외 매도 수, 매수 티커들)."""
     pm = portfolio.PortfolioManager()
     cash = 10_000.0
     per_day = []
@@ -322,20 +329,23 @@ def simulate_rotations(portfolio, period, n_days=60):
         for b in o["buy"]:
             pm.record_buy(b["ticker"], shares=b["shares"], price=100.0, score=b["score"])
             cash -= b["shares"] * 100.0
-        per_day.append(sum(s["reason"].startswith("rotate") for s in o["sell"]))
+        per_day.append((sum(s["reason"].startswith("rotate") for s in o["sell"]),
+                        sum(not s["reason"].startswith("trim") for s in o["sell"]),
+                        [b["ticker"] for b in o["buy"]]))
     portfolio.set_clock(None)
     return per_day
 
 
-def test_weekly_reshuffle_cuts_excess_rotation_vs_daily(book, monkeypatch, tmp_path):
-    """주 단위로 섞으면 이번 주에 산 동점 보유는 이번 주 순서의 앞쪽이라, 강한 신규가 와도
-    그 자리 1건만 판다. 과잉 회전은 주가 바뀐 월요일에 몰린다. 매일 섞으면(이전 방식) 매일 과잉."""
-    weekly = simulate_rotations(book, _period)
-    days = _trading_days(len(weekly))
-    assert all(r == 1 for r, d in zip(weekly[1:], days[1:]) if d.weekday() != 0)   # 화~금은 필요한 1건만
+def test_rotation_sim_one_swap_per_day_weekly_or_daily(book, monkeypatch, tmp_path):
+    """같은 점수면 보유가 먼저라(portfolio._dynamic_orders), 동점 순서를 주마다 섞든 매일 섞든
+    강한 신규가 온 날 필요한 1건만 판다. (보유 우선 전: 주간은 월요일, 매일은 매일 과잉 회전.)"""
+    def check(per_day):
+        assert per_day[0][:2] == (0, 0)                # 첫날은 빈 슬롯을 채우기만
+        for i, (rot, sells, buys) in enumerate(per_day[1:], 1):
+            assert rot <= 1 and sells == 1, (i, per_day[i])
+            assert buys == [f"S{i:02d}"], (i, per_day[i])   # 사는 건 그날의 85점 신규뿐
 
+    check(simulate_rotations(book, _period))
     monkeypatch.setattr(book, "STATE_FILE", tmp_path / "daily" / "state.json")
     (tmp_path / "daily").mkdir()
-    daily = simulate_rotations(book, lambda d: d.isoformat())                    # 이전: 매일 섞기
-    assert sum(weekly) < sum(daily)
-    assert sum(weekly) / len(weekly) < 2 < sum(daily) / len(daily)
+    check(simulate_rotations(book, lambda d: d.isoformat()))

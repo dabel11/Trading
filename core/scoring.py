@@ -20,8 +20,7 @@ TIE_SEED = 0         # 동점 순서 seed — 바꾸면 모든 날의 순서가 
 def _tie_period() -> str:
     """동점 순서를 고정하는 기준 = 미국 동부(ET) 날짜가 속한 주의 월요일(주간 재셔플).
 
-    매 거래일 섞으면 강한 신규 후보가 있는 날마다 동점 보유가 다시 회전돼(rank 3번 참고)
-    백테스트(7거래일 주기)보다 훨씬 자주 판다 — 주 단위로 고정해 그 주기에 가깝게 맞춘다.
+    백테스트 결정 주기(7거래일)에 가깝게 주 단위로 고정한다(rank 3번 참고).
     로컬(KST) 날짜를 쓰면 ET 장중에 날짜가 바뀌어 같은 세션 안에서 순서가 뒤집힌다."""
     import market_hours as mh
     d = mh.now_et().date()
@@ -57,9 +56,9 @@ def rank(scores: list, day: str | None = None, seed: int = TIE_SEED) -> None:
       2) 백테스트 순열은 유니버스 구성에 의존한다(이름 하나가 늘면 전원 순서가 바뀜). 라이브는
          구성과 무관 — 장중에 워치리스트가 바뀌어도 남은 종목끼리의 순서는 그대로다.
       3) 순서가 바뀌는 주기: 백테스트는 결정일마다(기본 REBALANCE_DAYS=7거래일), 라이브는 ET
-         주마다(5거래일). 순서만 바뀌어서는 보유를 팔지 않지만(ROTATE_MARGIN), 보유보다 마진 이상
-         높은 신규 후보가 하나라도 있으면 그 주 순서로 목표에서 밀린 동점 보유가 전부 회전된다 —
-         매일 섞으면 이게 매일 반복돼 주간으로 고정했다. test_live_tie_break 의 회전 테스트 참고."""
+         주마다(5거래일). 순서가 바뀌어도 보유를 팔지 않는다 — 목표를 고를 때 같은 점수면 보유가
+         먼저라(portfolio._dynamic_orders) 강한 신규가 와도 필요한 1건만 바꾼다.
+         test_live_tie_break 의 회전 테스트 참고."""
     d = day or _tie_period()
     scores.sort(key=lambda r: (-r["score"], tie_key(r["ticker"], d, seed), r["ticker"]))
 
