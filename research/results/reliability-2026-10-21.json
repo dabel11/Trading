@@ -1,0 +1,529 @@
+{
+ "date": "2026-10-21",
+ "window": [
+  "2020-01-01",
+  "2024-12-31"
+ ],
+ "universe": "sp500",
+ "run_kwargs": {
+  "capital": 10000.0,
+  "min_score": 60.0,
+  "stop_loss": 0.07,
+  "take_profit": 0.2,
+  "trailing_stop": 0.15,
+  "use_trend_filter": false,
+  "adaptive_regime": true,
+  "dynamic": true,
+  "ev_filter": false
+ },
+ "variants": {
+  "A": {
+   "label": "현행(종가 체결·7일마다 손절 판정)",
+   "kwargs": {}
+  },
+  "B": {
+   "label": "다음날 시가 체결",
+   "kwargs": {
+    "execution": "next_open"
+   }
+  },
+  "C": {
+   "label": "시가 체결 + 매일 손절",
+   "kwargs": {
+    "execution": "next_open",
+    "daily_stops": true
+   }
+  },
+  "D": {
+   "label": "C + 매일 결정(라이브 근사)",
+   "kwargs": {
+    "execution": "next_open",
+    "daily_stops": true,
+    "rebalance_days": 1
+   }
+  }
+ },
+ "seeds": {
+  "ABC": 5,
+  "D": 2
+ },
+ "benchmark": {
+  "ret": 0.945849530533869,
+  "cagr": 0.14265145614848374,
+  "mdd": -0.33717245675660396,
+  "sharpe": 0.7412321647534847,
+  "start": "2020-01-02",
+  "end": "2024-12-31"
+ },
+ "verify_A_vs_tournament": {
+  "max_abs_ret_diff": 0.04098042249437617,
+  "per_key": {
+   "dual_momentum": 0.0008044755721128283,
+   "momentum": 0.0,
+   "momentum_max": 0.04098042249437617,
+   "sector_rotation": 0.027657060098785324
+  }
+ },
+ "results": {
+  "D": {
+   "dual_momentum": {
+    "ret": -0.020152368136672316,
+    "cagr": -0.00406980840489668,
+    "mdd": -0.4701995248766626,
+    "sharpe": 0.12224079776242053,
+    "trades": 545.0,
+    "avg_hold": 18.35229357798165,
+    "med_hold": 11.0,
+    "cost_pct_per_year": 0.046230420962423316,
+    "turnover_per_year": 15.410140320807772,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 205.0,
+     "stop_loss": 134.0,
+     "trim": 122.0,
+     "trailing_stop": 40.0,
+     "max_hold": 23.0,
+     "score_drop": 17.0,
+     "end_of_backtest": 4.0
+    }
+   },
+   "momentum": {
+    "ret": 0.18572278855318913,
+    "cagr": 0.034713600059688154,
+    "mdd": -0.3067858817109421,
+    "sharpe": 0.2648019661171296,
+    "trades": 445.0,
+    "avg_hold": 15.73932584269663,
+    "med_hold": 11.0,
+    "cost_pct_per_year": 0.04262185973168783,
+    "turnover_per_year": 14.207286577229276,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 162.0,
+     "trim": 122.0,
+     "stop_loss": 89.0,
+     "max_hold": 24.0,
+     "trailing_stop": 23.0,
+     "score_drop": 21.0,
+     "end_of_backtest": 4.0
+    }
+   },
+   "momentum_max": {
+    "ret": 0.6795957227557243,
+    "cagr": 0.10946232536325584,
+    "mdd": -0.2631102530517957,
+    "sharpe": 0.6114937795913183,
+    "trades": 231.0,
+    "avg_hold": 37.84848484848485,
+    "med_hold": 23.0,
+    "cost_pct_per_year": 0.027496863795555517,
+    "turnover_per_year": 9.165621265185173,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 85.0,
+     "stop_loss": 66.0,
+     "max_hold": 38.0,
+     "trailing_stop": 25.0,
+     "trim": 11.0,
+     "end_of_backtest": 5.0,
+     "score_drop": 1.0
+    }
+   },
+   "sector_rotation": {
+    "ret": -0.2756870649366522,
+    "cagr": -0.06256598129417623,
+    "mdd": -0.5234723660701983,
+    "sharpe": -0.10332297579859542,
+    "trades": 779.0,
+    "avg_hold": 10.038510911424904,
+    "med_hold": 6.0,
+    "cost_pct_per_year": 0.06065345489830015,
+    "turnover_per_year": 20.217818299433386,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 609.0,
+     "stop_loss": 122.0,
+     "trailing_stop": 28.0,
+     "trim": 9.0,
+     "score_drop": 6.0,
+     "end_of_backtest": 4.0,
+     "max_hold": 1.0
+    }
+   },
+   "ichimoku": {
+    "ret": 0.08089654051491368,
+    "cagr": 0.005901165606004399,
+    "mdd": -0.3967313494354684,
+    "sharpe": 0.0877671245075608,
+    "trades": 384.5,
+    "avg_hold": 22.811678212442274,
+    "med_hold": 11.0,
+    "cost_pct_per_year": 0.04075772407017995,
+    "turnover_per_year": 13.585908023393316,
+    "sharpe_sd": 0.41464763329431015,
+    "n_seeds": 2,
+    "reasons": {
+     "rotate": 201.5,
+     "score_drop": 116.0,
+     "stop_loss": 34.0,
+     "trailing_stop": 15.0,
+     "trim": 8.0,
+     "max_hold": 5.0,
+     "end_of_backtest": 5.0
+    }
+   }
+  },
+  "A": {
+   "dual_momentum": {
+    "ret": 0.7291961199372468,
+    "cagr": 0.11594933216820391,
+    "mdd": -0.3880488763081317,
+    "sharpe": 0.5168622993638962,
+    "trades": 264.0,
+    "avg_hold": 43.59848484848485,
+    "med_hold": 21.0,
+    "cost_pct_per_year": 0.030868904411944727,
+    "turnover_per_year": 10.289634803981576,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 96.0,
+     "stop_loss": 57.0,
+     "trim": 49.0,
+     "max_hold": 33.0,
+     "trailing_stop": 19.0,
+     "score_drop": 5.0,
+     "end_of_backtest": 5.0
+    }
+   },
+   "momentum": {
+    "ret": 0.5832861092416932,
+    "cagr": 0.09641592084811701,
+    "mdd": -0.27050909905840814,
+    "sharpe": 0.5108112736805666,
+    "trades": 174.0,
+    "avg_hold": 36.367816091954026,
+    "med_hold": 21.0,
+    "cost_pct_per_year": 0.024977097225483927,
+    "turnover_per_year": 8.325699075161308,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 46.0,
+     "trim": 35.0,
+     "stop_loss": 32.0,
+     "max_hold": 27.0,
+     "score_drop": 18.0,
+     "trailing_stop": 12.0,
+     "end_of_backtest": 4.0
+    }
+   },
+   "momentum_max": {
+    "ret": 0.22213082491027714,
+    "cagr": 0.041001223655489305,
+    "mdd": -0.335191733890494,
+    "sharpe": 0.29735950390250115,
+    "trades": 165.0,
+    "avg_hold": 52.32727272727273,
+    "med_hold": 50.0,
+    "cost_pct_per_year": 0.017514106245934045,
+    "turnover_per_year": 5.8380354153113485,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "max_hold": 61.0,
+     "rotate": 54.0,
+     "stop_loss": 34.0,
+     "trailing_stop": 6.0,
+     "trim": 5.0,
+     "end_of_backtest": 5.0
+    }
+   },
+   "sector_rotation": {
+    "ret": 0.29539505412583567,
+    "cagr": 0.053212941431932004,
+    "mdd": -0.36359346696990186,
+    "sharpe": 0.32570708941995324,
+    "trades": 323.0,
+    "avg_hold": 26.139318885448915,
+    "med_hold": 12.0,
+    "cost_pct_per_year": 0.03656624153956156,
+    "turnover_per_year": 12.188747179853854,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 239.0,
+     "stop_loss": 56.0,
+     "trailing_stop": 10.0,
+     "score_drop": 6.0,
+     "trim": 5.0,
+     "end_of_backtest": 5.0,
+     "max_hold": 2.0
+    }
+   },
+   "ichimoku": {
+    "ret": 0.3621938089874389,
+    "cagr": 0.0588830612369188,
+    "mdd": -0.34160815656386584,
+    "sharpe": 0.39700583534073647,
+    "trades": 205.4,
+    "avg_hold": 42.873853536067145,
+    "med_hold": 22.4,
+    "cost_pct_per_year": 0.0247710957803126,
+    "turnover_per_year": 8.257031926770868,
+    "sharpe_sd": 0.2461508934078733,
+    "n_seeds": 5,
+    "reasons": {
+     "score_drop": 100.6,
+     "rotate": 50.6,
+     "stop_loss": 21.0,
+     "max_hold": 15.4,
+     "trailing_stop": 7.8,
+     "trim": 5.0,
+     "end_of_backtest": 5.0
+    }
+   }
+  },
+  "B": {
+   "dual_momentum": {
+    "ret": 0.47453405134636495,
+    "cagr": 0.08089768714179368,
+    "mdd": -0.37876358221254036,
+    "sharpe": 0.4105359365736729,
+    "trades": 264.0,
+    "avg_hold": 43.196969696969695,
+    "med_hold": 21.0,
+    "cost_pct_per_year": 0.02716385998494051,
+    "turnover_per_year": 9.05461999498017,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 103.0,
+     "stop_loss": 61.0,
+     "trim": 48.0,
+     "max_hold": 27.0,
+     "trailing_stop": 15.0,
+     "score_drop": 5.0,
+     "end_of_backtest": 5.0
+    }
+   },
+   "momentum": {
+    "ret": 0.4250511357614861,
+    "cagr": 0.07353201964041567,
+    "mdd": -0.351447870516366,
+    "sharpe": 0.41874754800922975,
+    "trades": 177.0,
+    "avg_hold": 36.429378531073446,
+    "med_hold": 21.0,
+    "cost_pct_per_year": 0.023867931157399408,
+    "turnover_per_year": 7.955977052466471,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 55.0,
+     "trim": 38.0,
+     "stop_loss": 29.0,
+     "score_drop": 22.0,
+     "max_hold": 17.0,
+     "trailing_stop": 12.0,
+     "end_of_backtest": 4.0
+    }
+   },
+   "momentum_max": {
+    "ret": 0.30147411690827086,
+    "cagr": 0.054201169313549125,
+    "mdd": -0.42563289690148176,
+    "sharpe": 0.35023437752275755,
+    "trades": 146.0,
+    "avg_hold": 58.62328767123287,
+    "med_hold": 52.5,
+    "cost_pct_per_year": 0.015702984459996402,
+    "turnover_per_year": 5.234328153332134,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "max_hold": 54.0,
+     "rotate": 42.0,
+     "stop_loss": 32.0,
+     "trailing_stop": 7.0,
+     "trim": 6.0,
+     "end_of_backtest": 5.0
+    }
+   },
+   "sector_rotation": {
+    "ret": 0.3710544948286467,
+    "cagr": 0.0652573072738627,
+    "mdd": -0.3848014242784144,
+    "sharpe": 0.3684255342428211,
+    "trades": 326.0,
+    "avg_hold": 26.43558282208589,
+    "med_hold": 12.0,
+    "cost_pct_per_year": 0.036258607952802106,
+    "turnover_per_year": 12.086202650934036,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 250.0,
+     "stop_loss": 47.0,
+     "trailing_stop": 11.0,
+     "score_drop": 6.0,
+     "trim": 5.0,
+     "end_of_backtest": 5.0,
+     "max_hold": 2.0
+    }
+   },
+   "ichimoku": {
+    "ret": 0.35592141393239823,
+    "cagr": 0.06015629498632302,
+    "mdd": -0.31070585002751916,
+    "sharpe": 0.4030461482334208,
+    "trades": 196.8,
+    "avg_hold": 46.06594560262322,
+    "med_hold": 22.2,
+    "cost_pct_per_year": 0.02286955287311085,
+    "turnover_per_year": 7.623184291036949,
+    "sharpe_sd": 0.18893208788104146,
+    "n_seeds": 5,
+    "reasons": {
+     "score_drop": 99.6,
+     "rotate": 50.0,
+     "stop_loss": 18.2,
+     "max_hold": 11.4,
+     "trailing_stop": 7.6,
+     "trim": 5.0,
+     "end_of_backtest": 5.0
+    }
+   }
+  },
+  "C": {
+   "dual_momentum": {
+    "ret": -0.059430321381690354,
+    "cagr": -0.01219837994524009,
+    "mdd": -0.44119822736286834,
+    "sharpe": 0.07651580117333931,
+    "trades": 313.0,
+    "avg_hold": 25.562300319488816,
+    "med_hold": 18.0,
+    "cost_pct_per_year": 0.030576661954543154,
+    "turnover_per_year": 10.192220651514384,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "stop_loss": 122.0,
+     "rotate": 97.0,
+     "trailing_stop": 33.0,
+     "trim": 33.0,
+     "max_hold": 20.0,
+     "score_drop": 5.0,
+     "end_of_backtest": 3.0
+    }
+   },
+   "momentum": {
+    "ret": 0.07280283259249365,
+    "cagr": 0.01417683511180523,
+    "mdd": -0.3632353840201725,
+    "sharpe": 0.16904010365116165,
+    "trades": 203.0,
+    "avg_hold": 23.004926108374384,
+    "med_hold": 14.0,
+    "cost_pct_per_year": 0.024304038699124304,
+    "turnover_per_year": 8.101346233041435,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "stop_loss": 77.0,
+     "rotate": 49.0,
+     "trim": 30.0,
+     "trailing_stop": 23.0,
+     "max_hold": 11.0,
+     "score_drop": 10.0,
+     "end_of_backtest": 3.0
+    }
+   },
+   "momentum_max": {
+    "ret": 0.15068138587957436,
+    "cagr": 0.028514453523817096,
+    "mdd": -0.2797303429071129,
+    "sharpe": 0.24737485028650538,
+    "trades": 186.0,
+    "avg_hold": 41.77956989247312,
+    "med_hold": 31.0,
+    "cost_pct_per_year": 0.02038316461391954,
+    "turnover_per_year": 6.794388204639847,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "stop_loss": 72.0,
+     "rotate": 47.0,
+     "max_hold": 39.0,
+     "trailing_stop": 18.0,
+     "trim": 5.0,
+     "end_of_backtest": 5.0
+    }
+   },
+   "sector_rotation": {
+    "ret": 0.18701970894572661,
+    "cagr": 0.034940210731797094,
+    "mdd": -0.3530306301817265,
+    "sharpe": 0.26250376042600104,
+    "trades": 388.0,
+    "avg_hold": 18.45876288659794,
+    "med_hold": 11.0,
+    "cost_pct_per_year": 0.046251740552890344,
+    "turnover_per_year": 15.417246850963448,
+    "sharpe_sd": 0.0,
+    "n_seeds": 1,
+    "reasons": {
+     "rotate": 239.0,
+     "stop_loss": 111.0,
+     "trailing_stop": 24.0,
+     "trim": 5.0,
+     "end_of_backtest": 4.0,
+     "score_drop": 3.0,
+     "max_hold": 2.0
+    }
+   },
+   "ichimoku": {
+    "ret": 0.3409003344728995,
+    "cagr": 0.055155136552115146,
+    "mdd": -0.2998703018317259,
+    "sharpe": 0.3916682987673494,
+    "trades": 223.2,
+    "avg_hold": 35.49838098637774,
+    "med_hold": 20.4,
+    "cost_pct_per_year": 0.027836295735086048,
+    "turnover_per_year": 9.27876524502868,
+    "sharpe_sd": 0.2930704543412441,
+    "n_seeds": 5,
+    "reasons": {
+     "score_drop": 96.0,
+     "rotate": 49.0,
+     "stop_loss": 44.0,
+     "trailing_stop": 14.2,
+     "max_hold": 11.4,
+     "end_of_backtest": 4.8,
+     "trim": 3.8
+    }
+   }
+  }
+ },
+ "meta": {
+  "universe": "sp500",
+  "start": "2020-01-01",
+  "end": "2024-12-31",
+  "warmup_from": "2018-10-08",
+  "eval_start": "2020-01-02",
+  "eval_end": "2024-12-31",
+  "holdout": false,
+  "snapshot": "2026-10-20",
+  "changes_in_window": 99,
+  "current_members": 501,
+  "requested": 590,
+  "loaded": 540,
+  "member_day_coverage": 0.9414230239773171
+ }
+}

@@ -448,3 +448,78 @@ def test_tournament_rejects_unknown_tie_break():
     st = _tournament()
     with pytest.raises(SystemExit, match="tie-break"):
         st.main(["--tie-break", "alphabetical", "--keys", "momentum"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 체결 현실성 옵션 — execution="next_open" · daily_stops (기본값은 예전 동작)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gap_bundle(day2: dict | None = None):
+    """MEM 하나가 오르다 eval 첫날(300) 매수. day2 = {열: entry 대비 배율} 로 302일 봉을 덮어쓴다.
+    Open 은 평소 종가의 +2% — 종가 체결과 시가 체결이 구분되게."""
+    b = _research_bundle()
+    idx = b["date_index"]
+    df = b["stock_data"]["MEM"].copy()
+    df["Open"] = df["Close"] * 1.02
+    entry = float(df["Close"].iloc[300]) * (1 + 0.0005)
+    if day2:
+        for col, k in day2.items():
+            df.iloc[302:, df.columns.get_loc(col)] = entry * k   # 이후는 그 수준에서 평평
+    b["stock_data"] = {"MEM": df}
+    b["members"] = {"MEM": np.ones(len(idx), bool)}
+    b["n_valid"] = {"MEM": df["Close"].notna().cumsum().to_numpy()}
+    return b, entry
+
+
+def test_next_open_fills_at_next_day_open():
+    b, _ = _gap_bundle()
+    d = b["stock_data"]["MEM"]
+    r_close = _run(b)
+    r_open = _run(b, execution="next_open")
+    t0, t1 = r_close.trades[0], r_open.trades[0]
+    assert t0.entry_date == b["date_index"][300].date()
+    assert t0.entry_price == pytest.approx(d["Close"].iloc[300] * 1.0005)
+    assert t1.entry_date == b["date_index"][301].date()          # 결정 다음 날
+    assert t1.entry_price == pytest.approx(d["Open"].iloc[301] * 1.0005)
+
+
+def test_daily_stop_gap_down_fills_at_open():
+    b, entry = _gap_bundle({"Open": 0.90, "High": 0.91, "Low": 0.88, "Close": 0.90})
+    r = _run(b, stop_loss=0.07, daily_stops=True)
+    t = r.trades[0]
+    assert t.reason.startswith("stop_loss") and t.exit_date == b["date_index"][302].date()
+    assert t.exit_price == pytest.approx(entry * 0.90 * (1 - 0.0005))   # 선(−7%)이 아니라 갭 시가
+
+
+def test_daily_stop_intraday_touch_fills_at_stop_level():
+    b, entry = _gap_bundle({"Open": 0.97, "High": 0.98, "Low": 0.92, "Close": 0.95})
+    r = _run(b, stop_loss=0.07, daily_stops=True)
+    t = r.trades[0]
+    assert t.reason.startswith("stop_loss") and t.exit_date == b["date_index"][302].date()
+    assert t.exit_price == pytest.approx(entry * 0.93 * (1 - 0.0005))
+    # 예전 방식(리밸런싱 날 종가로만 판정)은 302일 장중 −8% 를 못 보고 계속 보유한다
+    r_old = _run(b, stop_loss=0.07)
+    assert r_old.trades[0].exit_date != b["date_index"][302].date()
+
+
+def test_execution_option_validated():
+    b, _ = _gap_bundle()
+    with pytest.raises(ValueError):
+        _run(b, execution="vwap")
+
+
+def test_live_equivalent_kwargs_mirror_live_config():
+    cfg = {"strategy": "momentum", "stop_loss": 0.07, "take_profit": 0.15, "trail": 0.07,
+           "min_score": 60, "sell_score": 35, "hold_strong": 60, "hold_medium": 30,
+           "dynamic": True}
+    kw = bt.live_equivalent_kwargs(cfg)
+    assert kw["trailing_stop"] == 0.07 and kw["take_profit"] == 0.15
+    assert kw["ev_filter"] is True                           # 키 없으면 라이브처럼 켜짐
+    assert kw["execution"] == "next_open" and kw["daily_stops"] and kw["rebalance_days"] == 1
+    assert bt.live_equivalent_kwargs({**cfg, "ev_enabled": False})["ev_filter"] is False
+    b, _ = _gap_bundle()
+    r = bt.run(strategy="momentum", capital=10_000, prefetched=b,
+               **{**kw, "ev_filter": False, "min_score": 20})
+    assert r.trades and r.trades[0].entry_date == b["date_index"][301].date()
+    with pytest.raises(ValueError):
+        bt.live_equivalent_kwargs({**cfg, "strategy": "ai_influencer"})

@@ -753,6 +753,8 @@ def run(
     ev_filter: bool = False,       # 라이브와 같은 EV 판단(core.ev)으로 매수 대기·보유 매도
     ev_min: float = 0.0,
     ev_exit: float = -0.005,
+    execution: str = "close",      # "close": 결정한 날 종가 체결(예전) · "next_open": 다음 날 시가 체결
+    daily_stops: bool = False,     # 매 거래일 시가·고가·저가로 손절·트레일링 체결(갭은 시가)
 ) -> BacktestResult:
     """과거 데이터로 전략을 시뮬레이션한다.
 
@@ -765,7 +767,17 @@ def run(
       • use_trend_filter: 중립장 추가 보수 필터(끄면 라이브와 동일)
     리밸런싱은 rebalance_days 주기. 손절/트레일링도 그 주기에 평가된다
     (일봉 백테스트의 한계 — 라이브 틱 가드만큼 즉각적이지 않음).
+
+    체결 현실성 옵션(기본값 = 예전 동작, 연구·신뢰성 점검용):
+      • execution="next_open": 결정은 그날 종가까지의 정보로, 체결은 다음 거래일 시가.
+        기본 "close" 는 결정에 쓴 바로 그 종가에 체결해 약한 미래 참조가 있다.
+      • daily_stops=True: 리밸런싱 날이 아니어도 매일 손절·트레일링을 일봉 고가·저가로
+        확인한다(증권사 측 stop 주문과 같은 의미). 시가가 이미 선 아래면 시가에 체결(갭),
+        장중에 닿으면 선 가격에 체결. 고점(peak)은 그날 판정 뒤 고가로 갱신 — 같은 날
+        고가·저가의 선후를 모르므로 보수적으로.
     """
+    if execution not in ("close", "next_open"):
+        raise ValueError(f"execution 은 'close' 또는 'next_open': {execution!r}")
     if universe is None:
         universe = TRADEABLE_UNIVERSE
 
@@ -880,9 +892,86 @@ def run(
                 cost_side=float(commission + slippage), ev_min=float(ev_min),
                 ev_exit=float(ev_exit), min_score=float(MIN_SC), sell_score=float(SELL_SC),
                 n_paths=1000)
+        def _fill(orders: dict, i: int, at: str, cash: float) -> float:
+            """주문 체결: 매도 먼저(자본 회수) → 매수, 수수료·슬리피지 현금 반영.
+            at="close": 주문의 est_price(결정일 종가) · at="open": i 일 시가(없으면 건너뜀)."""
+            def _px(o: dict) -> float:
+                if at == "close":
+                    return float(o["est_price"])
+                df = stock_data.get(o["ticker"])
+                if df is None or i >= len(df) or "Open" not in df.columns:
+                    return 0.0
+                v = float(df["Open"].iloc[i])
+                return v if v == v and v > 0 else 0.0
+            for o in orders.get("sell", []):
+                t = o["ticker"]
+                pos = pmbt.positions.get(t)
+                if pos is None:
+                    continue
+                qty = min(int(o["shares"]), int(pos.shares))
+                px = _px(o)
+                if qty < 1 or not px > 0:
+                    continue
+                fill = px * (1 - slippage)
+                proceeds = fill * qty
+                cash += proceeds - proceeds * commission
+                pmbt.record_sell(t, exit_price=fill, reason=o["reason"], shares=qty)
+            for o in orders.get("buy", []):
+                t = o["ticker"]
+                qty = int(o["shares"])
+                px = _px(o)
+                if qty < 1 or not px > 0:
+                    continue
+                fill = px * (1 + slippage)
+                cost = fill * qty
+                if cost + cost * commission > cash + 1e-6:
+                    # 슬리피지·수수료(또는 시가 갭)로 예산 초과 → 가능한 수량으로 축소
+                    qty = int(cash / (fill * (1 + commission)))
+                    if qty < 1:
+                        continue
+                    cost = fill * qty
+                cash -= cost + cost * commission
+                pmbt.record_buy(t, qty, fill, o.get("score", 0))
+            return cash
+
+        def _intraday_stops(i: int, cash: float) -> float:
+            """일봉 OHLC 로 손절·트레일링 판정·체결(증권사 stop 주문 근사)."""
+            for t in list(pmbt.positions):
+                df = stock_data.get(t)
+                if df is None or i >= len(df) or "Low" not in df.columns:
+                    continue
+                o_, h_, l_ = (float(df[c].iloc[i]) for c in ("Open", "High", "Low"))
+                if not (o_ > 0 and h_ > 0 and l_ > 0):
+                    continue
+                pos = pmbt.positions[t]
+                levels = [(pos.entry_price * (1 - portfolio.STOP_LOSS_PCT), "stop_loss")]
+                if pos.entry_price and (pos.peak_price - pos.entry_price) / pos.entry_price \
+                        >= portfolio.TAKE_PROFIT_PCT:
+                    levels.append((pos.peak_price * (1 - portfolio.TRAIL_GIVEBACK_PCT),
+                                   "trailing_stop"))
+                level, why = max(levels)        # 떨어질 때 먼저 닿는 선
+                hit = o_ if o_ <= level else (level if l_ <= level else None)
+                if hit is None:
+                    pos.update_peak(h_)
+                    continue
+                fill = hit * (1 - slippage)
+                qty = pos.shares
+                proceeds = fill * qty
+                cash += proceeds - proceeds * commission
+                pmbt.record_sell(t, exit_price=fill, reason=f"{why} (일중)", shares=qty)
+            return cash
+
+        pending = None            # execution="next_open": 다음 거래일 시가에 체결할 주문
         for idx, today in enumerate(date_index):
             if idx < eval_start:
                 continue          # 워밍업 — 지표 계산용 과거 데이터일 뿐 매매·평가 없음
+            if pending is not None or (daily_stops and pmbt.positions):
+                portfolio.set_clock(today.date())
+                if pending is not None:
+                    cash = _fill(pending, idx, "open", cash)
+                    pending = None
+                if daily_stops and pmbt.positions:
+                    cash = _intraday_stops(idx, cash)
             # --- 일일 평가(mark-to-market) ---
             pv = cash
             for t, pos in pmbt.positions.items():
@@ -948,35 +1037,11 @@ def run(
             elif use_trend_filter and regime == "neutral" and _spy_below_200(idx):
                 orders["buy"] = []
 
-            # --- 체결: 매도 먼저(자본 회수) → 매수, 수수료·슬리피지 현금 반영 ---
-            for o in orders.get("sell", []):
-                t = o["ticker"]
-                pos = pmbt.positions.get(t)
-                if pos is None:
-                    continue
-                qty = int(o["shares"])
-                if qty < 1:
-                    continue
-                fill = float(o["est_price"]) * (1 - slippage)
-                proceeds = fill * qty
-                cash += proceeds - proceeds * commission
-                pmbt.record_sell(t, exit_price=fill, reason=o["reason"], shares=qty)
-
-            for o in orders.get("buy", []):
-                t = o["ticker"]
-                qty = int(o["shares"])
-                if qty < 1:
-                    continue
-                fill = float(o["est_price"]) * (1 + slippage)
-                cost = fill * qty
-                if cost + cost * commission > cash + 1e-6:
-                    # 슬리피지·수수료로 예산 초과 → 가능한 수량으로 축소
-                    qty = int(cash / (fill * (1 + commission)))
-                    if qty < 1:
-                        continue
-                    cost = fill * qty
-                cash -= cost + cost * commission
-                pmbt.record_buy(t, qty, fill, o.get("score", 0))
+            # --- 체결 ---
+            if execution == "next_open":
+                pending = orders          # 다음 거래일 시가(마지막 날 주문은 체결 없음)
+            else:
+                cash = _fill(orders, idx, "close", cash)
 
         # --- 남은 포지션 강제 청산 (마지막 날 종가) ---
         last_idx = len(date_index) - 1
@@ -1096,6 +1161,29 @@ def check_window(start: str, end: str, holdout: bool = False) -> tuple[str, str]
         raise ValueError(f"봉인 구간({HOLDOUT_START}~)은 holdout=True 를 명시해야 엽니다 "
                          f"(요청: {start} ~ {end}). 개발은 {DEV_START}~{DEV_END} 에서.")
     return s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")
+
+
+def live_equivalent_kwargs(cfg: dict) -> dict:
+    """라이브 설정(autotrader_config) → 라이브와 같은 과정으로 도는 run() 인자.
+
+    라이브는 채점은 완성된 일봉(전일까지)으로, 체결은 장중 실시간 가격으로, 손절·트레일링은
+    사이클마다(5분) 확인하고, 판단은 매일(실제로는 사이클마다) 다시 한다. 일봉으로 이 과정에
+    가장 가까운 것: 다음 날 시가 체결 + 매일 일봉 고가·저가 손절 + 매일 결정.
+    파라미터도 라이브 값 그대로 — 토너먼트 RUN_KW(트레일링 15%·EV 끔)와 다를 수 있다.
+    ai_influencer 처럼 과거 시점을 재현할 수 없는 전략은 받지 않는다."""
+    if cfg.get("strategy") == "ai_influencer":
+        raise ValueError("ai_influencer 는 과거 판단을 재현할 수 없어 백테스트 대상이 아닙니다 "
+                         "(influence_log + research/ai_forward_eval.py 로 forward 평가)")
+    g = lambda k, d: cfg.get(k) if cfg.get(k) is not None else d   # noqa: E731
+    return dict(
+        min_score=float(g("min_score", 60)), sell_score=float(g("sell_score", 35)),
+        stop_loss=float(g("stop_loss", 0.07)), take_profit=float(g("take_profit", 0.15)),
+        trailing_stop=float(g("trail", 0.07)),
+        hold_strong=int(g("hold_strong", 60)), hold_medium=int(g("hold_medium", 30)),
+        dynamic=bool(g("dynamic", True)),
+        ev_filter=bool(g("ev_enabled", True)),     # 라이브 core/cycle.py 기본값 = 켜짐
+        use_trend_filter=False, adaptive_regime=True,
+        execution="next_open", daily_stops=True, rebalance_days=1)
 
 
 TIE_BREAKS = ("random", "dollar_volume")
