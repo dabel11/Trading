@@ -523,3 +523,69 @@ def test_live_equivalent_kwargs_mirror_live_config():
     assert r.trades and r.trades[0].entry_date == b["date_index"][301].date()
     with pytest.raises(ValueError):
         bt.live_equivalent_kwargs({**cfg, "strategy": "ai_influencer"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 두 바구니(코어 SPY + 단기 고변동) — research/two_sleeve.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _two_sleeve():
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).parent / "research" / "two_sleeve.py"
+    spec = importlib.util.spec_from_file_location("two_sleeve", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _vol_bundle(n=320):
+    idx = pd.bdate_range("2019-01-01", periods=n)
+    rng = np.random.default_rng(0)
+
+    def walk(sd):
+        return 100 * np.exp(np.cumsum(rng.normal(0, sd, n)))
+    sd = {"CALM": _px(walk(0.005), idx), "MID": _px(walk(0.02), idx),
+          "WILD": _px(walk(0.04), idx), "OUT": _px(walk(0.08), idx)}   # OUT: 가장 출렁이지만 비구성
+    members = {t: np.full(n, t != "OUT") for t in sd}
+    return {"stock_data": sd, "date_index": idx, "members": members, "eval_start_idx": 100,
+            "n_valid": {t: df["Close"].notna().cumsum().to_numpy() for t, df in sd.items()},
+            "min_history": 20}
+
+
+def test_two_sleeve_high_vol_picks_top_members_only():
+    ts = _two_sleeve()
+    hv, pick, _, _ = ts.high_vol_members(_vol_bundle(), window=20, top=2)
+    assert set(pick.columns[pick.iloc[200].to_numpy()]) == {"WILD", "MID"}
+    assert not hv["OUT"].any()                         # 비구성종목은 아무리 출렁여도 제외
+    assert not pick.iloc[:20].to_numpy().any()         # 룩백을 못 채운 날엔 고르지 않는다
+
+
+def test_two_sleeve_high_vol_uses_no_future_prices():
+    """그날 이후 가격을 바꿔도 그날까지의 선택은 그대로 — 미래 참조 없음."""
+    ts = _two_sleeve()
+    b = _vol_bundle()
+    _, base, _, _ = ts.high_vol_members(b, window=20, top=1)
+    day = 150
+    c = b["stock_data"]["CALM"]["Close"].to_numpy().copy()
+    c[day + 1:] = c[day] * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.2, len(c) - day - 1)))
+    shocked = dict(b, stock_data=dict(b["stock_data"], CALM=_px(c, b["date_index"])))
+    _, after, _, _ = ts.high_vol_members(shocked, window=20, top=1)
+    assert base.iloc[:day + 1].equals(after.iloc[:day + 1])
+    assert after.iloc[day + 30:]["CALM"].all() and not base.iloc[day + 30:]["CALM"].any()
+
+
+def test_two_sleeve_combine_and_sleeve_cap():
+    import portfolio
+    ts = _two_sleeve()
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    spy = pd.Series(np.linspace(100, 130, 300), index=idx)
+    sat = pd.Series(2_000.0, index=idx)                # 단기 바구니가 현금처럼 그대로
+    apart = ts.combine(0.8, spy, sat, quarterly=False)
+    assert apart.iloc[0] == pytest.approx(8_000 * (1 - ts.COST) + 2_000)
+    assert apart.iloc[-1] == pytest.approx(8_000 * (1 - ts.COST) * 1.3 + 2_000)
+    q = ts.combine(0.8, spy, sat, quarterly=True)
+    assert q.iloc[0] == pytest.approx(apart.iloc[0])
+    assert q.iloc[-1] < apart.iloc[-1]                 # 오른 SPY 를 분기마다 덜어 현금 쪽으로 옮긴다
+    assert ts.sleeve_cap(0.9) == 1_000.0               # 0.1×10000 의 부동소수 오차(999.99…) 제거
+    assert portfolio.lot_plan(ts.sleeve_cap(0.9))[0] == 2
